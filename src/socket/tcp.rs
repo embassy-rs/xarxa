@@ -939,15 +939,21 @@ impl<'a> Socket<'a> {
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
         self.local_seq_no = TcpSeqNumber::default();
+        self.local_rx_last_seq = None;
+        self.local_rx_last_ack = None;
+        self.local_rx_dup_acks = 0;
+        self.pending_fast_retransmit = false;
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
+        self.remote_has_sack = false;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
+        self.last_remote_tsval = 0;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
         self.local_sack_history = [None, None, None];
@@ -6533,6 +6539,26 @@ mod test {
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
+    }
+
+    #[test]
+    fn test_reset_clears_connection_state() {
+        let mut s = socket_established();
+        s.remote_has_sack = true;
+        s.local_rx_last_seq = Some(TcpSeqNumber(42));
+        s.local_rx_last_ack = Some(TcpSeqNumber(42));
+        s.local_rx_dup_acks = 2;
+        s.pending_fast_retransmit = true;
+        s.last_remote_tsval = 7;
+
+        s.reset();
+
+        assert!(!s.remote_has_sack);
+        assert_eq!(s.local_rx_last_seq, None);
+        assert_eq!(s.local_rx_last_ack, None);
+        assert_eq!(s.local_rx_dup_acks, 0);
+        assert!(!s.pending_fast_retransmit);
+        assert_eq!(s.last_remote_tsval, 0);
     }
 
     #[test]

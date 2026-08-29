@@ -249,6 +249,11 @@ pub struct DhcpConfig {
     /// This is not RFC compliant. It is a workaround for servers that send spurious
     /// NAKs, for example when several servers share a network.
     pub ignore_naks: bool,
+    /// A filter to decide which DhcpLease to accept. The function should return
+    /// true if the lease is acceptable, and false otherwise.
+    ///
+    /// Defaults to just accepting a lease.
+    pub filter: fn(&DhcpLease) -> bool,
 }
 
 impl Default for DhcpConfig {
@@ -258,6 +263,7 @@ impl Default for DhcpConfig {
             parameter_request_list: None,
             max_lease_duration: None,
             ignore_naks: false,
+            filter: |_| true,
         }
     }
 }
@@ -305,7 +311,7 @@ impl Client {
         }
     }
 
-    fn parse_ack(
+    fn parse_lease(
         now: Instant,
         packet: &DhcpPacket<'_>,
         max_lease_duration: Option<Duration>,
@@ -600,19 +606,29 @@ impl IfaceState<'_> {
                     return;
                 }
 
-                client.state = ClientState::Requesting(RequestState {
-                    retry_at: now,
-                    retry: 0,
-                    server: DhcpServerInfo {
-                        address: src_ip,
-                        identifier: server_identifier,
-                    },
-                    requested_ip: packet.your_ip(), // use the offered ip
-                });
+                let server = DhcpServerInfo {
+                    address: src_ip,
+                    identifier: server_identifier,
+                };
+
+                let Some((lease, _, _, _)) = Client::parse_lease(now, &packet, max_lease_duration, server) else {
+                    return;
+                };
+
+                if (client.config.filter)(&lease) {
+                    client.state = ClientState::Requesting(RequestState {
+                        retry_at: now,
+                        retry: 0,
+                        server,
+                        requested_ip: packet.your_ip(), // use the offered ip
+                    });
+                } else {
+                    debug!("Ignoring lease because of configured filter: {:?}", lease);
+                }
             }
             (ClientState::Requesting(state), DhcpMessageType::Ack) => {
                 let Some((lease, renew_at, rebind_at, expires_at)) =
-                    Client::parse_ack(now, &packet, max_lease_duration, state.server)
+                    Client::parse_lease(now, &packet, max_lease_duration, state.server)
                 else {
                     return;
                 };
@@ -627,7 +643,7 @@ impl IfaceState<'_> {
             }
             (ClientState::Renewing(state), DhcpMessageType::Ack) => {
                 let Some((lease, renew_at, rebind_at, expires_at)) =
-                    Client::parse_ack(now, &packet, max_lease_duration, state.lease.server)
+                    Client::parse_lease(now, &packet, max_lease_duration, state.lease.server)
                 else {
                     return;
                 };
@@ -912,7 +928,7 @@ mod test {
             packet.set_your_ip(if message_type == DhcpMessageType::Nak {
                 Ipv4Address::UNSPECIFIED
             } else {
-                OFFERED_IP
+                dst_ip
             });
             packet.set_server_ip(SERVER_IP);
             packet.set_relay_agent_ip(Ipv4Address::UNSPECIFIED);
@@ -1204,6 +1220,83 @@ mod test {
         assert_eq!(stack.iface(IFACE).config_generation(), generation);
         assert!(stack.iface(IFACE).dhcpv4_lease().is_some());
         assert_eq!(stack.poll(at(34)), at(63));
+    }
+
+    #[test]
+    fn test_dhcp_lease_filter() {
+        // Cap the lease at 60 s so T1 comes at 30 s, while the server's neighbor
+        // cache entry (60 s) is still fresh.
+        let mut config = DhcpConfig::default();
+        config.filter = |lease: &DhcpLease| {
+            // Only accept 192.168.1.1/24 addresses.
+            if Ipv4Cidr::new(Ipv4Address::new(192, 168, 1, 1), 24).contains_addr(&lease.address.address()) {
+                return true;
+            }
+            false
+        };
+
+        config.max_lease_duration = Some(Duration::from_secs(60));
+
+        let (mut stack, rx, tx, _link) = test_stack_with_link();
+        stack.iface(IFACE).set_dhcpv4(Some(config));
+
+        // Poll to see the discover
+        let deadline = stack.poll(at(0));
+        assert_eq!(deadline, at(10));
+        assert_eq!(tx.borrow().len(), 1);
+        let mut sent = parse_sent(&tx.borrow()[0]);
+        assert_eq!(sent.src_ip, Ipv4Address::UNSPECIFIED);
+        assert_eq!(sent.dst_ip, Ipv4Address::BROADCAST);
+        assert_eq!(sent.dst_hw, EthernetAddress::BROADCAST);
+        assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
+        {
+            let packet = DhcpPacket::new_checked(&mut sent.dhcp).unwrap();
+            assert_eq!(packet.transaction_id(), XID);
+            assert_eq!(packet.client_hardware_address(), OUR_HW);
+            assert_eq!(
+                packet.option(field::OPT_CLIENT_ID),
+                Some(&[1, 0x02, 0, 0, 0, 0, 0x01][..])
+            );
+            assert_eq!(packet.option(field::OPT_PARAMETER_REQUEST_LIST), Some(&[1, 3, 6][..]));
+        }
+
+        // OFFER, unicast to the offered address (which isn't ours yet): REQUEST.
+        rx.borrow_mut().push_back(reply(
+            DhcpMessageType::Offer,
+            XID,
+            Ipv4Address::new(10, 0, 0, 15),
+            &ack_options(),
+        ));
+        // The client shouldn't send a REQUEST, the only thing in the queue should
+        // be a DISCOVER.
+        stack.poll(at(1));
+        assert_eq!(tx.borrow().len(), 1);
+
+        stack.poll(at(10));
+        // Another DHCP DISCOVER is sent.
+        assert_eq!(tx.borrow().len(), 2);
+
+        // Now a good OFFER...
+        rx.borrow_mut()
+            .push_back(reply(DhcpMessageType::Offer, XID, OFFERED_IP, &ack_options()));
+
+        // We read the new offer and accept it, sending out a REQUEST.
+        stack.poll(at(11));
+        assert_eq!(tx.borrow().len(), 3);
+
+        let mut sent = parse_sent(&tx.borrow()[2]);
+        assert_eq!(sent.src_ip, Ipv4Address::UNSPECIFIED);
+        assert_eq!(sent.dst_ip, Ipv4Address::BROADCAST);
+        assert_eq!(message_type(&mut sent), DhcpMessageType::Request);
+        {
+            let packet = DhcpPacket::new_checked(&mut sent.dhcp).unwrap();
+            assert_eq!(packet.transaction_id(), XID);
+            assert_eq!(packet.option(field::OPT_REQUESTED_IP), Some(&OFFERED_IP.octets()[..]));
+            assert_eq!(
+                packet.option(field::OPT_SERVER_IDENTIFIER),
+                Some(&SERVER_IP.octets()[..])
+            );
+        }
     }
 
     #[test]

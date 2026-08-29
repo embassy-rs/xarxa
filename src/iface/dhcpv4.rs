@@ -168,14 +168,14 @@ impl defmt::Format for DhcpLeaseOptions {
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-struct DiscoverState {
+pub struct DiscoverState {
     /// When to send next request
     retry_at: Instant,
 }
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-struct RequestState {
+pub struct RequestState {
     /// When to send next request
     retry_at: Instant,
     /// How many retries have been done
@@ -188,7 +188,7 @@ struct RequestState {
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-struct RenewState {
+pub struct RenewState {
     /// Active lease.
     lease: DhcpLease,
 
@@ -215,7 +215,7 @@ struct RenewState {
 
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-enum ClientState {
+pub enum ClientState {
     /// Discovering the DHCP server
     Discovering(DiscoverState),
     /// Requesting an address
@@ -264,9 +264,9 @@ impl Default for DhcpConfig {
 
 /// The DHCP client state of one interface.
 #[derive(Debug)]
-pub(crate) struct Client {
+pub struct Client {
     /// State of the DHCP client.
-    state: ClientState,
+    pub(crate) state: ClientState,
     /// xid of the last sent message.
     transaction_id: u32,
     pub(crate) config: DhcpConfig,

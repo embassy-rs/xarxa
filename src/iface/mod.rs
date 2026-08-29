@@ -12,6 +12,8 @@ pub mod dhcpv4;
 #[cfg(feature = "slaac")]
 pub mod slaac;
 
+#[cfg(feature = "dhcpv4")]
+use crate::iface::dhcpv4::ClientState;
 #[cfg(feature = "multicast")]
 pub use crate::multicast::MulticastError;
 
@@ -473,6 +475,11 @@ impl<'d> Iface<'_, 'd> {
     #[cfg(feature = "dhcpv4")]
     pub fn dhcpv4_lease(&self) -> Option<&self::dhcpv4::DhcpLease> {
         self.state().dhcpv4.as_ref().and_then(|client| client.lease())
+    }
+
+    #[cfg(feature = "dhcpv4")]
+    pub fn dhcpv4_state(&self) -> Option<&ClientState> {
+        self.state().dhcpv4.as_ref().and_then(|client| Some(&client.state))
     }
 
     /// Drop the DHCPv4 lease, if any, and look for a server again.

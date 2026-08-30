@@ -102,7 +102,11 @@ impl StackInner {
     /// The hostname to send in outgoing DHCP messages. `None` when unset.
     #[cfg(all(feature = "dhcpv4", feature = "hostname"))]
     pub(crate) fn hostname(&self) -> Option<&str> {
-        if self.hostname.is_empty() { None } else { Some(&self.hostname) }
+        if self.hostname.is_empty() {
+            None
+        } else {
+            Some(&self.hostname)
+        }
     }
 
     /// Forget everything the link layer learned about an interface: its neighbor
@@ -563,7 +567,8 @@ impl<'d> Stack<'d> {
     }
 
     fn add_iface_inner(&mut self, driver: MaybeBox<'d, dyn Driver + 'd>) -> core::result::Result<IfaceHandle, Full> {
-        let medium = Medium::from_driver(driver.capabilities().medium)
+        let caps = driver.capabilities();
+        let medium = Medium::from_driver(caps.medium)
             .expect("the driver's medium is not supported by this build: enable the matching medium-* cargo feature");
         let hardware_addr = HardwareAddress::from_driver(driver.hardware_address())
             .expect("the driver's hardware address kind is not supported by this build: enable the matching medium-* cargo feature");
@@ -585,6 +590,7 @@ impl<'d> Stack<'d> {
             handle: IfaceHandle::new(index),
             driver,
             medium,
+            caps,
             hardware_addr,
             ip_addrs,
             config_generation: 0,

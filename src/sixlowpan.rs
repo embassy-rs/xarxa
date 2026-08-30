@@ -610,7 +610,7 @@ impl StackInner {
 
         let total_size = buf.len();
         let ieee_len = ieee_repr.buffer_len();
-        let mtu = iface.driver.capabilities().max_transmission_unit;
+        let mtu = iface.caps.max_transmission_unit;
 
         if total_size + ieee_len > mtu {
             #[cfg(feature = "sixlowpan-fragmentation")]
@@ -761,7 +761,7 @@ impl StackInner {
 
         let total_size = buf.len();
         let ieee_len = ieee_repr.buffer_len();
-        let mtu = iface.driver.capabilities().max_transmission_unit;
+        let mtu = iface.caps.max_transmission_unit;
 
         // We calculate how much data we can send in the first fragment and the other
         // fragments. The eventual IPv6 sizes of these fragments need to be a multiple of eight

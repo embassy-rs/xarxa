@@ -162,6 +162,8 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) driver: MaybeBox<'d, dyn Driver + 'd>,
     /// The driver's medium, converted and checked when the interface is added.
     pub(crate) medium: Medium,
+    /// The driver's capabilities, read when the interface is added.
+    pub(crate) caps: Capabilities,
     pub(crate) hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
@@ -207,7 +209,7 @@ impl<'d> Iface<'_, 'd> {
 
     /// The capabilities reported by the device.
     pub fn capabilities(&self) -> Capabilities {
-        self.state().driver.capabilities()
+        self.state().caps.clone()
     }
 
     /// The interface's driver.
@@ -529,7 +531,7 @@ impl IfaceState<'_> {
     /// doesn't do it in software.
     #[allow(dead_code)] // unused depending on which protocols are enabled
     pub(crate) fn checksum_caps(&self) -> ChecksumCapabilities {
-        self.driver.capabilities().checksum
+        self.caps.checksum
     }
 
     /// Whether the interface's medium has link-layer addresses, and so does
@@ -587,7 +589,7 @@ impl IfaceState<'_> {
     /// Ethernet mediums, clamped to what a `PacketBuf` can carry once the
     /// link-layer headroom egress reserves ([`LINK_HEADER_LEN`]) is taken out.
     pub(crate) fn ip_mtu(&self) -> usize {
-        let caps = self.driver.capabilities();
+        let caps = &self.caps;
         let mtu = match self.medium() {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => caps.max_transmission_unit - ETHERNET_HEADER_LEN,

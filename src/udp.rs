@@ -781,10 +781,15 @@ impl UdpSocket<'_, '_> {
         f: impl FnOnce(&mut [u8]) -> usize,
     ) -> Result<(), SendError> {
         let mut meta = meta.into();
-        let local = self.inner().local;
-        let remote = self.inner().remote;
-        let binding = self.inner().binding;
-        let hop_limit = self.inner().hop_limit.unwrap_or(64);
+        let (local, remote, binding, hop_limit) = {
+            let socket = self.inner();
+            (
+                socket.local,
+                socket.remote,
+                socket.binding,
+                socket.hop_limit.unwrap_or(64),
+            )
+        };
 
         if local.port == 0 {
             return Err(SendError::InvalidState);
@@ -937,21 +942,15 @@ impl Stack<'_> {
         // on their port.
         let dst_is_bcast = self.ifaces.get(iface.index()).is_broadcast(&dst_addr) || dst_addr.is_multicast();
 
-        // Linear scan, most specific match wins: every candidate whose
-        // specified tuple parts all match is scored by how specific those parts
-        // are. Connected sockets beat bound-only ones, exact addresses beat
-        // per-version wildcards beat wildcards. Ties (only possible between
-        // sockets specific in *different* parts) go to the earliest socket.
-        let mut best: Option<(usize, u8)> = None;
-        for (index, socket) in self.sockets.udp.iter() {
-            if let Some(score) = socket.match_score(Some(iface), &src_addr, src_port, &dst_addr, dst_port, dst_is_bcast)
-                && best.is_none_or(|(_, best_score)| score > best_score)
-            {
-                best = Some((index, score));
-            }
-        }
-
-        if let Some((index, _)) = best {
+        if let Some(index) = demux(
+            &self.sockets.udp,
+            Some(iface),
+            &src_addr,
+            src_port,
+            &dst_addr,
+            dst_port,
+            dst_is_bcast,
+        ) {
             let socket = self.sockets.udp.get_mut(index);
             trace!(
                 "udp:{}: receiving {} octets from {}:{}",
@@ -989,6 +988,34 @@ impl Stack<'_> {
     }
 }
 
+/// The socket a datagram with this tuple should go to, or `None` if no socket
+/// wants it.
+///
+/// Linear scan, most specific match wins: every candidate whose specified tuple
+/// parts all match is scored by how specific those parts are. Connected sockets
+/// beat bound-only ones, exact addresses beat per-version wildcards beat
+/// wildcards. Ties (only possible between sockets specific in *different* parts)
+/// go to the earliest socket.
+fn demux(
+    sockets: &Slab<UdpSocketState, UDP_SOCKET_COUNT>,
+    iface: Option<IfaceHandle>,
+    src_addr: &IpAddress,
+    src_port: u16,
+    dst_addr: &IpAddress,
+    dst_port: u16,
+    dst_is_bcast: bool,
+) -> Option<usize> {
+    let mut best: Option<(usize, u8)> = None;
+    for (index, socket) in sockets.iter() {
+        if let Some(score) = socket.match_score(iface, src_addr, src_port, dst_addr, dst_port, dst_is_bcast)
+            && best.is_none_or(|(_, best_score)| score > best_score)
+        {
+            best = Some((index, score));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
 /// Deliver an ICMP error to the UDP socket whose packet provoked it.
 ///
 /// `local`/`remote` are the flow parsed from the packet quoted in the error, a
@@ -1002,16 +1029,7 @@ pub(crate) fn process_icmp_error(
     local: IpEndpoint,
     remote: IpEndpoint,
 ) {
-    let mut best: Option<(usize, u8)> = None;
-    for (index, socket) in sockets.iter() {
-        if let Some(score) = socket.match_score(None, &remote.addr, remote.port, &local.addr, local.port, false)
-            && best.is_none_or(|(_, best_score)| score > best_score)
-        {
-            best = Some((index, score));
-        }
-    }
-
-    if let Some((index, _)) = best {
+    if let Some(index) = demux(sockets, None, &remote.addr, remote.port, &local.addr, local.port, false) {
         let socket = sockets.get_mut(index);
         trace!("udp:{}: icmp error from {}: {}", socket.local, remote, error);
         socket.pending_error = Some((error, remote));

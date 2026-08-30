@@ -951,18 +951,22 @@ impl<'d> Stack<'d> {
                 self.process(handle, buf);
             }
 
+            // `inner` has no user in a build with no link layer and no fragmentation.
+            #[allow(unused_variables)]
+            let Self { inner, ifaces, .. } = self;
+            let iface = ifaces.get_mut(index);
+
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            self.inner.flush_resolved_pending(self.ifaces.get_mut(index));
+            inner.flush_resolved_pending(iface);
 
             #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
-            self.inner.fragment_egress(self.ifaces.get_mut(index));
+            inner.fragment_egress(iface);
 
             // Spot the link state edges: wake whoever waits on the interface, and on the
             // way back up re-run both configuration protocols, since a link coming back
             // can mean a different network and what was learned before it dropped may
             // not hold there.
             {
-                let iface = self.ifaces.get_mut(index);
                 let link_state = iface.driver.link_state();
                 if link_state != iface.last_link_state {
                     iface.last_link_state = link_state;
@@ -1413,9 +1417,10 @@ impl<'d> Stack<'d> {
                     }
                     // Reply as normal when src_addr and dst_addr are both unicast; only
                     // reply to broadcasts for echo replies and not other ICMP messages.
-                    if iface.is_unicast_v4(dst_addr) {
+                    let dst_is_broadcast = iface.is_broadcast_v4(dst_addr);
+                    if dst_addr.x_is_unicast() && !dst_is_broadcast {
                         dst_addr
-                    } else if iface.is_broadcast_v4(dst_addr) {
+                    } else if dst_is_broadcast {
                         match iface.ipv4_addr() {
                             Some(addr) => addr,
                             None => return,
@@ -2580,6 +2585,7 @@ fn packet_log_layer(medium: Medium) -> crate::packet_log::Layer {
 /// The header checksum is only computed if the egress device doesn't do it
 /// itself; it is written as zero otherwise, since devices might rely on it.
 #[cfg(feature = "ipv4")]
+#[inline(never)] // helps code size
 pub(crate) fn push_ipv4_header(
     buf: &mut PacketBuf,
     src_addr: Ipv4Address,

@@ -81,6 +81,7 @@ static POOL: Pool = Pool {
 
 /// Claim a free slot: the first zero bit of the bitmap, set with a CAS.
 #[cfg(target_has_atomic = "32")]
+#[inline(never)]
 fn alloc_slot() -> Option<usize> {
     for (w, word) in POOL.used.iter().enumerate() {
         let mut cur = word.load(Ordering::Relaxed);
@@ -108,6 +109,7 @@ fn alloc_slot() -> Option<usize> {
 
 /// Give a slot back: clear its bit.
 #[cfg(target_has_atomic = "32")]
+#[inline(never)]
 fn free_slot(index: usize) {
     POOL.used[index / 32].fetch_and(!(1 << (index % 32)), Ordering::Release);
 }
@@ -319,6 +321,7 @@ impl PacketBuf {
 }
 
 impl Drop for PacketBuf {
+    #[inline(never)] // helps code size
     fn drop(&mut self) {
         let base = POOL.slots.as_ptr() as usize;
         let index =

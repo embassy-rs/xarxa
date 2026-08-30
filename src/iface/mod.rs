@@ -639,11 +639,13 @@ impl IfaceState<'_> {
         self.ip_addrs.iter().map(|a| &a.cidr)
     }
 
+    #[inline(never)] // helps code size
     pub(crate) fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
         let addr = addr.into();
         self.cidrs().any(|probe| probe.address() == addr)
     }
 
+    #[inline(never)] // helps code size
     pub(crate) fn in_same_network(&self, addr: &IpAddress) -> bool {
         self.cidrs().any(|cidr| cidr.contains_addr(addr))
     }
@@ -734,6 +736,7 @@ impl IfaceState<'_> {
 
     /// Checks if an ipv4 address is unicast, taking into account subnet broadcast addresses
     #[cfg(feature = "ipv4")]
+    #[inline(never)] // helps code size
     pub(crate) fn is_unicast_v4(&self, address: Ipv4Address) -> bool {
         address.x_is_unicast() && !self.is_broadcast_v4(address)
     }

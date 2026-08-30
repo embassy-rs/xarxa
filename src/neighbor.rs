@@ -384,16 +384,18 @@ impl NeighborCache {
             // The cache is full, and we need to evict an entry. Prefer evicting
             // resolved entries: evicting an in-progress resolution would strand the
             // packets queued on it.
-            let index = self
-                .storage
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, (_, state))| match state {
-                    State::Reachable { expires_at, .. } => (0, *expires_at),
-                    State::Incomplete { retrans_at, .. } => (1, *retrans_at),
-                })
-                .expect("empty neighbor cache storage")
-                .0;
+            let mut index = 0;
+            let mut best = (1u8, Instant::MAX);
+            for (i, (_, state)) in self.storage.iter().enumerate() {
+                let rank = match state {
+                    State::Reachable { expires_at, .. } => (0u8, *expires_at),
+                    State::Incomplete { retrans_at, .. } => (1u8, *retrans_at),
+                };
+                if rank < best {
+                    best = rank;
+                    index = i;
+                }
+            }
 
             let (_old_key, _) = self.storage[index];
             trace!("neighbor cache full, evicted {}", _old_key.1);

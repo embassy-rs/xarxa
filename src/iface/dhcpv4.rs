@@ -1371,7 +1371,11 @@ mod test {
         stack.poll(at(5));
         link.set(LinkState::Up);
         stack.poll(at(6));
-        assert_eq!(tx.borrow().len(), after_first + 1, "each link-up sends a fresh DISCOVER");
+        assert_eq!(
+            tx.borrow().len(),
+            after_first + 1,
+            "each link-up sends a fresh DISCOVER"
+        );
         let mut sent = parse_sent(tx.borrow().last().unwrap());
         assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
     }

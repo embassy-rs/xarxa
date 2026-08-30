@@ -148,6 +148,18 @@ impl Address {
             Address::Ipv6(addr) => addr.prefix_len(),
         }
     }
+
+    /// Is this an IPv4 address.
+    #[cfg(feature = "ipv4")]
+    pub fn is_ipv4(&self) -> bool {
+        matches!(self, Address::Ipv4(_))
+    }
+
+    /// Is this an IPv6 address.
+    #[cfg(feature = "ipv6")]
+    pub fn is_ipv6(&self) -> bool {
+        matches!(self, Address::Ipv6(_))
+    }
 }
 
 #[cfg(all(feature = "ipv4", feature = "ipv6"))]
@@ -265,6 +277,18 @@ impl Cidr {
             #[allow(unreachable_patterns)]
             _ => false,
         }
+    }
+
+    /// Is this an IPv4 address.
+    #[cfg(feature = "ipv4")]
+    pub fn is_ipv4(&self) -> bool {
+        matches!(self, Cidr::Ipv4(_))
+    }
+
+    /// Is this an IPv6 address.
+    #[cfg(feature = "ipv6")]
+    pub fn is_ipv6(&self) -> bool {
+        matches!(self, Cidr::Ipv6(_))
     }
 }
 

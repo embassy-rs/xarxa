@@ -102,12 +102,11 @@ fn main() {
             socket.send_slice(&data, meta.endpoint).unwrap();
         }
 
-        // Accept every queued connection attempt.
-        while let Some(handle) = stack.tcp_listener(listener).accept(4096, 4096) {
-            log::info!(
-                "tcp: connection from {}",
-                stack.tcp_socket(handle).remote_endpoint().unwrap()
-            );
+        // Accept every queued connection attempt into a fresh socket.
+        while let Some(token) = stack.tcp_listener(listener).accept() {
+            log::info!("tcp: connection from {}", token.remote_endpoint());
+            let handle = stack.add_tcp_socket(4096, 4096).unwrap();
+            stack.tcp_socket(handle).accept(token).unwrap();
             connections.push(handle);
         }
 

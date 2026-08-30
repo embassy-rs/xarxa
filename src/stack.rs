@@ -862,13 +862,11 @@ impl<'d> Stack<'d> {
     /// # Panics
     /// Panics if the handle is stale (the listener was already removed).
     #[cfg(feature = "tcp-listener")]
-    pub fn tcp_listener(&mut self, handle: TcpListenerHandle) -> TcpListener<'_, 'd> {
+    pub fn tcp_listener(&mut self, handle: TcpListenerHandle) -> TcpListener<'_> {
         self.sockets.tcp_listeners.get(handle.index()); // Stale handles panic here, not on first use.
         TcpListener {
             listeners: &mut self.sockets.tcp_listeners,
             index: handle.index(),
-            tcp: &mut self.sockets.tcp,
-            rand: &mut self.inner.rand,
         }
     }
 
@@ -1310,8 +1308,8 @@ impl<'d> Stack<'d> {
     /// produces (RST, challenge ACK). Connected sockets match first, by full
     /// 4-tuple, then the listeners, which record SYNs to a listened endpoint in
     /// their accept queues and transmit nothing (the SYN|ACK is sent by the
-    /// socket that `accept` creates). Unmatched segments are answered with an
-    /// RST.
+    /// socket the attempt is accepted into). Unmatched segments are answered
+    /// with an RST.
     ///
     /// The socket's own transmissions (data, ACKs of received data) are not sent
     /// here. [`Stack::poll`] drives them right after ingress processing.

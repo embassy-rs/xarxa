@@ -38,7 +38,7 @@ mod ring_buffer;
 
 use self::congestion::Controller as _;
 #[cfg(feature = "tcp-listener")]
-pub use self::listener::{TcpListener, TcpListenerHandle, TcpListenerIter};
+pub use self::listener::{AcceptToken, TcpListener, TcpListenerHandle, TcpListenerIter};
 #[cfg(feature = "tcp-listener")]
 pub(crate) use self::listener::{TcpListenerState, process_listeners};
 pub(crate) use self::repr::TcpRepr;
@@ -88,17 +88,15 @@ impl Display for ListenError {
 #[cfg(feature = "tcp-listener")]
 impl core::error::Error for ListenError {}
 
-/// Error returned by [`TcpListener::accept_with_socket`]
+/// Error returned by [`TcpSocket::accept`]
 ///
 /// Requires the `tcp-listener` feature.
 #[cfg(feature = "tcp-listener")]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum AcceptError {
-    /// The socket is still open, so it can't be reused for a new connection.
+    /// The socket is still open, so it can't be used for a new connection.
     InvalidState,
-    /// The accept queue is empty.
-    Exhausted,
 }
 
 #[cfg(feature = "tcp-listener")]
@@ -106,7 +104,6 @@ impl Display for AcceptError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             AcceptError::InvalidState => write!(f, "invalid state"),
-            AcceptError::Exhausted => write!(f, "exhausted"),
         }
     }
 }
@@ -737,7 +734,7 @@ impl<'d> TcpSocketState<'d> {
     }
 
     /// Return the socket to the closed state, ready to be reused by `connect`
-    /// or `TcpListener::accept_with_socket`. Everything the user configured
+    /// or `TcpSocket::accept`. Everything the user configured
     /// (hop limit, timeout, keep-alive, Nagle, ACK delay) is kept; everything
     /// belonging to the connection is cleared.
     fn reset(&mut self) {
@@ -2413,7 +2410,7 @@ pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) 
     feature = "tcp-listener",
     doc = "A TCP socket represents a single connection (connecting or connected): its",
     doc = "4-tuple is fully set from the start, by [`connect`](Self::connect) or by",
-    doc = "[`TcpListener::accept`]. Passive open lives in [`TcpListener`]."
+    doc = "[`accept`](Self::accept). Passive open lives in [`TcpListener`]."
 )]
 ///
 /// [`Stack`]: crate::Stack
@@ -2740,6 +2737,30 @@ impl<'d> TcpSocket<'_, 'd> {
             s.last_remote_tsval = 0;
             s.tsval_offset = tsval_offset;
         }
+        Ok(())
+    }
+
+    /// Accept a connection attempt into this socket.
+    ///
+    /// The token comes from [`TcpListener::accept`].
+    ///
+    /// After this, the socket is in `SYN-RECEIVED` state. You must wait until
+    /// the socket reaches the `ESTABLISHED` state to send and receive data.
+    ///
+    /// The socket's interface binding (see [`bind_to_iface`](TcpSocket::bind_to_iface))
+    /// is set to the listener's binding. Other configuration (hop limit,
+    /// timeout, keep-alive, Nagle, ACK delay) is left unchanged.
+    ///
+    /// Errors:
+    /// - `InvalidState` if the socket is not closed.
+    #[cfg(feature = "tcp-listener")]
+    pub fn accept(&mut self, token: AcceptToken) -> Result<(), AcceptError> {
+        if self.is_open() {
+            return Err(AcceptError::InvalidState);
+        }
+        let s = self.sockets.get_mut(self.index);
+        s.reset();
+        token.start_syn_received(s, self.tx.rand());
         Ok(())
     }
 
@@ -3498,6 +3519,23 @@ mod test {
     // Tests for listeners.
     // =========================================================================================//
 
+    /// Accept a queued attempt into a fresh socket with buffers of the given
+    /// capacities, returning its handle, or `None` if nothing is queued.
+    #[cfg(feature = "tcp-listener")]
+    fn listener_accept(
+        stack: &mut Stack<'static>,
+        h: TcpListenerHandle,
+        rx_capacity: usize,
+        tx_capacity: usize,
+    ) -> Option<TcpHandle> {
+        let token = stack.tcp_listener(h).accept()?;
+        let sh = stack
+            .add_tcp_socket_with_bufs(vec![0; rx_capacity].leak(), vec![0; tx_capacity].leak())
+            .unwrap();
+        stack.tcp_socket(sh).accept(token).unwrap();
+        Some(sh)
+    }
+
     /// A stack with a listener on `LOCAL_PORT` (any address).
     #[cfg(feature = "tcp-listener")]
     fn listener_stack() -> (Stack<'static>, TcpListenerHandle) {
@@ -3574,18 +3612,10 @@ mod test {
         assert!(listener_deliver(&mut stack, &syn_repr()));
         assert!(stack.tcp_listener(h).can_accept());
 
-        // Accept allocates the actual socket, in SYN-RECEIVED.
-        let sh = stack
-            .tcp_listener(h)
-            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
-            .unwrap();
+        // Accepting the attempt into a socket puts it in SYN-RECEIVED.
+        let sh = listener_accept(&mut stack, h, 64, 64).unwrap();
         assert!(!stack.tcp_listener(h).can_accept());
-        assert!(
-            stack
-                .tcp_listener(h)
-                .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
-                .is_none()
-        );
+        assert!(stack.tcp_listener(h).accept().is_none());
         assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
         assert_eq!(stack.tcp_socket(sh).local_endpoint(), Some(LOCAL_END));
         assert_eq!(stack.tcp_socket(sh).remote_endpoint(), Some(REMOTE_END));
@@ -3625,28 +3655,43 @@ mod test {
 
     #[cfg(feature = "tcp-listener")]
     #[test]
-    fn test_listener_accept_with_socket() {
+    fn test_socket_accept() {
         let (mut stack, h) = listener_stack();
         let sh = stack
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
 
         // Nothing queued yet.
-        assert_eq!(
-            stack.tcp_listener(h).accept_with_socket(sh),
-            Err(AcceptError::Exhausted)
-        );
+        assert!(stack.tcp_listener(h).accept().is_none());
 
         // The queued SYN is accepted into the existing socket, which keeps its
         // handle.
         assert!(listener_deliver(&mut stack, &syn_repr()));
-        assert_eq!(stack.tcp_listener(h).accept_with_socket(sh), Ok(()));
+        let token = stack.tcp_listener(h).accept().unwrap();
         assert!(!stack.tcp_listener(h).can_accept());
+        assert_eq!(token.local_endpoint(), LOCAL_END);
+        assert_eq!(token.remote_endpoint(), REMOTE_END);
+        assert_eq!(stack.tcp_socket(sh).accept(token), Ok(()));
         assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
         assert_eq!(stack.tcp_socket(sh).local_endpoint(), Some(LOCAL_END));
         assert_eq!(stack.tcp_socket(sh).remote_endpoint(), Some(REMOTE_END));
 
-        // The socket is in use now: the next attempt is rejected and stays queued.
+        // The socket is in use now: accepting into it is rejected and the
+        // token's attempt is dropped. The client's retransmitted SYN would
+        // queue it on the listener again.
+        assert!(listener_deliver(
+            &mut stack,
+            &TcpRepr {
+                src_port: REMOTE_PORT + 1,
+                ..syn_repr()
+            }
+        ));
+        let token = stack.tcp_listener(h).accept().unwrap();
+        assert_eq!(stack.tcp_socket(sh).accept(token), Err(AcceptError::InvalidState));
+        assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
+
+        // Once the connection is over, the same socket serves the next
+        // (retransmitted) attempt, with the previous connection's state gone.
         assert!(listener_deliver(
             &mut stack,
             &TcpRepr {
@@ -3655,19 +3700,12 @@ mod test {
             }
         ));
         assert_eq!(
-            stack.tcp_listener(h).accept_with_socket(sh),
-            Err(AcceptError::InvalidState)
-        );
-        assert!(stack.tcp_listener(h).can_accept());
-
-        // Once the connection is over, the same socket serves the next one,
-        // with the previous connection's state gone.
-        assert_eq!(
             stack.sockets.tcp.get_mut(sh.index()).tx_buffer.enqueue_slice(b"stale"),
             5
         );
         stack.tcp_socket(sh).abort();
-        assert_eq!(stack.tcp_listener(h).accept_with_socket(sh), Ok(()));
+        let token = stack.tcp_listener(h).accept().unwrap();
+        assert_eq!(stack.tcp_socket(sh).accept(token), Ok(()));
         assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
         assert_eq!(
             stack.tcp_socket(sh).remote_endpoint(),
@@ -3818,7 +3856,8 @@ mod test {
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
         stack.tcp_socket(sh).bind_to_iface(Some(if1)).unwrap();
-        stack.tcp_listener(h).accept_with_socket(sh).unwrap();
+        let token = stack.tcp_listener(h).accept().unwrap();
+        stack.tcp_socket(sh).accept(token).unwrap();
         assert_eq!(stack.tcp_socket(sh).bound_iface(), Some(if0));
 
         // The binding survives close, and is part of the listen identity: an
@@ -3876,19 +3915,9 @@ mod test {
             ));
         }
         for _ in 0..TCP_LISTENER_BACKLOG {
-            assert!(
-                stack
-                    .tcp_listener(h)
-                    .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
-                    .is_some()
-            );
+            assert!(stack.tcp_listener(h).accept().is_some());
         }
-        assert!(
-            stack
-                .tcp_listener(h)
-                .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
-                .is_none()
-        );
+        assert!(stack.tcp_listener(h).accept().is_none());
     }
 
     #[cfg(feature = "tcp-listener")]
@@ -3910,16 +3939,8 @@ mod test {
             }
         ));
 
-        let sh = stack
-            .tcp_listener(h)
-            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
-            .unwrap();
-        assert!(
-            stack
-                .tcp_listener(h)
-                .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
-                .is_none()
-        );
+        let sh = listener_accept(&mut stack, h, 64, 64).unwrap();
+        assert!(stack.tcp_listener(h).accept().is_none());
         assert_eq!(stack.sockets.tcp.get(sh.index()).remote_seq_no, REMOTE_SEQ + 101);
     }
 
@@ -4011,10 +4032,7 @@ mod test {
                     ..syn_repr()
                 }
             ));
-            let sh = stack
-                .tcp_listener(h)
-                .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
-                .unwrap();
+            let sh = listener_accept(&mut stack, h, 64, 64).unwrap();
             assert_eq!(stack.sockets.tcp.get(sh.index()).remote_mss, effective);
         }
     }
@@ -4034,10 +4052,7 @@ mod test {
                     ..syn_repr()
                 }
             ));
-            let sh = stack
-                .tcp_listener(h)
-                .accept_with_bufs(vec![0; buffer_size].leak(), vec![0; 64].leak())
-                .unwrap();
+            let sh = listener_accept(&mut stack, h, buffer_size, 64).unwrap();
             assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_scale, Some(7));
             assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_shift, shift);
 
@@ -4066,10 +4081,7 @@ mod test {
         // Without an offer from the remote, scaling is off entirely.
         let (mut stack, h) = listener_stack();
         assert!(listener_deliver(&mut stack, &syn_repr()));
-        let sh = stack
-            .tcp_listener(h)
-            .accept_with_bufs(vec![0; 65536].leak(), vec![0; 64].leak())
-            .unwrap();
+        let sh = listener_accept(&mut stack, h, 65536, 64).unwrap();
         assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_scale, None);
         assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_shift, 0);
         let mut s = TestSocket {
@@ -10167,10 +10179,7 @@ mod test {
     fn accepted_socket(syn: &TcpRepr) -> TestSocket {
         let (mut stack, h) = listener_stack();
         assert!(listener_deliver(&mut stack, syn));
-        let sh = stack
-            .tcp_listener(h)
-            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
-            .unwrap();
+        let sh = listener_accept(&mut stack, h, 64, 64).unwrap();
         TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
@@ -11599,12 +11608,13 @@ mod stack_test {
         assert!(driver.tx.borrow().is_empty());
         assert!(stack.tcp_listener(lh).can_accept());
 
-        // Accept allocates the actual socket, and the next poll sends the
+        // Accepting the attempt into a socket makes the next poll send the
         // SYN|ACK, advertising the socket's actual receive window.
+        let token = stack.tcp_listener(lh).accept().unwrap();
         let h = stack
-            .tcp_listener(lh)
-            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
+        stack.tcp_socket(h).accept(token).unwrap();
         stack.tcp_socket(h).set_ack_delay(None);
         assert_eq!(stack.tcp_socket(h).state(), State::SynReceived);
         stack.poll(Instant::from_millis(0));
@@ -11713,10 +11723,11 @@ mod stack_test {
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(0));
+        let token = stack.tcp_listener(lh).accept().unwrap();
         let h = stack
-            .tcp_listener(lh)
-            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
+        stack.tcp_socket(h).accept(token).unwrap();
         stack.poll(Instant::from_millis(0));
         driver.tx.borrow_mut().remove(0); // the SYN|ACK
         driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {

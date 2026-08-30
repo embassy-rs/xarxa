@@ -3596,7 +3596,7 @@ mod test {
         let mut s = TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.index())).unwrap();
+                sockets.add_with(|_| stack.sockets.tcp.take(sh.index())).unwrap();
                 sockets
             },
             stack,
@@ -4044,7 +4044,7 @@ mod test {
             let mut s = TestSocket {
                 sockets: {
                     let mut sockets = Slab::new();
-                    sockets.add_with(|_| stack.sockets.tcp.remove(sh.index())).unwrap();
+                    sockets.add_with(|_| stack.sockets.tcp.take(sh.index())).unwrap();
                     sockets
                 },
                 stack,
@@ -4075,7 +4075,7 @@ mod test {
         let mut s = TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.index())).unwrap();
+                sockets.add_with(|_| stack.sockets.tcp.take(sh.index())).unwrap();
                 sockets
             },
             stack,
@@ -10174,7 +10174,7 @@ mod test {
         TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.index())).unwrap();
+                sockets.add_with(|_| stack.sockets.tcp.take(sh.index())).unwrap();
                 sockets
             },
             stack,

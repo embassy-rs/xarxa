@@ -564,7 +564,7 @@ impl IfaceState<'_> {
                 NdiscOptionType::SourceLinkLayerAddr,
                 self.hardware_addr,
             );
-            if self.checksum_caps().icmpv6.tx() {
+            if !self.checksum_caps().icmpv6.tx {
                 rs.fill_checksum(&src_addr, &dst_addr);
             } else {
                 rs.set_checksum(0);

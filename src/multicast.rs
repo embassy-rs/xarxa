@@ -643,7 +643,7 @@ impl IfaceState<'_> {
                 record.set_mcast_addr(mcast_addr);
                 payload = &mut payload[MLD_ADDRESS_RECORD_LEN..];
             }
-            if self.checksum_caps().icmpv6.tx() {
+            if !self.checksum_caps().icmpv6.tx {
                 mld.fill_checksum(&src_addr, &dst_addr);
             } else {
                 mld.set_checksum(0);
@@ -690,7 +690,7 @@ mod test {
     use std::vec::Vec;
 
     use super::*;
-    use crate::driver::{Checksum, ChecksumCapabilities};
+    use crate::driver::{ChecksumCapabilities, ChecksumOffload};
     use crate::iface::IfaceHandle;
     use crate::iface::Medium;
     use crate::stack::Stack;
@@ -1271,8 +1271,8 @@ mod test {
     fn test_checksum_offload() {
         let medium = Medium::Ip;
         let mut caps = ChecksumCapabilities::default();
-        caps.ipv4 = Checksum::None;
-        caps.icmpv6 = Checksum::None;
+        caps.ipv4 = ChecksumOffload::BOTH;
+        caps.icmpv6 = ChecksumOffload::BOTH;
         let (mut stack, _rx, tx) = test_stack_with_checksum(medium, caps);
         stack.poll(Instant::ZERO);
         tx.borrow_mut().clear();

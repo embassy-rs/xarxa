@@ -276,7 +276,7 @@ impl StackInner {
         packet.set_more_frags(more_frags);
         packet.set_dont_frag(false);
         packet.set_frag_offset(frag.ipv4.frag_offset);
-        if checksum_caps.ipv4.tx() {
+        if !checksum_caps.ipv4.tx {
             packet.fill_checksum();
         } else {
             packet.set_checksum(0);

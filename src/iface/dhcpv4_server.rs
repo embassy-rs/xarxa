@@ -689,7 +689,7 @@ impl Server {
         udp.set_src_port(DHCP_SERVER_PORT);
         udp.set_dst_port(DHCP_CLIENT_PORT);
         udp.set_len((UDP_HEADER_LEN + len) as u16);
-        if checksum_caps.udp.tx() {
+        if !checksum_caps.udp.tx {
             udp.fill_checksum(&IpAddress::Ipv4(server_cidr.address()), &IpAddress::Ipv4(dst_addr));
         } else {
             // A zero checksum means "no checksum" on UDP-over-IPv4, and is what a
@@ -789,7 +789,7 @@ mod test {
     use std::vec::Vec;
 
     use super::*;
-    use crate::driver::Checksum;
+    use crate::driver::ChecksumOffload;
     use crate::iface::{IfaceHandle, Medium};
     use crate::stack::Stack;
     use crate::test_device::{Queue, Sent, TestDevice};
@@ -1596,8 +1596,8 @@ mod test {
     #[test]
     fn test_checksum_offload() {
         let mut caps = ChecksumCapabilities::default();
-        caps.ipv4 = Checksum::None;
-        caps.udp = Checksum::None;
+        caps.ipv4 = ChecksumOffload::BOTH;
+        caps.udp = ChecksumOffload::BOTH;
         let (mut stack, rx, tx) = test_stack_with_checksum(caps);
 
         send(&mut stack, &rx, Msg::new(DhcpMessageType::Discover, CLIENT_HW), 0);

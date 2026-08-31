@@ -1169,7 +1169,7 @@ impl<'d> Stack<'d> {
             return;
         }
         let checksum_caps = self.ifaces.get(iface.index()).checksum_caps();
-        if checksum_caps.ipv4.rx() && !ipv4_packet.verify_checksum() {
+        if !checksum_caps.ipv4.rx && !ipv4_packet.verify_checksum() {
             trace!("ipv4: header checksum incorrect");
             return;
         }
@@ -1202,7 +1202,7 @@ impl<'d> Stack<'d> {
         if next_header == IpProtocol::Udp && self.ifaces.get(iface.index()).dhcpv4.is_some() {
             let udp_len = match buf.get_mut(header_len..total_len).map(UdpPacket::new_checked) {
                 Some(Ok(udp)) if udp.src_port() == DHCP_SERVER_PORT && udp.dst_port() == DHCP_CLIENT_PORT => {
-                    if checksum_caps.udp.rx()
+                    if !checksum_caps.udp.rx
                         && !udp.verify_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr))
                     {
                         trace!("dhcp: udp checksum incorrect");
@@ -1228,7 +1228,7 @@ impl<'d> Stack<'d> {
             let for_us = iface_state.is_broadcast_v4(dst_addr) || iface_state.has_ip_addr(dst_addr);
             let udp_len = match buf.get_mut(header_len..total_len).map(UdpPacket::new_checked) {
                 Some(Ok(udp)) if for_us && udp.dst_port() == DHCP_SERVER_PORT => {
-                    if checksum_caps.udp.rx()
+                    if !checksum_caps.udp.rx
                         && !udp.verify_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr))
                     {
                         trace!("DHCP server: udp checksum incorrect");
@@ -1354,7 +1354,7 @@ impl<'d> Stack<'d> {
             trace!("tcp: malformed packet");
             return;
         };
-        if self.ifaces.get(iface.index()).checksum_caps().tcp.rx() && !tcp_packet.verify_checksum(&src_addr, &dst_addr)
+        if !self.ifaces.get(iface.index()).checksum_caps().tcp.rx && !tcp_packet.verify_checksum(&src_addr, &dst_addr)
         {
             trace!("tcp: checksum incorrect");
             return;
@@ -1427,7 +1427,7 @@ impl<'d> Stack<'d> {
     #[cfg(feature = "ipv4")]
     fn process_icmpv4(&mut self, iface: IfaceHandle, src_addr: Ipv4Address, dst_addr: Ipv4Address, mut buf: PacketBuf) {
         let mut icmp_packet = check!(Icmpv4Packet::new_checked(&mut buf));
-        if self.ifaces.get(iface.index()).checksum_caps().icmpv4.rx() && !icmp_packet.verify_checksum() {
+        if !self.ifaces.get(iface.index()).checksum_caps().icmpv4.rx && !icmp_packet.verify_checksum() {
             trace!("icmpv4: checksum incorrect");
             return;
         }
@@ -1479,7 +1479,7 @@ impl<'d> Stack<'d> {
                 {
                     let mut reply_icmp = Icmpv4Packet::new_unchecked(&mut buf);
                     reply_icmp.set_msg_type(Icmpv4Message::EchoReply);
-                    if checksum_caps.icmpv4.tx() {
+                    if !checksum_caps.icmpv4.tx {
                         reply_icmp.fill_checksum();
                     } else {
                         reply_icmp.set_checksum(0);
@@ -1676,7 +1676,7 @@ impl<'d> Stack<'d> {
         let _ = iface;
 
         let mut icmp_packet = check!(Icmpv6Packet::new_checked(&mut buf));
-        if self.ifaces.get(iface.index()).checksum_caps().icmpv6.rx()
+        if !self.ifaces.get(iface.index()).checksum_caps().icmpv6.rx
             && !icmp_packet.verify_checksum(&src_addr, &dst_addr)
         {
             trace!("icmpv6: checksum incorrect");
@@ -1715,7 +1715,7 @@ impl<'d> Stack<'d> {
                 {
                     let mut reply_icmp = Icmpv6Packet::new_unchecked(&mut buf);
                     reply_icmp.set_msg_type(Icmpv6Message::EchoReply);
-                    if checksum_caps.icmpv6.tx() {
+                    if !checksum_caps.icmpv6.tx {
                         reply_icmp.fill_checksum(&reply_src, &src_addr);
                     } else {
                         reply_icmp.set_checksum(0);
@@ -2157,7 +2157,7 @@ impl StackInner {
                     NdiscOptionType::TargetLinkLayerAddr,
                     iface.hardware_addr,
                 );
-                if iface.checksum_caps().icmpv6.tx() {
+                if !iface.checksum_caps().icmpv6.tx {
                     na.fill_checksum(&target_addr, &src_addr);
                 } else {
                     na.set_checksum(0);
@@ -2415,7 +2415,7 @@ impl StackInner {
                 NdiscOptionType::SourceLinkLayerAddr,
                 iface.hardware_addr,
             );
-            if iface.checksum_caps().icmpv6.tx() {
+            if !iface.checksum_caps().icmpv6.tx {
                 ns.fill_checksum(&src_addr, &dst_addr);
             } else {
                 ns.set_checksum(0);
@@ -2643,7 +2643,7 @@ pub(crate) fn push_ipv4_header(
     packet.set_next_header(next_header);
     packet.set_src_addr(src_addr);
     packet.set_dst_addr(dst_addr);
-    if checksum_caps.ipv4.tx() {
+    if !checksum_caps.ipv4.tx {
         packet.fill_checksum();
     } else {
         packet.set_checksum(0);
@@ -2695,7 +2695,7 @@ fn build_icmpv4_error(
         icmp.set_msg_code(msg_code);
         icmp.clear_unused();
         icmp.data_mut().copy_from_slice(&orig[..quote_len]);
-        if checksum_caps.icmpv4.tx() {
+        if !checksum_caps.icmpv4.tx {
             icmp.fill_checksum();
         } else {
             icmp.set_checksum(0);
@@ -2732,7 +2732,7 @@ fn build_icmpv6_error(
             icmp.clear_reserved();
         }
         icmp.payload_mut().copy_from_slice(&orig[..quote_len]);
-        if checksum_caps.icmpv6.tx() {
+        if !checksum_caps.icmpv6.tx {
             icmp.fill_checksum(src_addr, dst_addr);
         } else {
             icmp.set_checksum(0);
@@ -2851,7 +2851,7 @@ fn ndisc_lladdr_option(
 pub(crate) mod test {
 
     use super::*;
-    use crate::driver::Checksum;
+    use crate::driver::ChecksumOffload;
     #[cfg(feature = "slaac")]
     use crate::iface::slaac::{SlaacConfig, SlaacState};
     use crate::iface::{AddrOrigin, IfaceAddr};
@@ -5416,17 +5416,15 @@ pub(crate) mod test {
     }
     // ===== Checksum offload =====
 
-    /// Which direction each `Checksum` variant covers.
+    /// The offload constants and defaults.
     #[test]
-    fn test_checksum_directions() {
-        assert!(Checksum::Both.rx() && Checksum::Both.tx());
-        assert!(Checksum::Rx.rx() && !Checksum::Rx.tx());
-        assert!(!Checksum::Tx.rx() && Checksum::Tx.tx());
-        assert!(!Checksum::None.rx() && !Checksum::None.tx());
-        // The default is doing everything in software.
-        assert_eq!(Checksum::default(), Checksum::Both);
-        assert_eq!(ChecksumCapabilities::default().udp, Checksum::Both);
-        assert_eq!(ChecksumCapabilities::ignored().udp, Checksum::None);
+    fn test_checksum_offload_defaults() {
+        assert!(!ChecksumOffload::NONE.rx && !ChecksumOffload::NONE.tx);
+        assert!(ChecksumOffload::BOTH.rx && ChecksumOffload::BOTH.tx);
+        // The default is no offload: everything in software.
+        assert_eq!(ChecksumOffload::default(), ChecksumOffload::NONE);
+        assert_eq!(ChecksumCapabilities::default().udp, ChecksumOffload::NONE);
+        assert_eq!(ChecksumCapabilities::all_offloaded().udp, ChecksumOffload::BOTH);
     }
 
     /// Corrupt the checksum field at `offset` of `packet`.
@@ -5456,7 +5454,7 @@ pub(crate) mod test {
         corrupt_checksum(&mut packet, IPV4_CHECKSUM);
 
         let mut caps = ChecksumCapabilities::default();
-        caps.ipv4 = Checksum::None;
+        caps.ipv4 = ChecksumOffload::BOTH;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -5474,7 +5472,7 @@ pub(crate) mod test {
         let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request);
 
         let mut caps = ChecksumCapabilities::default();
-        caps.icmpv4 = Checksum::None;
+        caps.icmpv4 = ChecksumOffload::BOTH;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -5492,7 +5490,7 @@ pub(crate) mod test {
         let packet = ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol::Icmpv6, &request);
 
         let mut caps = ChecksumCapabilities::default();
-        caps.icmpv6 = Checksum::None;
+        caps.icmpv6 = ChecksumOffload::BOTH;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -5510,7 +5508,7 @@ pub(crate) mod test {
         let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram);
 
         let mut caps = ChecksumCapabilities::default();
-        caps.udp = Checksum::None;
+        caps.udp = ChecksumOffload::BOTH;
         let (mut stack, rx, _tx) = test_stack_with_checksum(Medium::Ip, caps);
         let handle = stack.add_udp_socket().unwrap();
         stack
@@ -5567,7 +5565,7 @@ pub(crate) mod test {
         let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Tcp, &segment);
 
         let mut caps = ChecksumCapabilities::default();
-        caps.tcp = Checksum::None;
+        caps.tcp = ChecksumOffload::BOTH;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -5582,7 +5580,7 @@ pub(crate) mod test {
     #[test]
     fn test_checksum_offload_tx_ipv4() {
         let mut caps = ChecksumCapabilities::default();
-        caps.ipv4 = Checksum::None;
+        caps.ipv4 = ChecksumOffload::BOTH;
         let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         let handle = stack.add_udp_socket().unwrap();
         stack.udp_socket(handle).bind(5000, (REMOTE_V4, 5000)).unwrap();
@@ -5605,7 +5603,7 @@ pub(crate) mod test {
     #[test]
     fn test_checksum_offload_tx_udp() {
         let mut caps = ChecksumCapabilities::default();
-        caps.udp = Checksum::None;
+        caps.udp = ChecksumOffload::BOTH;
         let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         let handle = stack.add_udp_socket().unwrap();
         stack.udp_socket(handle).bind(5000, (REMOTE_V4, 5000)).unwrap();
@@ -5628,7 +5626,7 @@ pub(crate) mod test {
     #[test]
     fn test_checksum_offload_tx_tcp() {
         let mut caps = ChecksumCapabilities::default();
-        caps.tcp = Checksum::None;
+        caps.tcp = ChecksumOffload::BOTH;
         let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         let handle = stack
             .add_tcp_socket_with_bufs(vec![0; 4096].leak(), vec![0; 4096].leak())
@@ -5646,7 +5644,7 @@ pub(crate) mod test {
     #[test]
     fn test_checksum_offload_tx_icmpv4() {
         let mut caps = ChecksumCapabilities::default();
-        caps.icmpv4 = Checksum::None;
+        caps.icmpv4 = ChecksumOffload::BOTH;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
 
         let request = icmpv4_echo(Icmpv4Message::EchoRequest, 0x1234, 7, b"ping");
@@ -5672,7 +5670,7 @@ pub(crate) mod test {
     #[test]
     fn test_checksum_offload_tx_icmpv6() {
         let mut caps = ChecksumCapabilities::default();
-        caps.icmpv6 = Checksum::None;
+        caps.icmpv6 = ChecksumOffload::BOTH;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         let request = icmpv6_echo(Icmpv6Message::EchoRequest, 0x1234, 7, b"ping", REMOTE_V6, OUR_V6);
         inject(

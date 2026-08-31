@@ -258,7 +258,7 @@ impl<'a> TcpRepr<'a> {
         let payload = packet.payload_mut();
         payload[..self.payload.len()].copy_from_slice(self.payload);
         payload[self.payload.len()..].copy_from_slice(self.payload2);
-        if checksum_caps.tcp.tx() {
+        if !checksum_caps.tcp.tx {
             packet.fill_checksum(src_addr, dst_addr)
         } else {
             packet.set_checksum(0);

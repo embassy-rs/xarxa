@@ -89,6 +89,9 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - DHCP client (feature `dhcpv4`)
     - Raw access to all lease options by option number. (feature `dhcpv4-options`)
     - Sends the stack's hostname to the server, if set. (feature `hostname`)
+  - DHCP server (feature `dhcpv4-server`)
+    - Turned on per interface, hands out leases from a configured pool with gateway and DNS options.
+    - API to inspect and remove leases.
   - Fragmentation (feature `ipv4-fragmentation`)
   - Reassembly (feature `ipv4-reassembly`)
 - IPv6 (feature `ipv6`)
@@ -134,7 +137,6 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 
 All of the below is planned. Please open an issue or reach out on [the Matrix chat](https://matrix.to/#/#xarxa:matrix.org) if you want to work on one of these so we don't duplicate work.
 
-- DHCP server
 - Acting on link state: skipping down interfaces on egress routing, restarting DHCP/SLAAC on link-up.
 - IPv6 DAD (duplicate address detection)
 - IPv6 RDNSS (DNS servers from router advertisements)

@@ -598,6 +598,8 @@ impl<'d> Stack<'d> {
             waker: crate::waker::WakerRegistration::new(),
             #[cfg(feature = "dhcpv4")]
             dhcpv4: None,
+            #[cfg(feature = "dhcpv4-server")]
+            dhcpv4_server: None,
             #[cfg(feature = "slaac")]
             slaac: None,
             last_link_state: crate::driver::LinkState::Down,
@@ -1215,6 +1217,32 @@ impl<'d> Stack<'d> {
                 self.ifaces
                     .get_mut(iface.index())
                     .dhcpv4_process(&mut self.inner, src_addr, payload);
+                return;
+            }
+        }
+
+        // Dispatch packets to the DHCP server
+        #[cfg(feature = "dhcpv4-server")]
+        if next_header == IpProtocol::Udp && self.ifaces.get(iface.index()).dhcpv4_server.is_some() {
+            let iface_state = self.ifaces.get(iface.index());
+            let for_us = iface_state.is_broadcast_v4(dst_addr) || iface_state.has_ip_addr(dst_addr);
+            let udp_len = match buf.get_mut(header_len..total_len).map(UdpPacket::new_checked) {
+                Some(Ok(udp)) if for_us && udp.dst_port() == DHCP_SERVER_PORT => {
+                    if checksum_caps.udp.rx()
+                        && !udp.verify_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr))
+                    {
+                        trace!("DHCP server: udp checksum incorrect");
+                        return;
+                    }
+                    Some(udp.len() as usize)
+                }
+                _ => None,
+            };
+            if let Some(udp_len) = udp_len {
+                let payload = &mut buf[header_len + UDP_HEADER_LEN..header_len + udp_len];
+                self.ifaces
+                    .get_mut(iface.index())
+                    .dhcpv4_server_process(&mut self.inner, src_addr, payload);
                 return;
             }
         }
@@ -2543,7 +2571,7 @@ impl StackInner {
     }
 
     #[cfg(feature = "medium-ethernet")]
-    fn transmit_ethernet(
+    pub(crate) fn transmit_ethernet(
         &mut self,
         iface: &mut IfaceState<'_>,
         dst_hw: EthernetAddress,

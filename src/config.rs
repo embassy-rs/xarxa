@@ -223,3 +223,20 @@ pub const DHCP_MAX_DNS_SERVER_COUNT: usize = raw::DHCP_MAX_DNS_SERVER_COUNT;
 ///
 /// This is a limit with and without `alloc`. Default: 128.
 pub const DHCP_OPTIONS_BUF_SIZE: usize = raw::DHCP_OPTIONS_BUF_SIZE;
+
+/// Max leases the DHCP server keeps per interface.
+///
+/// Only used with the `dhcpv4-server` feature. This bounds how many clients can
+/// hold an address at once. Expired and released leases stay in the table as
+/// records until a new client needs their slot.
+///
+/// This is a limit with and without `alloc`. Default: 8.
+pub const DHCP_SERVER_LEASE_COUNT: usize = raw::DHCP_SERVER_LEASE_COUNT;
+
+/// Longest DHCP client identifier a server lease can store, in bytes.
+///
+/// Only used with the `dhcpv4-server` feature. A client sending a longer
+/// identifier is identified by its hardware address instead.
+///
+/// This is a limit with and without `alloc`. Default: 24.
+pub const DHCP_SERVER_CLIENT_ID_SIZE: usize = raw::DHCP_SERVER_CLIENT_ID_SIZE;

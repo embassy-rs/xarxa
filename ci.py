@@ -86,18 +86,21 @@ EXTRAS = [
     "dhcpv4,defmt",
     "dhcpv4-options",
     "dhcpv4-options,defmt",
+    "dhcpv4-server",
+    "dhcpv4-server,defmt",
+    "dhcpv4,dhcpv4-server",
     "multicast",
     "multicast,defmt",
     "multicast,icmp-errors,icmp-ping-reply",
     "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,tcp-sack,"
-    "packet-log,dhcpv4,dhcpv4-options,multicast,ipv4-fragmentation,ipv4-reassembly,"
+    "packet-log,dhcpv4,dhcpv4-options,dhcpv4-server,multicast,ipv4-fragmentation,ipv4-reassembly,"
     "medium-ieee802154,sixlowpan-fragmentation,sixlowpan-reassembly,slaac",
 ]
 
 # The whole API, minus the features that are mutually exclusive with another.
 FULL = (
     "medium-ethernet,medium-ip,medium-ieee802154,ipv4,ipv6,raw-ethernet,raw-ip,udp,tcp,tcp-listener,"
-    "std,log,async,icmp-errors,icmp-ping-reply,iface-bind,multicast,slaac,dhcpv4,dhcpv4-options,"
+    "std,log,async,icmp-errors,icmp-ping-reply,iface-bind,multicast,slaac,dhcpv4,dhcpv4-options,dhcpv4-server,"
     "dns,mdns,packetmeta-timestamp,tcp-timestamps,tcp-sack,ipv4-fragmentation,ipv4-reassembly,"
     "sixlowpan-fragmentation,sixlowpan-reassembly"
 )

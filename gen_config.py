@@ -79,6 +79,11 @@ feature("dns_max_name_size", default=255, min=64, max=255, pow2=True)
 feature("dhcp_max_dns_server_count", default=3, min=1, max=8)
 feature("dhcp_options_buf_size", default=128, min=16, max=1024, pow2=True)
 
+# DHCP server (feature `dhcpv4-server`): lease table entries per interface, and
+# the longest client identifier a lease can store.
+feature("dhcp_server_lease_count", default=8, min=1, max=64, pow2=8)
+feature("dhcp_server_client_id_size", default=24, min=8, max=64, pow2=True)
+
 # ========= Update Cargo.toml and build.rs of both crates
 
 

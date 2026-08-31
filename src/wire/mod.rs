@@ -71,7 +71,12 @@ mod ndiscoption;
 pub(crate) mod sixlowpan;
 #[cfg(feature = "tcp")]
 mod tcp;
-#[cfg(any(feature = "udp", feature = "dhcpv4", feature = "medium-ieee802154"))]
+#[cfg(any(
+    feature = "udp",
+    feature = "dhcpv4",
+    feature = "dhcpv4-server",
+    feature = "medium-ieee802154"
+))]
 mod udp;
 
 use core::fmt;
@@ -104,7 +109,7 @@ pub use self::arp::{
     BUFFER_LEN as ARP_BUFFER_LEN, Hardware as ArpHardware, Operation as ArpOperation, Packet as ArpPacket,
 };
 
-#[cfg(feature = "dhcpv4")]
+#[cfg(any(feature = "dhcpv4", feature = "dhcpv4-server"))]
 pub(crate) use self::dhcpv4::field as dhcpv4_field;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 pub use self::dhcpv4::{
@@ -196,7 +201,12 @@ pub use self::tcp::{
     Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, Packet as TcpPacket, SeqNumber as TcpSeqNumber, TcpOption,
 };
 
-#[cfg(any(feature = "udp", feature = "dhcpv4", feature = "medium-ieee802154"))]
+#[cfg(any(
+    feature = "udp",
+    feature = "dhcpv4",
+    feature = "dhcpv4-server",
+    feature = "medium-ieee802154"
+))]
 pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket};
 
 #[cfg(feature = "dns")]

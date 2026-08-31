@@ -6,9 +6,13 @@
 //!
 //! The two autoconfiguration methods are [`dhcpv4`] and [`slaac`], each turned
 //! on per interface and driven by [`Stack::poll`].
+//!
+//! An interface can also hand out addresses itself, as a [`dhcpv4_server`].
 
 #[cfg(feature = "dhcpv4")]
 pub mod dhcpv4;
+#[cfg(feature = "dhcpv4-server")]
+pub mod dhcpv4_server;
 #[cfg(feature = "slaac")]
 pub mod slaac;
 
@@ -173,6 +177,8 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) waker: crate::waker::WakerRegistration,
     #[cfg(feature = "dhcpv4")]
     pub(crate) dhcpv4: Option<self::dhcpv4::Client>,
+    #[cfg(feature = "dhcpv4-server")]
+    pub(crate) dhcpv4_server: Option<self::dhcpv4_server::Server>,
     #[cfg(feature = "slaac")]
     pub(crate) slaac: Option<self::slaac::Slaac>,
     /// Link state at the previous poll, for spotting a change.
@@ -485,6 +491,60 @@ impl<'d> Iface<'_, 'd> {
     pub fn restart_dhcpv4(&mut self) {
         let Iface { inner, ifaces, index } = self;
         ifaces.get_mut(*index).dhcpv4_reset(inner);
+    }
+
+    /// Turn the DHCPv4 server on, with the given configuration, or off with `None`.
+    ///
+    /// While on, the stack answers DHCP requests arriving on this interface,
+    /// handing out addresses from the configured pool.
+    ///
+    /// You must configure at least one IPv4 address on the interface, and the
+    /// pool must be inside its subnet.
+    ///
+    /// Turning the server off, or on again with a new configuration, drops all
+    /// leases.
+    ///
+    /// # Panics
+    /// Panics if the interface is not an Ethernet interface, or if the pool is
+    /// backwards (`pool_start` above `pool_end`).
+    #[cfg(feature = "dhcpv4-server")]
+    pub fn set_dhcpv4_server(&mut self, config: Option<self::dhcpv4_server::DhcpServerConfig>) {
+        assert!(
+            matches!(self.state().hardware_addr, HardwareAddress::Ethernet(_)),
+            "the DHCPv4 server needs an Ethernet interface"
+        );
+        if let Some(config) = &config {
+            assert!(
+                config.pool_start.to_bits() <= config.pool_end.to_bits(),
+                "the DHCP pool ends before it starts"
+            );
+        }
+        self.state_mut().dhcpv4_server = config.map(self::dhcpv4_server::Server::new);
+    }
+
+    /// The DHCP server's lease table. Empty if the server is off.
+    ///
+    /// All entries are returned, whether their lease is running or already over.
+    /// Check each entry's [`state`](self::dhcpv4_server::DhcpServerLease::state)
+    /// and [`expires_at`](self::dhcpv4_server::DhcpServerLease::expires_at).
+    #[cfg(feature = "dhcpv4-server")]
+    pub fn dhcpv4_server_leases(&self) -> &[self::dhcpv4_server::DhcpServerLease] {
+        match &self.state().dhcpv4_server {
+            Some(server) => server.leases(),
+            None => &[],
+        }
+    }
+
+    /// Remove the DHCP server lease of the given address, freeing it for other
+    /// clients. Returns whether there was one.
+    ///
+    /// The client is not told: it keeps using the address until it next renews.
+    #[cfg(feature = "dhcpv4-server")]
+    pub fn remove_dhcpv4_server_lease(&mut self, address: Ipv4Address) -> bool {
+        match &mut self.state_mut().dhcpv4_server {
+            Some(server) => server.remove_lease(address),
+            None => false,
+        }
     }
 }
 

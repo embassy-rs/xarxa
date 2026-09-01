@@ -640,6 +640,8 @@ impl IfaceState<'_> {
         if self.has_link_layer() {
             self.update_solicited_node_groups();
         }
+        #[cfg(feature = "medium-ethernet")]
+        self.sync_multicast_filter();
         self.config_generation = self.config_generation.wrapping_add(1);
         #[cfg(feature = "async")]
         self.waker.wake();
@@ -837,6 +839,55 @@ impl IfaceState<'_> {
             #[cfg(feature = "ipv6")]
             IpAddress::Ipv6(key) => key == IPV6_LINK_LOCAL_ALL_NODES || self.has_solicited_node(key),
         }
+    }
+
+    /// Report the multicast hardware addresses the interface listens on to the
+    /// driver's filter: the groups every host is in, the solicited-node group of
+    /// each assigned IPv6 address, and the joined groups. The driver gets the
+    /// whole list every time, changed or not: keeping the last list to compare
+    /// against would cost every interface a copy of it, for calls that only
+    /// happen on configuration changes.
+    #[cfg(feature = "medium-ethernet")]
+    pub(crate) fn sync_multicast_filter(&mut self) {
+        if self.medium() != Medium::Ethernet {
+            return;
+        }
+
+        // Worst-case size of the set.
+        const MAX_COUNT: usize = crate::config::MULTICAST_GROUP_COUNT + crate::config::IFACE_ADDR_COUNT + 2;
+
+        let mut desired: Vec<[u8; 6], MAX_COUNT> = Vec::new();
+        let mut push = |addr: EthernetAddress| {
+            if !desired.contains(&addr.0) && desired.push(addr.0).is_err() {
+                warn!("iface: multicast filter table full, address not reported to the driver");
+            }
+        };
+
+        #[cfg(feature = "ipv4")]
+        push(IPV4_MULTICAST_ALL_SYSTEMS.multicast_ethernet_addr());
+        #[cfg(feature = "ipv6")]
+        push(IPV6_LINK_LOCAL_ALL_NODES.multicast_ethernet_addr());
+
+        // The solicited-node groups follow the assigned addresses. With `multicast`
+        // they are also joined as regular groups, but ingress accepts them even if
+        // the group table had no room for one, so derive them from the addresses
+        // directly rather than trusting the group table.
+        #[cfg(feature = "ipv6")]
+        for cidr in self.cidrs() {
+            #[allow(irrefutable_let_patterns)]
+            if let IpCidr::Ipv6(cidr) = cidr
+                && cidr.address() != Ipv6Address::LOCALHOST
+            {
+                push(cidr.address().solicited_node().multicast_ethernet_addr());
+            }
+        }
+
+        #[cfg(feature = "multicast")]
+        for group in self.multicast.active_groups() {
+            push(group.multicast_ethernet_addr());
+        }
+
+        self.driver.set_multicast_filter(&desired);
     }
 
     /// Get the first link-local IPv6 address of the interface, if present.

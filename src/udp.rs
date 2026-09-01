@@ -919,8 +919,7 @@ impl Stack<'_> {
             trace!("udp: malformed packet");
             return;
         };
-        if !self.ifaces.get(iface.index()).checksum_caps().udp.rx && !udp_packet.verify_checksum(&src_addr, &dst_addr)
-        {
+        if !self.ifaces.get(iface.index()).checksum_caps().udp.rx && !udp_packet.verify_checksum(&src_addr, &dst_addr) {
             trace!("udp: checksum incorrect");
             return;
         }

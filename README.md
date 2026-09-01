@@ -127,6 +127,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Join and leave multicast groups per interface.
   - IGMPv1/IGMPv2 (IPv4) and MLDv2 (IPv6): membership is reported on join and leave, and in response to router queries.
   - The IPv6 solicited-node groups of the interface's addresses are joined automatically.
+  - The multicast hardware addresses the stack listens on are reported to the driver, for devices that filter multicast in hardware.
 - Bind sockets to an interface, like Linux's `SO_BINDTODEVICE`. (feature `iface-bind`)
 - Packet metadata
   - Support for hardware timestamping on both RX and TX. Allows implementing protocols like PTP, NTP. (feature `packetmeta-timestamp`)

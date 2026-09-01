@@ -619,6 +619,8 @@ impl<'d> Stack<'d> {
         if self.ifaces.get(index).has_link_layer() {
             self.ifaces.get_mut(index).update_solicited_node_groups();
         }
+        #[cfg(feature = "medium-ethernet")]
+        self.ifaces.get_mut(index).sync_multicast_filter();
         Ok(IfaceHandle::new(index))
     }
 
@@ -1354,8 +1356,7 @@ impl<'d> Stack<'d> {
             trace!("tcp: malformed packet");
             return;
         };
-        if !self.ifaces.get(iface.index()).checksum_caps().tcp.rx && !tcp_packet.verify_checksum(&src_addr, &dst_addr)
-        {
+        if !self.ifaces.get(iface.index()).checksum_caps().tcp.rx && !tcp_packet.verify_checksum(&src_addr, &dst_addr) {
             trace!("tcp: checksum incorrect");
             return;
         }
@@ -2322,18 +2323,7 @@ impl StackInner {
         if dst_addr.is_multicast() {
             let hardware_addr = match iface.medium() {
                 #[cfg(feature = "medium-ethernet")]
-                Medium::Ethernet => HardwareAddress::Ethernet(match *dst_addr {
-                    #[cfg(feature = "ipv4")]
-                    IpAddress::Ipv4(addr) => {
-                        let b = addr.octets();
-                        EthernetAddress::from_bytes(&[0x01, 0x00, 0x5e, b[1] & 0x7F, b[2], b[3]])
-                    }
-                    #[cfg(feature = "ipv6")]
-                    IpAddress::Ipv6(addr) => {
-                        let b = addr.octets();
-                        EthernetAddress::from_bytes(&[0x33, 0x33, b[12], b[13], b[14], b[15]])
-                    }
-                }),
+                Medium::Ethernet => HardwareAddress::Ethernet(dst_addr.multicast_ethernet_addr()),
                 // RFC 4944 §9: IPv6 multicast is broadcast on the link.
                 #[cfg(feature = "medium-ieee802154")]
                 Medium::Ieee802154 => HardwareAddress::Ieee802154(Ieee802154Address::BROADCAST),
@@ -5695,5 +5685,79 @@ pub(crate) mod test {
             checksum_at(&tx[0], ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + ICMP_CHECKSUM),
             0
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "ipv4", feature = "ipv6", feature = "multicast"))]
+    fn test_multicast_filter_sync() {
+        const ALL_SYSTEMS: [u8; 6] = [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01];
+        const ALL_NODES: [u8; 6] = [0x33, 0x33, 0x00, 0x00, 0x00, 0x01];
+        // Solicited-node group of the link-local address derived from OUR_HW.
+        const SOL_LL: [u8; 6] = [0x33, 0x33, 0xff, 0x00, 0x00, 0x01];
+
+        let driver = TestDevice::new(Medium::Ethernet);
+        let filter = driver.mcast_filter.clone();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
+
+        // The lists the driver was given since the last call, each sorted, so the
+        // order the interface builds them in doesn't matter.
+        let sets = || {
+            let mut lists = filter.borrow_mut().drain(..).collect::<Vec<_>>();
+            for list in lists.iter_mut() {
+                list.sort();
+            }
+            lists
+        };
+        let sorted = |addrs: &[[u8; 6]]| {
+            let mut v = addrs.to_vec();
+            v.sort();
+            v
+        };
+
+        // Adding the interface sets the groups every host is in, plus the
+        // solicited-node group of the derived link-local address.
+        let base = [ALL_SYSTEMS, ALL_NODES, SOL_LL];
+        assert_eq!(sets(), [sorted(&base)]);
+
+        // OUR_V6's solicited-node group maps to the same Ethernet address as the
+        // link-local one (their low 24 bits match), so assigning it changes
+        // nothing. The driver still gets the (same) list: the interface doesn't
+        // keep the last one to compare against.
+        stack
+            .iface(handle)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)])
+            .unwrap();
+        assert_eq!(sets(), [sorted(&base)]);
+
+        // An address with different low bits brings its own filter entry, and
+        // takes it along when it goes.
+        let other = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 0x1234);
+        let sol_other = [0x33, 0x33, 0xff, 0x00, 0x12, 0x34];
+        stack.iface(handle).add_ip_addr(IpCidr::new(other.into(), 64)).unwrap();
+        assert_eq!(sets(), [sorted(&[ALL_SYSTEMS, ALL_NODES, SOL_LL, sol_other])]);
+        stack.iface(handle).remove_ip_addr(other);
+        assert_eq!(sets(), [sorted(&base)]);
+
+        // Joined groups are reported as they come and go.
+        let group_v4 = Ipv4Address::new(224, 0, 1, 60);
+        let mac_v4 = [0x01, 0x00, 0x5e, 0x00, 0x01, 0x3c];
+        stack.iface(handle).join_multicast_group(group_v4).unwrap();
+        assert_eq!(sets(), [sorted(&[ALL_SYSTEMS, ALL_NODES, SOL_LL, mac_v4])]);
+
+        // Two IPv6 groups with the same low 32 bits share one filter entry: it
+        // appears with the first join and goes with the last leave.
+        let group_a = Ipv6Address::new(0xff05, 0, 0, 0, 0, 0, 0, 7);
+        let group_b = Ipv6Address::new(0xff0e, 0, 0, 0, 0, 0, 0, 7);
+        let mac_ab = [0x33, 0x33, 0x00, 0x00, 0x00, 0x07];
+        let with_ab = sorted(&[ALL_SYSTEMS, ALL_NODES, SOL_LL, mac_v4, mac_ab]);
+        stack.iface(handle).join_multicast_group(group_a).unwrap();
+        assert_eq!(sets(), [with_ab.clone()]);
+        stack.iface(handle).join_multicast_group(group_b).unwrap();
+        assert_eq!(sets(), [with_ab.clone()]);
+        stack.iface(handle).leave_multicast_group(group_a).unwrap();
+        assert_eq!(sets(), [with_ab]);
+        stack.iface(handle).leave_multicast_group(group_b).unwrap();
+        assert_eq!(sets(), [sorted(&[ALL_SYSTEMS, ALL_NODES, SOL_LL, mac_v4])]);
     }
 }

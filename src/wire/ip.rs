@@ -118,6 +118,26 @@ impl Address {
         }
     }
 
+    /// The Ethernet address this multicast address maps to.
+    ///
+    /// IPv4 groups map per RFC 1112, IPv6 groups per RFC 2464. Both mappings
+    /// drop part of the group address, so distinct groups can map to the same
+    /// Ethernet address.
+    ///
+    /// Only with the `medium-ethernet` feature.
+    ///
+    /// # Panics
+    /// Panics if the address is not multicast.
+    #[cfg(feature = "medium-ethernet")]
+    pub fn multicast_ethernet_addr(&self) -> crate::wire::EthernetAddress {
+        match self {
+            #[cfg(feature = "ipv4")]
+            Address::Ipv4(addr) => addr.multicast_ethernet_addr(),
+            #[cfg(feature = "ipv6")]
+            Address::Ipv6(addr) => addr.multicast_ethernet_addr(),
+        }
+    }
+
     /// Query whether the address is the broadcast address.
     pub fn is_broadcast(&self) -> bool {
         match self {

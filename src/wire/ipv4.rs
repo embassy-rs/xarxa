@@ -47,12 +47,29 @@ pub(crate) trait AddressExt {
     /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
     /// where `prefix_len` is the number of leading zeroes. Return `None` otherwise.
     fn prefix_len(&self) -> Option<u8>;
+
+    /// The Ethernet address this multicast address maps to (RFC 1112 §6.4).
+    ///
+    /// The mapping drops the top 5 bits of the group, so distinct groups can
+    /// map to the same Ethernet address.
+    ///
+    /// # Panics
+    /// Panics if the address is not multicast.
+    #[cfg(feature = "medium-ethernet")]
+    fn multicast_ethernet_addr(&self) -> super::EthernetAddress;
 }
 
 impl AddressExt for Address {
     /// Query whether the address is an unicast address.
     fn x_is_unicast(&self) -> bool {
         !(self.is_broadcast() || self.is_multicast() || self.is_unspecified())
+    }
+
+    #[cfg(feature = "medium-ethernet")]
+    fn multicast_ethernet_addr(&self) -> super::EthernetAddress {
+        assert!(self.is_multicast());
+        let b = self.octets();
+        super::EthernetAddress([0x01, 0x00, 0x5e, b[1] & 0x7F, b[2], b[3]])
     }
 
     fn prefix_len(&self) -> Option<u8> {

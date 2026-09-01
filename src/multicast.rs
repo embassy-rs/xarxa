@@ -136,6 +136,16 @@ impl State {
     fn keys(&self) -> impl Iterator<Item = &IpAddress> + Clone + '_ {
         self.groups.iter().map(|(addr, _)| addr)
     }
+
+    /// The addresses of the groups the interface listens on: the joined
+    /// groups, not counting the ones being left.
+    #[cfg(feature = "medium-ethernet")]
+    pub(crate) fn active_groups(&self) -> impl Iterator<Item = &IpAddress> + '_ {
+        self.groups
+            .iter()
+            .filter(|(_, state)| !matches!(state, GroupState::Leaving))
+            .map(|(addr, _)| addr)
+    }
 }
 
 impl core::fmt::Display for MulticastError {
@@ -158,7 +168,10 @@ impl Iface<'_, '_> {
     /// Errors:
     /// - `Unaddressable` if the address is not a multicast address.
     pub fn join_multicast_group<T: Into<IpAddress>>(&mut self, addr: T) -> Result<(), MulticastError> {
-        self.state_mut().join_multicast_group(addr)
+        let res = self.state_mut().join_multicast_group(addr);
+        #[cfg(feature = "medium-ethernet")]
+        self.state_mut().sync_multicast_filter();
+        res
     }
 
     /// Leave a multicast group.
@@ -171,7 +184,10 @@ impl Iface<'_, '_> {
     /// Errors:
     /// - `Unaddressable` if the address is not a multicast address.
     pub fn leave_multicast_group<T: Into<IpAddress>>(&mut self, addr: T) -> Result<(), MulticastError> {
-        self.state_mut().leave_multicast_group(addr)
+        let res = self.state_mut().leave_multicast_group(addr);
+        #[cfg(feature = "medium-ethernet")]
+        self.state_mut().sync_multicast_filter();
+        res
     }
 
     /// Check whether the interface listens to the given multicast address.

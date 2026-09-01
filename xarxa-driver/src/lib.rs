@@ -295,6 +295,28 @@ pub trait Driver {
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         None
     }
+
+    /// Set the device's multicast hardware address filter.
+    ///
+    /// `addrs` is the full list of multicast MAC addresses to listen on. It
+    /// replaces the previous one.
+    ///
+    /// A device with no multicast filter can ignore the calls, which
+    /// is the default implementation.
+    ///
+    /// Only called for [`Medium::Ethernet`] devices. The list has no duplicates.
+    ///
+    /// It may be the same list as last time: the stack does not compare. If
+    /// applying the filter is expensive, the driver should should keep the last
+    /// list and skip if there were no changes.
+    ///
+    /// If the list does not fit the filter, receive the addresses anyway if
+    /// possible, for example by turning the filter off or switching it to
+    /// receive all multicast. Losing filter efficiency is fine, filtering out
+    /// traffic the network stack wants is not.
+    fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
+        let _ = addrs;
+    }
 }
 
 impl<T: Driver + ?Sized> Driver for &mut T {
@@ -323,5 +345,8 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         T::poll_tx_timestamp(self)
+    }
+    fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
+        T::set_multicast_filter(self, addrs)
     }
 }

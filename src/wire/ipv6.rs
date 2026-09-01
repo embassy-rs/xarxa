@@ -103,6 +103,16 @@ pub(crate) trait AddressExt {
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn solicited_node(&self) -> Address;
 
+    /// The Ethernet address this multicast address maps to (RFC 2464 §7).
+    ///
+    /// The mapping keeps only the low 32 bits of the group, so distinct groups
+    /// can map to the same Ethernet address.
+    ///
+    /// # Panics
+    /// Panics if the address is not multicast.
+    #[cfg(feature = "medium-ethernet")]
+    fn multicast_ethernet_addr(&self) -> super::EthernetAddress;
+
     /// Return the scope of the address.
     ///
     /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
@@ -153,6 +163,13 @@ impl AddressExt for Address {
         Address::from([
             0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, o[13], o[14], o[15],
         ])
+    }
+
+    #[cfg(feature = "medium-ethernet")]
+    fn multicast_ethernet_addr(&self) -> super::EthernetAddress {
+        assert!(self.is_multicast());
+        let b = self.octets();
+        super::EthernetAddress([0x33, 0x33, b[12], b[13], b[14], b[15]])
     }
 
     fn x_multicast_scope(&self) -> MulticastScope {

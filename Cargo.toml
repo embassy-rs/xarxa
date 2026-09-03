@@ -6,6 +6,14 @@ exclude = ["bench", "xarxa_old"]
 name = "xarxa"
 version = "0.1.0"
 edition = "2024"
+description = "Network stack designed for embedded, real-time systems without a heap."
+documentation = "https://docs.rs/xarxa/"
+homepage = "https://github.com/embassy-rs/xarxa"
+repository = "https://github.com/embassy-rs/xarxa.git"
+readme = "README.md"
+keywords = ["ip", "tcp", "udp", "ethernet", "network"]
+categories = ["embedded", "network-programming"]
+license = "0BSD"
 
 [package.metadata.embassy_docs]
 src_base = "https://github.com/embassy-rs/xarxa/blob/xarxa-v$VERSION/src/"
@@ -47,6 +55,7 @@ default = [
     "tcp-cubic",
     "tcp-timestamps",
     "tcp-sack",
+    "iface-bind",
     "packetmeta-timestamp",
 ]
 

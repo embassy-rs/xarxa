@@ -2,12 +2,26 @@
 name = "xarxa-driver"
 version = "0.1.0"
 edition = "2024"
+description = "Driver trait for the `xarxa` network stack."
+documentation = "https://docs.rs/xarxa/"
+homepage = "https://github.com/embassy-rs/xarxa"
+repository = "https://github.com/embassy-rs/xarxa.git"
+readme = "README.md"
+keywords = ["ip", "tcp", "udp", "ethernet", "network"]
+categories = ["embedded", "network-programming"]
+license = "0BSD"
 
 [package.metadata.embassy_docs]
 src_base = "https://github.com/embassy-rs/xarxa/blob/xarxa-driver-v$VERSION/xarxa-driver/src/"
 src_base_git = "https://github.com/embassy-rs/xarxa/blob/$COMMIT/xarxa-driver/src/"
 features = ["packetmeta-timestamp", "async"]
 target = "x86_64-unknown-linux-gnu"
+
+[package.metadata.docs.rs]
+# No feature is on by default, so document everything that adds API. defmt is
+# left out: it only adds `defmt::Format` impls.
+features = ["async", "packetmeta-timestamp"]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
 ## Derive `defmt::Format` on the types in this crate.

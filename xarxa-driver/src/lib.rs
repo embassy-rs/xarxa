@@ -223,7 +223,7 @@ pub trait Driver {
     /// Only one waker is kept. Registering another replaces it. Wakes are
     /// allowed to be spurious.
     ///
-    /// A registered waker is woken just one. The main loop must re-register it if
+    /// A registered waker is woken just once. The main loop must re-register it if
     /// it wants to be woken again.
     ///
     /// Drivers that cannot wake anything return `Err(NotSupported)`, which is the
@@ -296,6 +296,25 @@ pub trait Driver {
         None
     }
 
+    /// Register a waker for transmit timestamp availability.
+    ///
+    /// This registration is independent of [`register_waker`](Self::register_waker).
+    /// Register before each poll of [`poll_tx_timestamp`](Self::poll_tx_timestamp):
+    /// if that poll returns `None`, a later fresh timestamp must wake the waker.
+    /// That wake may rely on ordinary driver polling.
+    ///
+    /// Only one waker is kept. Registering another replaces it. Wakes are
+    /// allowed to be spurious. Drivers may retain the registration after waking.
+    /// Registration never consumes timestamps.
+    ///
+    /// Returns `Err(NotSupported)` if timestamp notification is unavailable, which is the
+    /// default implementation. In that case synchronous timestamp polling remains usable.
+    #[cfg(all(feature = "async", feature = "packetmeta-timestamp"))]
+    fn register_tx_timestamp_waker(&mut self, waker: &Waker) -> Result<(), NotSupported> {
+        let _ = waker;
+        Err(NotSupported)
+    }
+
     /// Set the device's multicast hardware address filter.
     ///
     /// `addrs` is the full list of multicast MAC addresses to listen on. It
@@ -345,6 +364,10 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         T::poll_tx_timestamp(self)
+    }
+    #[cfg(all(feature = "async", feature = "packetmeta-timestamp"))]
+    fn register_tx_timestamp_waker(&mut self, waker: &Waker) -> Result<(), NotSupported> {
+        T::register_tx_timestamp_waker(self, waker)
     }
     fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
         T::set_multicast_filter(self, addrs)

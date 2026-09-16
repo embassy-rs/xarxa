@@ -27,7 +27,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 ## Derive `defmt::Format` on the types in this crate.
 defmt = ["dep:defmt"]
 
-## Enable the async parts of the driver API: `Driver::register_waker`.
+## Enable driver waker registration.
 async = []
 
 #! ### Packet metadata

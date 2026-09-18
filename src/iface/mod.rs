@@ -19,13 +19,19 @@ pub mod slaac;
 #[cfg(feature = "multicast")]
 pub use crate::multicast::MulticastError;
 
+#[cfg(feature = "packetmeta-timestamp")]
+use crate::config::TX_TIMESTAMP_QUEUE_COUNT;
 use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
+#[cfg(feature = "packetmeta-timestamp")]
+use crate::driver::TxTimestamp;
 use crate::driver::config::PACKET_BUF_SIZE;
 use crate::driver::{Capabilities, ChecksumCapabilities, Driver, LinkState};
 use crate::error::Full;
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 use crate::fragmentation::Fragmenter;
 use crate::stack::{Stack, StackInner};
+#[cfg(feature = "packetmeta-timestamp")]
+use crate::storage::BoundedDeque;
 use crate::storage::{MaybeBox, Slab, Vec};
 use crate::time::Instant;
 use crate::wire::*;
@@ -242,6 +248,10 @@ pub(crate) fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAdd
 pub(crate) struct IfaceState<'d> {
     pub(crate) handle: IfaceHandle,
     pub(crate) driver: MaybeBox<'d, dyn Driver + 'd>,
+    #[cfg(feature = "packetmeta-timestamp")]
+    pub(crate) tx_timestamps: BoundedDeque<TxTimestamp, TX_TIMESTAMP_QUEUE_COUNT>,
+    #[cfg(all(feature = "packetmeta-timestamp", feature = "async"))]
+    pub(crate) tx_timestamp_waker: crate::waker::WakerRegistration,
     /// The driver's medium, converted and checked when the interface is added.
     pub(crate) medium: Medium,
     /// The driver's capabilities, read when the interface is added.
@@ -312,7 +322,7 @@ impl<'d> Iface<'_, 'd> {
         self.state().ip_mtu()
     }
 
-    /// Poll the device for the timestamp of an already-transmitted packet, sent with
+    /// Poll for the timestamp of an already-transmitted packet, sent with
     /// [`PacketMeta::request_timestamp`](crate::driver::PacketMeta::request_timestamp) set.
     ///
     /// Returns `None` if no timestamp is available right now, which is also all a
@@ -320,9 +330,23 @@ impl<'d> Iface<'_, 'd> {
     /// [`Driver::poll_tx_timestamp`] for what a caller must tolerate: timestamps
     /// arrive an arbitrary time after the packet was sent, possibly out of order, and
     /// possibly never.
+    /// See [`crate::config::TX_TIMESTAMP_QUEUE_COUNT`] for report retention limits.
     #[cfg(feature = "packetmeta-timestamp")]
     pub fn poll_tx_timestamp(&mut self) -> Option<crate::driver::TxTimestamp> {
-        self.state_mut().driver.poll_tx_timestamp()
+        let state = self.state_mut();
+        if let Some(timestamp) = state.tx_timestamps.pop_front() {
+            return Some(timestamp);
+        }
+        state.driver.poll_tx_timestamp()
+    }
+
+    /// Register a waker for transmit timestamp reports.
+    ///
+    /// Register before each poll. Only one timestamp waiter is supported per
+    /// interface. Notifications require the stack to keep polling its drivers.
+    #[cfg(all(feature = "packetmeta-timestamp", feature = "async"))]
+    pub fn register_tx_timestamp_waker(&mut self, waker: &core::task::Waker) {
+        self.state_mut().tx_timestamp_waker.register(waker);
     }
 
     /// The hardware address of the interface.
@@ -755,7 +779,19 @@ impl IfaceState<'_> {
         feature = "medium-ieee802154"
     ))]
     pub(crate) fn can_transmit(&mut self) -> bool {
+        #[cfg(feature = "packetmeta-timestamp")]
+        self.drain_tx_timestamps();
         self.driver.can_transmit()
+    }
+
+    #[cfg(feature = "packetmeta-timestamp")]
+    pub(crate) fn drain_tx_timestamps(&mut self) {
+        while let Some(timestamp) = self.driver.poll_tx_timestamp() {
+            // A full report queue must not prevent driver completion processing.
+            let _ = self.tx_timestamps.push_back(timestamp);
+            #[cfg(feature = "async")]
+            self.tx_timestamp_waker.wake();
+        }
     }
 
     /// Whether a new packet can be handed to the interface right now.

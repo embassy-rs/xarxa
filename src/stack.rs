@@ -601,6 +601,10 @@ impl<'d> Stack<'d> {
             hardware_addr,
             ip_addrs,
             config_generation: 0,
+            #[cfg(feature = "packetmeta-timestamp")]
+            tx_timestamps: crate::storage::BoundedDeque::new(),
+            #[cfg(all(feature = "packetmeta-timestamp", feature = "async"))]
+            tx_timestamp_waker: crate::waker::WakerRegistration::new(),
             #[cfg(feature = "async")]
             waker: crate::waker::WakerRegistration::new(),
             #[cfg(feature = "dhcpv4")]
@@ -940,6 +944,12 @@ impl<'d> Stack<'d> {
     pub fn poll(&mut self, timestamp: Instant) -> Instant {
         self.inner.now = timestamp;
 
+        // Timestamp polling may release TX buffers needed by other interfaces.
+        #[cfg(feature = "packetmeta-timestamp")]
+        for (_, iface) in self.ifaces.iter_mut() {
+            iface.drain_tx_timestamps();
+        }
+
         // Drop queued packets whose neighbor resolution timed out.
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         self.inner.pending.purge_expired(timestamp);
@@ -956,7 +966,13 @@ impl<'d> Stack<'d> {
             self.poll_neighbor_timers(handle);
 
             #[allow(unused_mut)]
-            while let Some(mut buf) = self.ifaces.get_mut(index).driver.receive() {
+            loop {
+                let iface = self.ifaces.get_mut(index);
+                #[cfg(feature = "packetmeta-timestamp")]
+                iface.drain_tx_timestamps();
+                let Some(mut buf) = iface.driver.receive() else {
+                    break;
+                };
                 #[cfg(feature = "packet-log")]
                 {
                     trace!("received on iface {}", index);
@@ -2565,6 +2581,8 @@ impl StackInner {
     }
 
     pub(crate) fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
+        #[cfg(feature = "packetmeta-timestamp")]
+        iface.drain_tx_timestamps();
         #[cfg(feature = "packet-log")]
         {
             trace!("sent on iface {}", iface.handle.index());
@@ -4320,6 +4338,105 @@ pub(crate) mod test {
                 timestamp: TX_STAMP,
             })
         );
+        assert_eq!(stack.iface(iface).poll_tx_timestamp(), None);
+    }
+
+    #[test]
+    #[cfg(all(feature = "packetmeta-timestamp", feature = "async"))]
+    fn test_tx_timestamp_overflow_and_notification() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        use crate::config::TX_TIMESTAMP_QUEUE_COUNT;
+        use crate::driver::{Capabilities, Driver, Timestamp, TxTimestamp};
+
+        struct TimestampDevice {
+            device: TestDevice,
+            pending: Option<PacketBuf>,
+        }
+        impl Driver for TimestampDevice {
+            fn capabilities(&self) -> Capabilities {
+                self.device.capabilities()
+            }
+            fn hardware_address(&self) -> crate::driver::HardwareAddress {
+                self.device.hardware_address()
+            }
+            fn receive(&mut self) -> Option<PacketBuf> {
+                assert!(self.pending.is_none());
+                None
+            }
+            fn can_transmit(&mut self) -> bool {
+                self.pending.is_none()
+            }
+            fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
+                assert!(self.pending.is_none());
+                self.pending = Some(buf);
+                Ok(())
+            }
+            fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
+                let buf = self.pending.take()?;
+                Some(TxTimestamp {
+                    id: buf.meta().id,
+                    timestamp: Timestamp::from_seconds_and_nanos(1, 0),
+                })
+            }
+        }
+
+        #[derive(Default)]
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut driver = TimestampDevice {
+            device: TestDevice::new(Medium::Ip),
+            pending: None,
+        };
+        let mut stack = Stack::new(1);
+        let iface = stack.add_iface_borrowed(&mut driver).unwrap();
+        stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
+        let socket = stack.add_udp_socket().unwrap();
+        stack
+            .udp_socket(socket)
+            .bind(319, ListenSocketAddr::UNSPECIFIED)
+            .unwrap();
+        stack.poll(Instant::from_secs(0));
+        let wakes = Arc::new(WakeCount::default());
+        let config_wakes = Arc::new(WakeCount::default());
+        stack.iface(iface).register_waker(&Waker::from(config_wakes.clone()));
+
+        // Ignore reports until storage overflows; transmission and notification must continue.
+        for id in 0..TX_TIMESTAMP_QUEUE_COUNT + 2 {
+            stack
+                .iface(iface)
+                .register_tx_timestamp_waker(&Waker::from(wakes.clone()));
+            let mut meta: crate::udp::UdpMetadata = SocketAddr::new(REMOTE_V4.into(), 319).into();
+            meta.meta.id = id as u32;
+            meta.meta.request_timestamp = true;
+            stack.udp_socket(socket).send_slice(b"delay_req", meta).unwrap();
+            // A second send must reclaim the first even outside Stack::poll.
+            stack.udp_socket(socket).send_slice(b"delay_req", meta).unwrap();
+            stack.poll(Instant::from_secs(0));
+            assert_eq!(wakes.0.swap(0, Ordering::Relaxed), 1);
+        }
+        assert_eq!(config_wakes.0.load(Ordering::Relaxed), 0);
+        for id in 0..TX_TIMESTAMP_QUEUE_COUNT {
+            assert_eq!(stack.iface(iface).poll_tx_timestamp().unwrap().id, (id / 2) as u32);
+        }
+        assert_eq!(stack.iface(iface).poll_tx_timestamp(), None);
+
+        // Unchecked sends must reclaim before entering the driver.
+        for id in [10, 11] {
+            let mut buf = PacketBuf::try_new().unwrap();
+            buf.meta_mut().id = id;
+            buf.meta_mut().request_timestamp = true;
+            stack.inner.transmit_raw(stack.ifaces.get_mut(iface.index()), buf);
+        }
+        assert_eq!(stack.iface(iface).poll_tx_timestamp().unwrap().id, 10);
+        assert_eq!(stack.iface(iface).poll_tx_timestamp().unwrap().id, 11);
         assert_eq!(stack.iface(iface).poll_tx_timestamp(), None);
     }
 

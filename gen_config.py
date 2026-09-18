@@ -50,6 +50,7 @@ feature("slaac_router_count", default=2, min=1, max=16, pow2=8)
 # Always bounded.
 feature("neighbor_cache_count", default=8, min=1, max=1024, pow2=8)
 feature("pending_queue_count", default=16, min=1, max=256, pow2=8)
+feature("tx_timestamp_queue_count", default=4, min=1, max=64, pow2=8)
 
 # Socket slabs (only bounded without `alloc`).
 feature("udp_socket_count", default=4, min=1, max=64, pow2=8)

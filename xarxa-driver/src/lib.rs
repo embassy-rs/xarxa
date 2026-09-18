@@ -218,13 +218,14 @@ pub trait Driver {
     /// The driver must wake it when:
     /// - a frame has been received, so [`receive`](Self::receive) may return `Some`,
     /// - there is room to transmit again, after [`can_transmit`](Self::can_transmit) returned `false`,
-    /// - the link state changed, so [`link_state`](Self::link_state) may return something new.
+    /// - the link state changed, so [`link_state`](Self::link_state) may return something new,
+    /// - TX timestamp polling can return a timestamp or reclaim a buffer,
+    ///   with `packetmeta-timestamp` enabled.
     ///
     /// Only one waker is kept. Registering another replaces it. Wakes are
     /// allowed to be spurious.
     ///
-    /// A registered waker is woken just one. The main loop must re-register it if
-    /// it wants to be woken again.
+    /// Re-register before each poll. Drivers may wake a registration more than once.
     ///
     /// Drivers that cannot wake anything return `Err(NotSupported)`, which is the
     /// default implementation. Such a driver can only be polled, so a caller that
@@ -275,6 +276,9 @@ pub trait Driver {
     /// Returns the transmit timestamp of a packet previously sent with
     /// [`PacketMeta::request_timestamp`] set, tagged with that packet's
     /// [`PacketMeta::id`], or `None` if no timestamp is available right now.
+    ///
+    /// Drivers may reclaim TX buffers here. Call until this returns `None`,
+    /// even when no timestamps were requested.
     ///
     /// Transmit timestamps are reported out of band, rather than on the packet like
     /// receive timestamps are, because a packet's transmit timestamp does not exist yet

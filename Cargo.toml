@@ -288,6 +288,18 @@ pending-queue-count-64 = []
 pending-queue-count-128 = []
 pending-queue-count-256 = []
 
+tx-timestamp-queue-count-1 = []
+tx-timestamp-queue-count-2 = []
+tx-timestamp-queue-count-3 = []
+tx-timestamp-queue-count-4 = [] # Default
+tx-timestamp-queue-count-5 = []
+tx-timestamp-queue-count-6 = []
+tx-timestamp-queue-count-7 = []
+tx-timestamp-queue-count-8 = []
+tx-timestamp-queue-count-16 = []
+tx-timestamp-queue-count-32 = []
+tx-timestamp-queue-count-64 = []
+
 udp-socket-count-1 = []
 udp-socket-count-2 = []
 udp-socket-count-3 = []

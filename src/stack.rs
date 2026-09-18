@@ -7,8 +7,12 @@ use crate::config::RAW_SOCKET_COUNT;
 use crate::config::TCP_LISTENER_COUNT;
 #[cfg(feature = "tcp")]
 use crate::config::TCP_SOCKET_COUNT;
+#[cfg(feature = "packetmeta-timestamp")]
+use crate::config::TX_TIMESTAMP_QUEUE_COUNT;
 #[cfg(feature = "udp")]
 use crate::config::UDP_SOCKET_COUNT;
+#[cfg(feature = "packetmeta-timestamp")]
+use crate::driver::TxTimestamp;
 use crate::driver::{ChecksumCapabilities, Driver, PacketBuf};
 #[cfg(any(feature = "udp", feature = "_raw", feature = "tcp"))]
 use crate::error::Full;
@@ -31,6 +35,8 @@ use crate::raw::{RawHandle, RawSocket, RawSocketIter, RawSocketState};
 #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
 use crate::reassembly::FragmentsBuffer;
 use crate::route::Routes;
+#[cfg(feature = "packetmeta-timestamp")]
+use crate::storage::BoundedDeque;
 use crate::storage::{MaybeBox, Slab, Vec};
 #[cfg(feature = "tcp")]
 use crate::tcp::{SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketIter, TcpSocketState};
@@ -71,6 +77,8 @@ pub(crate) struct Sockets<'d> {
 /// Separate from `Stack` so that its methods can borrow an interface from `Stack::ifaces`
 /// while taking `&mut self`.
 pub(crate) struct StackInner {
+    #[cfg(feature = "packetmeta-timestamp")]
+    pub(crate) tx_timestamps: TxTimestampQueue,
     pub(crate) now: Instant,
     #[cfg_attr(not(any(feature = "udp", feature = "tcp")), allow(dead_code))]
     pub(crate) rand: Rand,
@@ -93,6 +101,31 @@ pub(crate) struct StackInner {
 /// Maximum hostname length, in bytes. The DNS label limit (RFC 1035 §2.3.4).
 #[cfg(feature = "hostname")]
 const HOSTNAME_MAX_LEN: usize = 63;
+
+#[cfg(feature = "packetmeta-timestamp")]
+pub(crate) struct TxTimestampQueue {
+    queue: BoundedDeque<TxTimestamp, TX_TIMESTAMP_QUEUE_COUNT>,
+    #[cfg(feature = "async")]
+    waker: crate::waker::WakerRegistration,
+}
+
+#[cfg(feature = "packetmeta-timestamp")]
+impl TxTimestampQueue {
+    fn new() -> Self {
+        Self {
+            queue: BoundedDeque::new(),
+            #[cfg(feature = "async")]
+            waker: crate::waker::WakerRegistration::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, timestamp: TxTimestamp) {
+        // A full timestamp queue must not prevent TX buffer reclamation.
+        let _ = self.queue.push_back(timestamp);
+        #[cfg(feature = "async")]
+        self.waker.wake();
+    }
+}
 
 impl StackInner {
     /// Note that a socket send was held back for lack of a packet buffer or
@@ -246,16 +279,19 @@ impl TxContext<'_, '_> {
             .get_source_address(dst_addr, self.inner.now)
     }
 
-    /// Whether the interface can take one more frame right now.
+    /// Drain TX timestamps, then check whether the interface can take a new packet.
     ///
     /// Asked before a packet is built, so that a device with no room holds the
-    /// sender back instead of losing the packet.
+    /// sender back instead of losing the packet. Does not reserve TX capacity.
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
     #[cfg(any(feature = "udp", feature = "tcp", feature = "_raw"))]
-    pub(crate) fn can_transmit(&mut self, iface: IfaceHandle) -> bool {
-        self.ifaces.get_mut(iface.index()).can_transmit_new_packet()
+    pub(crate) fn prepare_transmit(&mut self, iface: IfaceHandle) -> bool {
+        let iface = self.ifaces.get_mut(iface.index());
+        #[cfg(feature = "packetmeta-timestamp")]
+        iface.drain_tx_timestamps(&mut self.inner.tx_timestamps);
+        iface.can_transmit_new_packet()
     }
 
     /// Which checksums the egress interface computes itself, so the stack
@@ -462,6 +498,8 @@ impl<'d> Stack<'d> {
 
         Self {
             inner: StackInner {
+                #[cfg(feature = "packetmeta-timestamp")]
+                tx_timestamps: TxTimestampQueue::new(),
                 now: Instant::ZERO,
                 rand,
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
@@ -629,6 +667,32 @@ impl<'d> Stack<'d> {
         #[cfg(feature = "medium-ethernet")]
         self.ifaces.get_mut(index).sync_multicast_filter();
         Ok(IfaceHandle::new(index))
+    }
+
+    /// Take a TX timestamp from the stack-wide queue.
+    ///
+    /// Call [`Self::poll`] to collect TX timestamps. This method only reads the queue.
+    /// Timestamps may be lost or arrive out of order; use timeouts for missing
+    /// timestamps. Full queues drop incoming timestamps.
+    /// See [`crate::config::TX_TIMESTAMP_QUEUE_COUNT`] for the stack-wide capacity.
+    ///
+    /// The queue has one consumer. The application assigns packet IDs and remembers
+    /// their socket, interface, and clock. Coordinate IDs across senders, and do not
+    /// reuse an ID while an old timestamp can still arrive. Removing an interface
+    /// does not remove its queued timestamps; discard timestamps for requests that
+    /// are no longer valid.
+    #[cfg(feature = "packetmeta-timestamp")]
+    pub fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
+        self.inner.tx_timestamps.queue.pop_front()
+    }
+
+    /// Register the stack's single TX timestamp waker.
+    ///
+    /// Register before checking [`Self::poll_tx_timestamp`]. Replaces any previous
+    /// registration. Call [`Self::poll`] to collect TX timestamps and wake the consumer.
+    #[cfg(all(feature = "packetmeta-timestamp", feature = "async"))]
+    pub fn register_tx_timestamp_waker(&mut self, waker: &core::task::Waker) {
+        self.inner.tx_timestamps.waker.register(waker);
     }
 
     /// Borrow an interface from the stack.
@@ -940,6 +1004,12 @@ impl<'d> Stack<'d> {
     pub fn poll(&mut self, timestamp: Instant) -> Instant {
         self.inner.now = timestamp;
 
+        // Timestamp polling may release TX buffers needed by other interfaces.
+        #[cfg(feature = "packetmeta-timestamp")]
+        for (_, iface) in self.ifaces.iter_mut() {
+            iface.drain_tx_timestamps(&mut self.inner.tx_timestamps);
+        }
+
         // Drop queued packets whose neighbor resolution timed out.
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         self.inner.pending.purge_expired(timestamp);
@@ -956,7 +1026,13 @@ impl<'d> Stack<'d> {
             self.poll_neighbor_timers(handle);
 
             #[allow(unused_mut)]
-            while let Some(mut buf) = self.ifaces.get_mut(index).driver.receive() {
+            loop {
+                let iface = self.ifaces.get_mut(index);
+                #[cfg(feature = "packetmeta-timestamp")]
+                iface.drain_tx_timestamps(&mut self.inner.tx_timestamps);
+                let Some(mut buf) = iface.driver.receive() else {
+                    break;
+                };
                 #[cfg(feature = "packet-log")]
                 {
                     trace!("received on iface {}", index);
@@ -2220,6 +2296,8 @@ impl StackInner {
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn flush_pending(&mut self, iface: &mut IfaceState<'_>, key: &NeighborKey, hardware_addr: HardwareAddress) {
         while self.pending.has_matching(key) {
+            #[cfg(feature = "packetmeta-timestamp")]
+            iface.drain_tx_timestamps(&mut self.tx_timestamps);
             if !iface.can_transmit_new_packet() {
                 trace!("neighbor: device has no room, {} stays parked", key.1);
                 return;
@@ -2565,6 +2643,8 @@ impl StackInner {
     }
 
     pub(crate) fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
+        #[cfg(feature = "packetmeta-timestamp")]
+        iface.drain_tx_timestamps(&mut self.tx_timestamps);
         #[cfg(feature = "packet-log")]
         {
             trace!("sent on iface {}", iface.handle.index());
@@ -4313,14 +4393,158 @@ pub(crate) mod test {
         assert!(sent.borrow()[0].request_timestamp);
 
         // ... and the timestamp comes back out of band, tagged with the id.
+        stack.poll(Instant::from_secs(0));
         assert_eq!(
-            stack.iface(iface).poll_tx_timestamp(),
+            stack.poll_tx_timestamp(),
             Some(TxTimestamp {
                 id: 0x2222,
                 timestamp: TX_STAMP,
             })
         );
-        assert_eq!(stack.iface(iface).poll_tx_timestamp(), None);
+        assert_eq!(stack.poll_tx_timestamp(), None);
+    }
+
+    #[test]
+    #[cfg(all(feature = "packetmeta-timestamp", feature = "async"))]
+    fn test_tx_timestamp_queue() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        use crate::config::TX_TIMESTAMP_QUEUE_COUNT;
+        use crate::driver::{Capabilities, Driver, Timestamp, TxTimestamp};
+
+        struct TimestampDevice<'a> {
+            device: TestDevice,
+            pending: Option<PacketBuf>,
+            pending_count: &'a core::cell::Cell<usize>,
+        }
+        impl Driver for TimestampDevice<'_> {
+            fn capabilities(&self) -> Capabilities {
+                self.device.capabilities()
+            }
+            fn hardware_address(&self) -> crate::driver::HardwareAddress {
+                self.device.hardware_address()
+            }
+            fn receive(&mut self) -> Option<PacketBuf> {
+                // RX may need a buffer released by another interface's TX.
+                assert_eq!(self.pending_count.get(), 0);
+                None
+            }
+            fn can_transmit(&mut self) -> bool {
+                self.pending.is_none()
+            }
+            fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
+                assert!(self.pending.is_none());
+                self.pending = Some(buf);
+                self.pending_count.set(self.pending_count.get() + 1);
+                Ok(())
+            }
+            fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
+                let buf = self.pending.take()?;
+                self.pending_count.set(self.pending_count.get() - 1);
+                buf.meta().request_timestamp.then_some(TxTimestamp {
+                    id: buf.meta().id,
+                    timestamp: Timestamp::from_seconds_and_nanos(1, 0),
+                })
+            }
+        }
+
+        #[derive(Default)]
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let pending_count = core::cell::Cell::new(0);
+        let mut driver = TimestampDevice {
+            device: TestDevice::new(Medium::Ip),
+            pending: None,
+            pending_count: &pending_count,
+        };
+        let mut other_driver = TimestampDevice {
+            device: TestDevice::new(Medium::Ip),
+            pending: None,
+            pending_count: &pending_count,
+        };
+        let mut stack = Stack::new(1);
+        let iface = stack.add_iface_borrowed(&mut driver).unwrap();
+        let other_iface = stack.add_iface_borrowed(&mut other_driver).unwrap();
+        stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
+        let socket = stack.add_udp_socket().unwrap();
+        stack
+            .udp_socket(socket)
+            .bind(319, ListenSocketAddr::UNSPECIFIED)
+            .unwrap();
+        stack.poll(Instant::from_secs(0));
+        let wakes = Arc::new(WakeCount::default());
+        let config_wakes = Arc::new(WakeCount::default());
+        stack.iface(iface).register_waker(&Waker::from(config_wakes.clone()));
+
+        // Ignore timestamps until the queue overflows; transmission and notification must continue.
+        for id in 0..TX_TIMESTAMP_QUEUE_COUNT + 2 {
+            stack.register_tx_timestamp_waker(&Waker::from(wakes.clone()));
+            let mut meta: crate::udp::UdpMetadata = SocketAddr::new(REMOTE_V4.into(), 319).into();
+            meta.meta.id = 2 * id as u32;
+            meta.meta.request_timestamp = true;
+            stack.udp_socket(socket).send_slice(b"delay_req", meta).unwrap();
+            // A second send must reclaim the first even outside Stack::poll.
+            meta.meta.id += 1;
+            stack.udp_socket(socket).send_slice(b"delay_req", meta).unwrap();
+            stack.poll(Instant::from_secs(0));
+            assert_eq!(wakes.0.swap(0, Ordering::Relaxed), 1);
+        }
+        assert_eq!(config_wakes.0.load(Ordering::Relaxed), 0);
+        for id in 0..TX_TIMESTAMP_QUEUE_COUNT {
+            assert_eq!(stack.poll_tx_timestamp().unwrap().id, id as u32);
+        }
+        assert_eq!(stack.poll_tx_timestamp(), None);
+
+        // Unchecked sends must reclaim before entering the driver.
+        for id in [10, 11] {
+            let mut buf = PacketBuf::try_new().unwrap();
+            buf.meta_mut().id = id;
+            buf.meta_mut().request_timestamp = true;
+            stack.inner.transmit_raw(stack.ifaces.get_mut(iface.index()), buf);
+        }
+        stack.poll(Instant::from_secs(0));
+        for id in [10, 11].into_iter().take(TX_TIMESTAMP_QUEUE_COUNT) {
+            assert_eq!(stack.poll_tx_timestamp().unwrap().id, id);
+        }
+        assert_eq!(stack.poll_tx_timestamp(), None);
+
+        // Both interfaces share one queue and waker.
+        stack
+            .iface(other_iface)
+            .register_waker(&Waker::from(config_wakes.clone()));
+        for id in 0..TX_TIMESTAMP_QUEUE_COUNT + 2 {
+            stack.register_tx_timestamp_waker(&Waker::from(wakes.clone()));
+            let source = if id % 2 == 0 { iface } else { other_iface };
+            let mut buf = PacketBuf::try_new().unwrap();
+            buf.meta_mut().id = 100 + id as u32;
+            buf.meta_mut().request_timestamp = true;
+            stack.inner.transmit_raw(stack.ifaces.get_mut(source.index()), buf);
+            stack.poll(Instant::from_secs(0));
+            assert_eq!(wakes.0.swap(0, Ordering::Relaxed), 1);
+        }
+        assert_eq!(config_wakes.0.load(Ordering::Relaxed), 0);
+
+        // Removing an interface leaves its queued timestamps for the consumer to discard.
+        stack.remove_iface(iface);
+        for id in 0..TX_TIMESTAMP_QUEUE_COUNT {
+            assert_eq!(stack.poll_tx_timestamp().unwrap().id, 100 + id as u32);
+        }
+        assert_eq!(stack.poll_tx_timestamp(), None);
+
+        // TX timestamp polling must also release packets without timestamp requests.
+        for _ in 0..2 {
+            let buf = PacketBuf::try_new().unwrap();
+            stack.inner.transmit_raw(stack.ifaces.get_mut(other_iface.index()), buf);
+        }
+        stack.poll(Instant::from_secs(0));
+        assert_eq!(stack.poll_tx_timestamp(), None);
     }
 
     #[test]

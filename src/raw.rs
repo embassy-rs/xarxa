@@ -493,7 +493,7 @@ impl RawSocket<'_, '_> {
     ///
     /// The metadata is handed to the driver along with the frame. This is how a
     /// packet is tagged with an id, or a transmit timestamp is requested for it (see
-    /// [`Iface::poll_tx_timestamp`](crate::iface::Iface::poll_tx_timestamp)). Everything else
+    /// [`Stack::poll_tx_timestamp`]). Everything else
     /// is exactly [`send_with`](Self::send_with).
     pub fn send_with_meta(
         &mut self,
@@ -526,7 +526,7 @@ impl RawSocket<'_, '_> {
                     Some(iface) => iface,
                     None => self.tx.first_ethernet_iface().ok_or(SendError::Unaddressable)?,
                 };
-                if !self.tx.can_transmit(iface) {
+                if !self.tx.prepare_transmit(iface) {
                     self.tx.inner.set_tx_starved();
                     return Err(SendError::DeviceBusy);
                 }
@@ -577,7 +577,7 @@ impl RawSocket<'_, '_> {
                     .tx
                     .route(self.state.binding, &dst_addr)
                     .ok_or(SendError::Unaddressable)?;
-                if !self.tx.can_transmit(route.iface) {
+                if !self.tx.prepare_transmit(route.iface) {
                     self.tx.inner.set_tx_starved();
                     return Err(SendError::DeviceBusy);
                 }

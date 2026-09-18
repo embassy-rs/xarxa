@@ -817,6 +817,8 @@ impl StackInner {
         }
 
         while !iface.fragmenter.finished() {
+            #[cfg(feature = "packetmeta-timestamp")]
+            iface.drain_tx_timestamps(&mut self.tx_timestamps);
             if !iface.can_transmit() {
                 trace!("fragmenter: device has no room, fragments wait");
                 return;

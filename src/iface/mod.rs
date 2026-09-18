@@ -25,6 +25,8 @@ use crate::driver::{Capabilities, ChecksumCapabilities, Driver, LinkState};
 use crate::error::Full;
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 use crate::fragmentation::Fragmenter;
+#[cfg(feature = "packetmeta-timestamp")]
+use crate::stack::TxTimestampQueue;
 use crate::stack::{Stack, StackInner};
 use crate::storage::{MaybeBox, Slab, Vec};
 use crate::time::Instant;
@@ -310,19 +312,6 @@ impl<'d> Iface<'_, 'd> {
     /// clamped to what a [`PacketBuf`](crate::driver::PacketBuf) can carry.
     pub fn ip_mtu(&self) -> usize {
         self.state().ip_mtu()
-    }
-
-    /// Poll the device for the timestamp of an already-transmitted packet, sent with
-    /// [`PacketMeta::request_timestamp`](crate::driver::PacketMeta::request_timestamp) set.
-    ///
-    /// Returns `None` if no timestamp is available right now, which is also all a
-    /// device without transmit timestamping support ever returns. See
-    /// [`Driver::poll_tx_timestamp`] for what a caller must tolerate: timestamps
-    /// arrive an arbitrary time after the packet was sent, possibly out of order, and
-    /// possibly never.
-    #[cfg(feature = "packetmeta-timestamp")]
-    pub fn poll_tx_timestamp(&mut self) -> Option<crate::driver::TxTimestamp> {
-        self.state_mut().driver.poll_tx_timestamp()
     }
 
     /// The hardware address of the interface.
@@ -756,6 +745,13 @@ impl IfaceState<'_> {
     ))]
     pub(crate) fn can_transmit(&mut self) -> bool {
         self.driver.can_transmit()
+    }
+
+    #[cfg(feature = "packetmeta-timestamp")]
+    pub(crate) fn drain_tx_timestamps(&mut self, timestamps: &mut TxTimestampQueue) {
+        while let Some(timestamp) = self.driver.poll_tx_timestamp() {
+            timestamps.push(timestamp);
+        }
     }
 
     /// Whether a new packet can be handed to the interface right now.

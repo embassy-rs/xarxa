@@ -2383,7 +2383,7 @@ pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) 
                 debug!("no route to {}, dropping packet", dst_addr);
                 return Ok(());
             };
-            if !cx.can_transmit(route.iface) {
+            if !cx.prepare_transmit(route.iface) {
                 trace!("device has no room for segment to {}, holding it back", dst_addr);
                 return Err(Blocked);
             }

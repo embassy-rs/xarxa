@@ -105,6 +105,12 @@ pub const NEIGHBOR_CACHE_COUNT: usize = raw::NEIGHBOR_CACHE_COUNT;
 /// This is a limit with and without `alloc`. Default: 16.
 pub const PENDING_QUEUE_COUNT: usize = raw::PENDING_QUEUE_COUNT;
 
+/// TX timestamps queued per stack with `packetmeta-timestamp`.
+///
+/// Full queues drop incoming timestamps. Always bounded, including with `alloc`.
+/// Default: 4.
+pub const TX_TIMESTAMP_QUEUE_COUNT: usize = raw::TX_TIMESTAMP_QUEUE_COUNT;
+
 // ======== Sockets
 
 /// Max UDP sockets a [`Stack`](crate::Stack) can hold at once.

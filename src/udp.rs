@@ -770,7 +770,7 @@ impl UdpSocket<'_, '_> {
     ///
     /// `meta.meta` is attached to the packet and handed to the driver with it: an id
     /// to tag the packet with, or a request to timestamp its transmission (see
-    /// [`Iface::poll_tx_timestamp`](crate::iface::Iface::poll_tx_timestamp)).
+    /// [`Stack::poll_tx_timestamp`]).
     ///
     /// Returns `Err(SendError::InvalidState)` if the socket is not bound.
     /// Returns `Err(SendError::Unaddressable)` if the destination address or port
@@ -863,7 +863,7 @@ impl UdpSocket<'_, '_> {
         };
         let headroom = LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
 
-        if !self.tx.can_transmit(route.iface) {
+        if !self.tx.prepare_transmit(route.iface) {
             self.tx.inner.set_tx_starved();
             return Err(SendError::DeviceBusy);
         }

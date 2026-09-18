@@ -14,6 +14,7 @@ static CONFIGS: &[(&str, usize)] = &[
     ("SLAAC_ROUTER_COUNT", 2),
     ("NEIGHBOR_CACHE_COUNT", 8),
     ("PENDING_QUEUE_COUNT", 16),
+    ("TX_TIMESTAMP_QUEUE_COUNT", 4),
     ("UDP_SOCKET_COUNT", 4),
     ("RAW_SOCKET_COUNT", 2),
     ("TCP_SOCKET_COUNT", 4),

@@ -21,6 +21,7 @@
 
 use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
+use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use super::IfaceState;
 use crate::config::{DHCP_MAX_DNS_SERVER_COUNT, DHCP_SERVER_CLIENT_ID_SIZE, DHCP_SERVER_LEASE_COUNT};
@@ -640,7 +641,7 @@ impl Server {
         };
 
         let mut buf = PacketBuf::try_new()?;
-        buf.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
+        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         buf.set_len(buf.tailroom());
 
         let mut packet = DhcpPacket::new_unchecked(&mut buf[..]);

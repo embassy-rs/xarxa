@@ -1,5 +1,8 @@
 //! The network stack.
 
+#[cfg(feature = "ipv6")]
+use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
 use crate::config::IFACE_COUNT;
 #[cfg(feature = "_raw")]
 use crate::config::RAW_SOCKET_COUNT;
@@ -2197,11 +2200,13 @@ impl StackInner {
         );
 
         if operation == ArpOperation::Request {
+            use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
             let Some(mut reply) = PacketBuf::try_new() else {
                 trace!("arp: no packet buffer for reply");
                 return;
             };
-            reply.reserve(ETHERNET_HEADER_LEN);
+            reply.reserve(PACKET_BUF_DRIVER_HEADROOM + ETHERNET_HEADER_LEN);
             reply.set_len(ARP_BUFFER_LEN);
             {
                 let mut arp_reply = ArpPacket::new_unchecked(&mut reply);
@@ -2248,12 +2253,14 @@ impl StackInner {
         if (iface.has_solicited_node(dst_addr) || iface.has_ip_addr(dst_addr)) && iface.has_ip_addr(target_addr) {
             // Neighbor advert: NA header (24 bytes) plus the target link-layer
             // address option.
+
+            use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
             let Some(mut reply) = PacketBuf::try_new() else {
                 trace!("ndisc: no packet buffer for neighbor advert");
                 return;
             };
             let opt_len = lladdr_option_len(iface.hardware_addr);
-            reply.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
+            reply.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN);
             reply.set_len(24 + opt_len);
             {
                 let mut na = Icmpv6Packet::new_unchecked(&mut reply);
@@ -2502,6 +2509,8 @@ impl StackInner {
 
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
     fn transmit_arp_request(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv4Addr) {
+        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
         let Some(source_protocol_addr) = iface.get_source_address_ipv4(&target_addr) else {
             debug!("arp: no source address for request");
             return;
@@ -2512,7 +2521,7 @@ impl StackInner {
             trace!("arp: no packet buffer for request");
             return;
         };
-        buf.reserve(ETHERNET_HEADER_LEN);
+        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + ETHERNET_HEADER_LEN);
         buf.set_len(ARP_BUFFER_LEN);
         {
             let mut arp_packet = ArpPacket::new_unchecked(&mut buf);
@@ -2531,6 +2540,8 @@ impl StackInner {
 
     #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
     fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv6Addr) {
+        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
         let src_addr = iface.get_source_address_ipv6(&target_addr, self.now);
         let dst_addr = target_addr.solicited_node();
 
@@ -2542,7 +2553,7 @@ impl StackInner {
             return;
         };
         let opt_len = lladdr_option_len(iface.hardware_addr);
-        buf.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
+        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN);
         buf.set_len(24 + opt_len);
         {
             let mut ns = Icmpv6Packet::new_unchecked(&mut buf);
@@ -2825,8 +2836,10 @@ fn build_icmpv4_error(
     msg_code: u8,
     checksum_caps: &ChecksumCapabilities,
 ) -> Option<PacketBuf> {
+    use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
     let mut reply = PacketBuf::try_new()?;
-    reply.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
+    reply.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
     // A buffer smaller than the minimum MTU quotes less.
     let quote_len = orig
         .len()
@@ -2863,7 +2876,7 @@ fn build_icmpv6_error(
     checksum_caps: &ChecksumCapabilities,
 ) -> Option<PacketBuf> {
     let mut reply = PacketBuf::try_new()?;
-    reply.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
+    reply.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN);
     // A buffer smaller than the minimum MTU quotes less.
     let quote_len = orig
         .len()
@@ -5851,7 +5864,7 @@ pub(crate) mod test {
                 let datagram = udp_datagram(OUR_V4.into(), 12345, REMOTE_V4.into(), 54321, &udp_packet_payload);
 
                 let mut buf = PacketBuf::try_new().unwrap();
-                buf.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
+                buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
                 buf.set_len(datagram.len());
                 buf.copy_from_slice(&datagram);
 

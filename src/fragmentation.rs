@@ -7,6 +7,9 @@
 //! compressed packet is cut into pieces behind fragment headers. Fragmentation
 //! pays one extra copy, on purpose: it is a fallback path.
 
+#[cfg(feature = "ipv4-fragmentation")]
+use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
 use crate::driver::PacketBuf;
 use crate::iface::IfaceState;
 #[cfg(feature = "ipv4-fragmentation")]
@@ -265,7 +268,7 @@ impl StackInner {
             trace!("fragmenter: no packet buffer, fragments wait");
             return false;
         };
-        tx_buffer.reserve(LINK_HEADER_LEN);
+        tx_buffer.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN);
         tx_buffer.set_len(ip_len);
 
         // NOTE(unwrap): checked above.

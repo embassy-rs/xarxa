@@ -509,9 +509,11 @@ impl IfaceState<'_> {
 
     #[cfg(feature = "ipv4")]
     fn igmp_report_packet(&self, version: IgmpVersion, group_addr: Ipv4Addr) -> Option<PacketBuf> {
+        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
         let iface_addr = self.ipv4_addr()?;
         let mut pkt = PacketBuf::try_new()?;
-        pkt.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
+        pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
             let mut igmp_packet = IgmpPacket::new_unchecked(&mut pkt);
@@ -538,9 +540,11 @@ impl IfaceState<'_> {
 
     #[cfg(feature = "ipv4")]
     fn igmp_leave_packet(&self, group_addr: Ipv4Addr) -> Option<PacketBuf> {
+        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
         let iface_addr = self.ipv4_addr()?;
         let mut pkt = PacketBuf::try_new()?;
-        pkt.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
+        pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
             let mut igmp_packet = IgmpPacket::new_unchecked(&mut pkt);
@@ -613,6 +617,8 @@ impl IfaceState<'_> {
         // Per [RFC 3810 § 5.2.13], source addresses must be link-local, falling
         // back to the unspecified address if we haven't acquired one.
         // [RFC 3810 § 5.2.13]: https://tools.ietf.org/html/rfc3810#section-5.2.13
+
+        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
         let src_addr = self.link_local_ipv6_address().unwrap_or(Ipv6Addr::UNSPECIFIED);
 
         // Per [RFC 3810 § 5.2.14], all MLDv2 reports are sent to ff02::16.
@@ -621,7 +627,7 @@ impl IfaceState<'_> {
 
         // MLD report: the report header (8 bytes) plus one record per group.
         let mut pkt = PacketBuf::try_new()?;
-        pkt.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
+        pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
         let max_records = (pkt.tailroom() - 8) / MLD_ADDRESS_RECORD_LEN;
         let record_count = records.clone().count();
         if record_count > max_records {

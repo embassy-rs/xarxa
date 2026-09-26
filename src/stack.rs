@@ -2738,6 +2738,8 @@ impl StackInner {
     }
 
     pub(crate) fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
+        debug_assert!(buf.headroom() >= xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM);
+
         #[cfg(feature = "packet-log")]
         {
             trace!("sent on iface {}", iface.handle.index());

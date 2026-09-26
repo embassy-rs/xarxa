@@ -8,6 +8,8 @@
 //!
 //! Needs the `slaac` feature.
 
+use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
 use crate::config::{SLAAC_PREFIX_COUNT, SLAAC_ROUTER_COUNT};
 use crate::storage::Vec;
 
@@ -572,7 +574,7 @@ impl IfaceState<'_> {
         // next one.
         if let Some(mut buf) = PacketBuf::try_new() {
             let opt_len = crate::stack::lladdr_option_len(self.hardware_addr);
-            buf.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
+            buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN);
             buf.set_len(8 + opt_len);
             {
                 let mut rs = Icmpv6Packet::new_unchecked(&mut buf);

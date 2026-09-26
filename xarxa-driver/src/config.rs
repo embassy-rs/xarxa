@@ -52,6 +52,27 @@ pub const PACKET_BUF_ALIGN: usize = cfg_select! {
     _ => 1,
 };
 
+const fn packet_buf_driver_headroom(cfg_head: usize) -> usize {
+    if cfg_head == 0 {
+        0
+    } else if PACKET_BUF_ALIGN > cfg_head {
+        PACKET_BUF_ALIGN
+    } else {
+        cfg_head
+    }
+}
+
+/// Default headroom of the buffer in a [`PacketBuf`](crate::PacketBuf), in bytes.
+pub const PACKET_BUF_DRIVER_HEADROOM: usize = packet_buf_driver_headroom(cfg_select! {
+    feature = "packet-buf-driver-headroom-64" => 64,
+    feature = "packet-buf-driver-headroom-32" => 32,
+    feature = "packet-buf-driver-headroom-16" => 16,
+    feature = "packet-buf-driver-headroom-8" => 8,
+    feature = "packet-buf-driver-headroom-4" => 4,
+    feature = "packet-buf-driver-headroom-2" => 2,
+    _ => 0,
+});
+
 /// Size of the buffer in a [`PacketBuf`](crate::PacketBuf), in bytes.
 ///
 /// This is the largest frame that can be sent or received, headers included.
@@ -72,7 +93,7 @@ pub const PACKET_BUF_ALIGN: usize = cfg_select! {
 /// Must be between 128 and 65535.
 ///
 /// Default: 1514.
-pub const PACKET_BUF_SIZE: usize = raw::PACKET_BUF_SIZE.next_multiple_of(PACKET_BUF_ALIGN);
+pub const PACKET_BUF_SIZE: usize = raw::PACKET_BUF_SIZE.next_multiple_of(PACKET_BUF_ALIGN) + PACKET_BUF_DRIVER_HEADROOM;
 
 // `headroom` and `len` are `u16`.
 const _: () = assert!(

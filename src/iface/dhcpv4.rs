@@ -15,6 +15,7 @@
 
 use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
+use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use super::{AddrOrigin, IfaceAddr, IfaceState};
 use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
@@ -473,7 +474,7 @@ impl Client {
         let max_size = (ip_mtu - MAX_IPV4_HEADER_LEN - UDP_HEADER_LEN) as u16;
 
         let mut buf = PacketBuf::try_new()?;
-        buf.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
+        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         let max_payload = buf.tailroom().min(ip_mtu - IPV4_HEADER_LEN - UDP_HEADER_LEN);
         buf.set_len(max_payload);
 

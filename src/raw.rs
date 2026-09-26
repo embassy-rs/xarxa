@@ -10,6 +10,8 @@
 //!   interfaces. The socket may be bound to an IP version and/or an IP protocol,
 //!   both optional.
 
+use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
 use crate::config::RAW_RX_QUEUE_COUNT;
 use crate::storage::BoundedDeque;
 use core::fmt;
@@ -562,7 +564,7 @@ impl RawSocket<'_, '_> {
             return Err(SendError::BufferFull);
         }
         buf.set_meta(meta);
-        buf.reserve(headroom);
+        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
         buf.set_len(max_size);
         let size = f(&mut buf);
         assert!(size <= max_size);

@@ -7,6 +7,8 @@
 use core::fmt::Display;
 use core::{fmt, mem};
 
+use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
 #[cfg(all(test, feature = "tcp-listener"))]
 use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
@@ -2183,7 +2185,7 @@ pub(crate) fn build_tcp_packet(
         IpAddr::V6(_) => IPV6_HEADER_LEN,
     };
     let mut buf = PacketBuf::try_new()?;
-    buf.reserve(LINK_HEADER_LEN + ip_header_len);
+    buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + ip_header_len);
     buf.set_len(repr.buffer_len());
     let mut packet = TcpPacket::new_unchecked(&mut buf);
     repr.emit(&mut packet, src_addr, dst_addr, checksum_caps);

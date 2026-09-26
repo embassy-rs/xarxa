@@ -920,6 +920,8 @@ impl StackInner {
     allow(unused_imports, dead_code)
 )]
 mod test {
+    use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
     use super::*;
     use crate::iface::Medium;
     use crate::iface::{AddrOrigin, IfaceHandle};
@@ -1012,7 +1014,7 @@ mod test {
     /// the header difference.
     fn compress(packet: &[u8], src: Ieee802154Address, dst: Ieee802154Address, headroom: usize) -> (Vec<u8>, usize) {
         let mut buf = PacketBuf::try_new().unwrap();
-        buf.reserve(headroom);
+        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
         buf.set_len(packet.len());
         buf.copy_from_slice(packet);
         let header_diff = ipv6_to_sixlowpan(&mut buf, &mac_repr(src, dst, None)).unwrap();
@@ -1030,7 +1032,7 @@ mod test {
         total_len: Option<usize>,
     ) -> Result<Vec<u8>, Malformed> {
         let mut buf = PacketBuf::try_new().unwrap();
-        buf.reserve(headroom);
+        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
         buf.set_len(payload.len());
         buf.copy_from_slice(payload);
         sixlowpan_to_ipv6(&mut buf, Some(src), Some(dst), context, total_len)?;

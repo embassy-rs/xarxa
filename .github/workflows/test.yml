@@ -9,5 +9,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache cargo
+        id: cargo-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/filetime.json
+          key: ${{ runner.os }}-cargo
+      - name: Install hashtime
+        run: cargo install --git https://github.com/embassy-rs/hashtime --locked --rev cfb0a6d8b69adb704ceb58ff81577718913a42a1 || true
+      - name: Install cargo-batch
+        run: cargo install --git https://github.com/embassy-rs/cargo-batch cargo --bin cargo-batch --locked || true
+      - name: Cache target
+        id: target-cache
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-target
+      - name: Restore file times
+        run: |
+          hashtime restore ~/.cargo/filetime.json || true
+          hashtime save ~/.cargo/filetime.json
       - name: Run tests
         run: ./ci.py

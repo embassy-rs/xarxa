@@ -524,12 +524,13 @@ impl RawSocket<'_, '_> {
 
         // Ethernet frames go out as-is. IP packets get an Ethernet header prepended
         // on Ethernet mediums, so they need headroom for it.
-        let headroom = match mode {
-            #[cfg(feature = "raw-ethernet")]
-            RawMode::Ethernet { .. } => 0,
-            #[cfg(feature = "raw-ip")]
-            RawMode::Ip { .. } => LINK_HEADER_LEN,
-        };
+        let headroom = PACKET_BUF_DRIVER_HEADROOM
+            + match mode {
+                #[cfg(feature = "raw-ethernet")]
+                RawMode::Ethernet { .. } => 0,
+                #[cfg(feature = "raw-ip")]
+                RawMode::Ip { .. } => LINK_HEADER_LEN,
+            };
 
         // Ethernet frames carry no routing information: a bound socket sends on
         // its interface, an unbound one on the first Ethernet interface. The
@@ -537,22 +538,8 @@ impl RawSocket<'_, '_> {
         // IP-mode packet names its destination inside, so it is built first and
         // routed after.
         #[cfg(feature = "raw-ethernet")]
-        let eth_iface = match mode {
-            RawMode::Ethernet { .. } => {
-                let iface = match self.state.binding.iface() {
-                    Some(iface) => iface,
-                    None => self.tx.first_ethernet_iface().ok_or(SendError::Unaddressable)?,
-                };
-                if self.tx.can_transmit(iface).is_err() {
-                    // `Stack::poll` wakes the socket once the interface has room.
-                    #[cfg(feature = "async")]
-                    {
-                        self.state.tx_blocked_on = Some(iface);
-                    }
-                    return Err(SendError::DeviceBusy);
-                }
-                Some(iface)
-            }
+        let ethernet = match mode {
+            RawMode::Ethernet { ethertype } => Some((self.prepare_ethernet_send()?, ethertype)),
             #[cfg(feature = "raw-ip")]
             RawMode::Ip { .. } => None,
         };
@@ -564,51 +551,96 @@ impl RawSocket<'_, '_> {
             return Err(SendError::BufferFull);
         }
         buf.set_meta(meta);
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
+        buf.reserve(headroom);
         buf.set_len(max_size);
         let size = f(&mut buf);
         assert!(size <= max_size);
         buf.set_len(size);
 
+        #[cfg(feature = "raw-ethernet")]
+        if let Some((iface, ethertype)) = ethernet {
+            check_ethernet(&mut buf, ethertype)?;
+            trace!("raw: sending {} octet frame", buf.len());
+            self.tx.transmit_ethernet(iface, buf);
+            return Ok(());
+        }
+        self.send_packet(buf).map_err(|(err, _)| err)
+    }
+
+    #[cfg(feature = "raw-ethernet")]
+    fn prepare_ethernet_send(&mut self) -> Result<IfaceHandle, SendError> {
+        let iface = match self.state.binding.iface() {
+            Some(iface) => iface,
+            None => self.tx.first_ethernet_iface().ok_or(SendError::Unaddressable)?,
+        };
+        self.check_send_ready(iface)?;
+        Ok(iface)
+    }
+
+    fn check_send_ready(&mut self, iface: IfaceHandle) -> Result<(), SendError> {
+        if self.tx.can_transmit(iface).is_err() {
+            // Stack::poll wakes this socket when the interface has room.
+            #[cfg(feature = "async")]
+            {
+                self.state.tx_blocked_on = Some(iface);
+            }
+            return Err(SendError::DeviceBusy);
+        }
+        Ok(())
+    }
+
+    /// Send an owned packet, preserving its packet metadata.
+    ///
+    /// The buffer contains a complete Ethernet frame or IP packet, as in
+    /// [`send_with`](Self::send_with). Reserve [`PACKET_BUF_DRIVER_HEADROOM`], plus
+    /// [`crate::wire::LINK_HEADER_LEN`] in IP mode, to avoid moving it.
+    /// Further encapsulation may need more space.
+    ///
+    /// Errors return the buffer unchanged. Errors match [`send_with`](Self::send_with),
+    /// except this method allocates no payload buffer and never returns [`SendError::NoBuffer`].
+    /// Success transfers ownership to the stack; it does not guarantee delivery.
+    pub fn send_packet(&mut self, mut buf: PacketBuf) -> Result<(), (SendError, PacketBuf)> {
+        let Some(mode) = self.state.mode else {
+            return Err((SendError::InvalidState, buf));
+        };
         match mode {
             #[cfg(feature = "raw-ethernet")]
             RawMode::Ethernet { ethertype } => {
-                {
-                    let Ok(frame) = EthernetFrame::new_checked(&mut buf) else {
-                        return Err(SendError::Malformed);
-                    };
-                    if ethertype.is_some_and(|t| t != frame.ethertype()) {
-                        return Err(SendError::Malformed);
-                    }
+                if let Err(err) = check_ethernet(&mut buf, ethertype) {
+                    return Err((err, buf));
+                }
+                let iface = match self.prepare_ethernet_send() {
+                    Ok(iface) => iface,
+                    Err(err) => return Err((err, buf)),
+                };
+                if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM) {
+                    return Err((SendError::BufferFull, buf));
                 }
                 trace!("raw: sending {} octet frame", buf.len());
-                self.tx.transmit_ethernet(unwrap!(eth_iface), buf);
+                self.tx.transmit_ethernet(iface, buf);
                 Ok(())
             }
             #[cfg(feature = "raw-ip")]
             RawMode::Ip { version, protocol } => {
                 let Some((dst_addr, next_header)) = parse_ip_headers(&mut buf) else {
-                    return Err(SendError::Malformed);
+                    return Err((SendError::Malformed, buf));
                 };
                 if version.is_some_and(|v| v != dst_addr.version()) || protocol.is_some_and(|p| p != next_header) {
-                    return Err(SendError::Malformed);
+                    return Err((SendError::Malformed, buf));
                 }
                 // The unspecified address is never a destination (RFC 1122
                 // §3.2.1.3, RFC 4291 §2.5.2).
                 if dst_addr.is_unspecified() {
-                    return Err(SendError::Unaddressable);
+                    return Err((SendError::Unaddressable, buf));
                 }
-                let route = self
-                    .tx
-                    .route(self.state.binding, &dst_addr)
-                    .ok_or(SendError::Unaddressable)?;
-                if self.tx.can_transmit(route.iface).is_err() {
-                    // `Stack::poll` wakes the socket once the interface has room.
-                    #[cfg(feature = "async")]
-                    {
-                        self.state.tx_blocked_on = Some(route.iface);
-                    }
-                    return Err(SendError::DeviceBusy);
+                let Some(route) = self.tx.route(self.state.binding, &dst_addr) else {
+                    return Err((SendError::Unaddressable, buf));
+                };
+                if let Err(err) = self.check_send_ready(route.iface) {
+                    return Err((err, buf));
+                }
+                if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN) {
+                    return Err((SendError::BufferFull, buf));
                 }
                 trace!("raw: sending {} octets to {}", buf.len(), dst_addr);
                 self.tx.transmit_raw_ip(&route, buf, dst_addr);
@@ -616,6 +648,15 @@ impl RawSocket<'_, '_> {
             }
         }
     }
+}
+
+#[cfg(feature = "raw-ethernet")]
+fn check_ethernet(buf: &mut [u8], ethertype: Option<EthernetProtocol>) -> Result<(), SendError> {
+    let frame = EthernetFrame::new_checked(buf).map_err(|_| SendError::Malformed)?;
+    if ethertype.is_some_and(|t| t != frame.ethertype()) {
+        return Err(SendError::Malformed);
+    }
+    Ok(())
 }
 
 impl Stack<'_> {
@@ -1180,6 +1221,54 @@ mod test {
     }
 
     #[test]
+    fn test_send_packet() {
+        for mode in [
+            RawMode::Ethernet {
+                ethertype: Some(ETHERTYPE_CUSTOM),
+            },
+            RawMode::Ip {
+                version: None,
+                protocol: Some(IP_PROTO),
+            },
+        ] {
+            let ethernet = matches!(mode, RawMode::Ethernet { .. });
+            let driver = TestDevice::new(if ethernet { Medium::Ethernet } else { Medium::Ip });
+            let tx = driver.tx.clone();
+            let room = driver.room.clone();
+            let mut stack = Stack::new(0x1234_5678_dead_beef);
+            let hw = if ethernet {
+                HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 1]))
+            } else {
+                HardwareAddress::Ip
+            };
+            let iface = driver.install(&mut stack, hw);
+            stack
+                .iface(iface)
+                .add_ip_addr(IpCidr::new(Ipv4Addr::new(192, 168, 69, 1).into(), 24))
+                .unwrap();
+            let handle = stack.add_raw_socket().unwrap();
+            let mut socket = stack.raw_socket(handle);
+            socket.bind(mode).unwrap();
+            let bytes = if ethernet {
+                eth_frame(ETHERTYPE_CUSTOM, b"hello")
+            } else {
+                ipv4_packet(IP_PROTO, b"hello")
+            };
+            let buf = buf_from(&bytes);
+            let ptr = buf.as_ptr();
+            room.set(Some(0));
+            let (err, buf) = socket.send_packet(buf).unwrap_err();
+            assert_eq!(err, SendError::DeviceBusy);
+            assert_eq!(buf.as_ptr(), ptr);
+            assert_eq!(buf.headroom(), 0);
+            assert_eq!(&*buf, &bytes);
+            room.set(None);
+            socket.send_packet(buf).unwrap();
+            assert_eq!(&*tx.borrow(), &[bytes]);
+        }
+    }
+
+    #[test]
     fn test_send_ethernet() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let (_iface, tx) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
@@ -1301,7 +1390,7 @@ mod test {
         // Too big for a packet buffer (IP mode leaves room for the Ethernet header).
         assert_eq!(
             stack.raw_socket(handle).send_with(
-                crate::driver::config::PACKET_BUF_SIZE - LINK_HEADER_LEN + 1,
+                crate::driver::config::PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN + 1,
                 |_| unreachable!()
             ),
             Err(SendError::BufferFull)
@@ -1435,7 +1524,7 @@ mod test {
         );
         // Too big for a packet buffer: IP mode leaves room for the link header,
         // whatever medium the packet ends up going out of.
-        let max = crate::driver::config::PACKET_BUF_SIZE - LINK_HEADER_LEN;
+        let max = crate::driver::config::PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN;
         assert_eq!(
             stack.raw_socket(handle).send_with(max + 1, |_| unreachable!()),
             Err(SendError::BufferFull)

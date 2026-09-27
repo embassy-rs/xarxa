@@ -19,7 +19,7 @@ use crate::driver::PacketMeta;
 use crate::error::IcmpError;
 use crate::error::InvalidHopLimit;
 use crate::iface::IfaceHandle;
-use crate::stack::{IfaceBinding, Stack, TxContext, addr_score, alloc_ephemeral_port};
+use crate::stack::{EgressRoute, IfaceBinding, Stack, TxContext, addr_score, alloc_ephemeral_port};
 use crate::storage::Slab;
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -30,6 +30,20 @@ use crate::wire::{IPV6_HEADER_LEN, Icmpv6DstUnreachable, Icmpv6Message, Ipv6ExtH
 use crate::wire::{
     IpAddr, IpProtocol, IpVersion, LINK_HEADER_LEN, ListenSocketAddr, SocketAddr, UDP_HEADER_LEN, UdpPacket,
 };
+
+/// Suggested reservation for driver headroom, UDP, the largest enabled base IP
+/// header, and the Ethernet header when enabled. Further encapsulation may need
+/// more space.
+pub const SEND_HEADROOM: usize = send_headroom({
+    #[cfg(feature = "ipv6")]
+    {
+        IpVersion::V6
+    }
+    #[cfg(not(feature = "ipv6"))]
+    {
+        IpVersion::V4
+    }
+});
 
 define_handle! {
     /// A handle to a UDP socket added to a [`Stack`].
@@ -812,16 +826,53 @@ impl UdpSocket<'_, '_> {
         f: impl FnOnce(&mut [u8]) -> usize,
     ) -> Result<(), SendError> {
         let mut meta = meta.into();
-        let (local, remote, binding, hop_limit) = {
-            let socket = self.inner();
-            (
-                socket.local,
-                socket.remote,
-                socket.binding,
-                socket.hop_limit.unwrap_or(64),
-            )
+        let (route, local) = self.prepare_send(&mut meta)?;
+        let headroom = send_headroom(meta.remote_addr.addr.version());
+        let Some(mut buf) = PacketBuf::try_new() else {
+            return Err(SendError::NoBuffer);
         };
+        if max_size > buf.capacity() - headroom {
+            return Err(SendError::BufferFull);
+        }
+        buf.reserve(headroom);
+        buf.set_len(max_size);
+        let size = f(&mut buf);
+        assert!(size <= max_size);
+        buf.set_len(size);
+        self.transmit(buf, meta, route, local);
+        Ok(())
+    }
 
+    /// Send an owned UDP payload, adding the UDP, IP, and link headers.
+    ///
+    /// The buffer contains only the payload. Reserve [`SEND_HEADROOM`] to avoid
+    /// moving it. Addresses and packet metadata come from `meta`, as in
+    /// [`send_with`](Self::send_with), replacing the buffer's metadata.
+    ///
+    /// Errors return the buffer unchanged. Errors match [`send_with`](Self::send_with),
+    /// except this method allocates no payload buffer and never returns [`SendError::NoBuffer`].
+    /// Success transfers ownership to the stack; it does not guarantee delivery.
+    pub fn send_packet(
+        &mut self,
+        mut buf: PacketBuf,
+        meta: impl Into<UdpMetadata>,
+    ) -> Result<(), (SendError, PacketBuf)> {
+        let mut meta = meta.into();
+        let (route, local) = match self.prepare_send(&mut meta) {
+            Ok(route) => route,
+            Err(err) => return Err((err, buf)),
+        };
+        if !buf.ensure_headroom(send_headroom(meta.remote_addr.addr.version())) {
+            return Err((SendError::BufferFull, buf));
+        }
+        self.transmit(buf, meta, route, local);
+        Ok(())
+    }
+
+    // Resolve addresses and check readiness before allocating or changing a packet.
+    fn prepare_send(&mut self, meta: &mut UdpMetadata) -> Result<(EgressRoute, SocketAddr), SendError> {
+        let socket = self.inner();
+        let (local, remote, binding) = (socket.local, socket.remote, socket.binding);
         if local.port == 0 {
             return Err(SendError::InvalidState);
         }
@@ -878,16 +929,6 @@ impl UdpSocket<'_, '_> {
             return Err(SendError::Unaddressable);
         }
 
-        // Build the datagram: reserve headroom for the headers below, write the
-        // payload, prepend the UDP header.
-        let ip_header_len = match meta.remote_addr.addr {
-            #[cfg(feature = "ipv4")]
-            IpAddr::V4(_) => IPV4_HEADER_LEN,
-            #[cfg(feature = "ipv6")]
-            IpAddr::V6(_) => IPV6_HEADER_LEN,
-        };
-        let headroom = LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
-
         if self.tx.can_transmit(route.iface).is_err() {
             // `Stack::poll` wakes the socket once the interface has room.
             #[cfg(feature = "async")]
@@ -896,18 +937,13 @@ impl UdpSocket<'_, '_> {
             }
             return Err(SendError::DeviceBusy);
         }
-        let Some(mut buf) = PacketBuf::try_new() else {
-            return Err(SendError::NoBuffer);
-        };
-        if max_size > buf.capacity() - headroom {
-            return Err(SendError::BufferFull);
-        }
+        Ok((route, SocketAddr::new(src_addr, local.port)))
+    }
+
+    fn transmit(&mut self, mut buf: PacketBuf, meta: UdpMetadata, route: EgressRoute, local: SocketAddr) {
+        let hop_limit = self.inner().hop_limit.unwrap_or(64);
         buf.set_meta(meta.meta);
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
-        buf.set_len(max_size);
-        let size = f(&mut buf);
-        assert!(size <= max_size);
-        buf.set_len(size);
+        let size = buf.len();
 
         buf.push_front(UDP_HEADER_LEN);
         let udp_len = buf.len();
@@ -917,7 +953,7 @@ impl UdpSocket<'_, '_> {
             udp.set_dst_port(meta.remote_addr.port);
             udp.set_len(udp_len as u16);
             if !self.tx.checksum_caps(route.iface).udp.tx {
-                udp.fill_checksum(&src_addr, &meta.remote_addr.addr);
+                udp.fill_checksum(&local.addr, &meta.remote_addr.addr);
             } else {
                 // A zero checksum means "no checksum" on UDP-over-IPv4, and is what a
                 // device that computes it itself expects to find in the field.
@@ -925,12 +961,34 @@ impl UdpSocket<'_, '_> {
             }
         }
 
-        trace!("udp:{}:{}: sending {} octets", local, meta.remote_addr, size);
+        trace!(
+            "udp:{}:{}: sending {} octets",
+            self.inner().local,
+            meta.remote_addr,
+            size
+        );
 
-        self.tx
-            .transmit_ip(&route, buf, src_addr, meta.remote_addr.addr, IpProtocol::Udp, hop_limit);
-        Ok(())
+        self.tx.transmit_ip(
+            &route,
+            buf,
+            local.addr,
+            meta.remote_addr.addr,
+            IpProtocol::Udp,
+            hop_limit,
+        );
     }
+}
+
+const fn send_headroom(version: IpVersion) -> usize {
+    PACKET_BUF_DRIVER_HEADROOM
+        + LINK_HEADER_LEN
+        + UDP_HEADER_LEN
+        + match version {
+            #[cfg(feature = "ipv4")]
+            IpVersion::V4 => IPV4_HEADER_LEN,
+            #[cfg(feature = "ipv6")]
+            IpVersion::V6 => IPV6_HEADER_LEN,
+        }
 }
 
 impl Stack<'_> {
@@ -1836,6 +1894,66 @@ mod test {
     }
 
     #[test]
+    fn test_send_packet() {
+        let driver = TestDevice::new(Medium::Ip);
+        let tx = driver.tx.clone();
+        let room = driver.room.clone();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let iface = driver.install(&mut stack, HardwareAddress::Ip);
+        stack
+            .iface(iface)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
+        stack
+            .iface(iface)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR_V6.into(), 64))
+            .unwrap();
+        let handle = stack.add_udp_socket().unwrap();
+        let mut socket = stack.udp_socket(handle);
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+
+        for (src, dst, header_len) in [
+            (LOCAL_ADDR.into(), REMOTE_ADDR.into(), IPV4_HEADER_LEN),
+            (LOCAL_ADDR_V6.into(), REMOTE_ADDR_V6.into(), IPV6_HEADER_LEN),
+        ] {
+            for headroom in [0, SEND_HEADROOM, SEND_HEADROOM + 2] {
+                for payload in [b"".as_slice(), b"abcde".as_slice()] {
+                    let mut buf = PacketBuf::try_new().unwrap();
+                    buf.reserve(headroom);
+                    buf.set_len(payload.len());
+                    buf.copy_from_slice(payload);
+                    let ptr = buf.as_ptr();
+                    let meta = buf.meta();
+                    room.set(Some(0));
+                    let (err, returned) = socket.send_packet(buf, (dst, REMOTE_PORT)).unwrap_err();
+                    assert_eq!(err, SendError::DeviceBusy);
+                    assert_eq!(returned.as_ptr(), ptr);
+                    assert_eq!(returned.headroom(), headroom);
+                    assert_eq!(&*returned, payload);
+                    assert_eq!(returned.meta(), meta);
+
+                    room.set(None);
+                    tx.borrow_mut().clear();
+                    socket.send_packet(returned, (dst, REMOTE_PORT)).unwrap();
+                    let mut frames = tx.borrow_mut();
+                    assert_eq!(frames.len(), 1);
+                    assert_eq!(frames[0].len(), header_len + UDP_HEADER_LEN + payload.len());
+                    check_udp_header(&mut frames[0][header_len..], src, dst, payload);
+                }
+            }
+        }
+
+        let mut buf = PacketBuf::try_new().unwrap();
+        buf.set_len(buf.capacity());
+        buf.fill(0x5a);
+        let (err, returned) = socket.send_packet(buf, (REMOTE_ADDR, REMOTE_PORT)).unwrap_err();
+        assert_eq!(err, SendError::BufferFull);
+        assert_eq!(returned.headroom(), 0);
+        assert_eq!(returned.len(), returned.capacity());
+        assert!(returned.iter().all(|b| *b == 0x5a));
+    }
+
+    #[test]
     fn test_set_hop_limit() {
         // The socket's hop limit ends up in the IP header of every datagram it
         // sends, 64 by default. The rest of the headers are checked while at it.
@@ -1935,7 +2053,7 @@ mod test {
         let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
-        let max = crate::driver::config::PACKET_BUF_SIZE - (LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
+        let max = crate::driver::config::PACKET_BUF_SIZE - send_headroom(IpVersion::V4);
         let remote = SocketAddr::new(REMOTE_ADDR.into(), REMOTE_PORT);
 
         // One byte too many: rejected, nothing transmitted.

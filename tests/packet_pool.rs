@@ -47,6 +47,14 @@ fn exhaustion() {
     );
     assert!(stack.udp_socket(udp).is_open());
 
+    // An owned send needs no free buffer, even without reserved headroom.
+    let mut buf = held.pop().unwrap();
+    buf.set_len(5);
+    buf.copy_from_slice(b"hello");
+    stack.udp_socket(udp).send_packet(buf, dst).unwrap();
+    held.push(PacketBuf::try_new().unwrap());
+    assert!(PacketBuf::try_new().is_none());
+
     // Freeing one buffer is enough for a send. Taking it back starves sends again.
     drop(held.pop());
     stack.udp_socket(udp).send_slice(b"hello", dst).unwrap();

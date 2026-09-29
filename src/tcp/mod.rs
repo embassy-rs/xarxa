@@ -1235,12 +1235,16 @@ impl<'d> TcpSocketState<'d> {
         let mut control = repr.control;
         control = control.quash_psh();
 
-        // If a FIN is received at the end of the current segment, but
-        // we have a hole in the assembler before the current segment, disregard this FIN.
-        if control == TcpControl::Fin && window_start < segment_start {
+        // FIN occupies the sequence number after the original payload. A
+        // payload that reaches or crosses the right window edge does not leave
+        // room for FIN. Keep the existing bare-FIN zero-window handling; a hole
+        // before the segment also prevents accepting FIN.
+        if control == TcpControl::Fin
+            && (window_start < segment_start || (!payload.is_empty() && segment_end >= window_end))
+        {
             trace!(
-                "ignoring FIN because we don't have full data yet. window_start={} segment_start={}",
-                window_start, segment_start
+                "ignoring FIN outside contiguous receive window {}..{} at {}",
+                window_start, window_end, segment_end
             );
             control = TcpControl::None;
         }
@@ -5567,6 +5571,73 @@ mod test {
         // We should accept the FIN, because even though the last packet was partially
         // outside the receive window, there is no hole after adding its data to the assembler.
         assert_eq!(s.state, State::CloseWait);
+    }
+
+    #[test]
+    fn test_fin_outside_right_window_waits_for_retransmission() {
+        // FIN exactly at the right edge and FIN beyond a trimmed payload both
+        // remain unacknowledged until the application frees receive space.
+        for payload in [&b"abcd"[..], &b"abcdef"[..]] {
+            let mut s = socket_established_with_buffer_sizes(64, 4);
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Fin,
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload,
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 5),
+                    window_len: 0,
+                    ..RECV_TEMPL
+                }]
+            );
+            assert_eq!(s.state, State::Established);
+            let mut received = [0; 6];
+            assert_eq!(s.view().recv_slice(&mut received).unwrap(), 4);
+            assert_eq!(&received[..4], b"abcd");
+            assert_eq!(s.view().recv_slice(&mut received[4..]), Ok(0));
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 5),
+                    window_len: 4,
+                    ..RECV_TEMPL
+                }]
+            );
+
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Fin,
+                    seq_number: REMOTE_SEQ + 5,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &payload[4..],
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 2 + payload.len()),
+                    window_len: (8 - payload.len()) as u16,
+                    ..RECV_TEMPL
+                }]
+            );
+            if payload.len() > 4 {
+                assert_eq!(s.view().recv_slice(&mut received[4..]).unwrap(), 2);
+            }
+            assert_eq!(&received[..payload.len()], payload);
+            assert_eq!(s.view().recv_slice(&mut received), Err(RecvError::Finished));
+        }
     }
 
     #[test]

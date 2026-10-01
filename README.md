@@ -60,7 +60,8 @@ _xarxa_ makes the core work with the packet bytes directly instead. Why?
 
 ## Benchmarks
 
-_xarxa_ is faster and smaller than _smoltcp_, and roughly matches lwIP.
+_xarxa_ is faster and smaller than smoltcp and lwIP.
+
 ![throughput](https://raw.githubusercontent.com/embassy-rs/xarxa-bench/refs/heads/main/bench-throughput.svg)
 ![codesize](https://raw.githubusercontent.com/embassy-rs/xarxa-bench/refs/heads/main/bench-codesize.svg)
 

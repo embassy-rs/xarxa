@@ -542,6 +542,8 @@ pub(crate) struct TcpSocketState<'d> {
     /// The largest remote window ever received (MAX.SND.WND of RFC 5961).
     /// An ACK further than this below local_seq_no is not acceptable.
     remote_max_win_len: usize,
+    /// SEG.SEQ and SEG.ACK of the last accepted window update (SND.WL1/WL2).
+    remote_win_last_update: Option<(TcpSeqNumber, TcpSeqNumber)>,
     /// The receive window scaling factor for remotes which support RFC 1323, None if unsupported.
     remote_win_scale: Option<u8>,
     /// Whether or not the remote supports selective ACK as described in RFC 2018.
@@ -659,6 +661,7 @@ impl<'d> TcpSocketState<'d> {
             remote_last_win: 0,
             remote_win_len: 0,
             remote_max_win_len: 0,
+            remote_win_last_update: None,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
             #[cfg(feature = "tcp-sack")]
@@ -762,6 +765,7 @@ impl<'d> TcpSocketState<'d> {
         self.remote_last_win = 0;
         self.remote_win_len = 0;
         self.remote_max_win_len = 0;
+        self.remote_win_last_update = None;
         self.remote_win_scale = None;
         #[cfg(feature = "tcp-sack")]
         {
@@ -1376,10 +1380,15 @@ impl<'d> TcpSocketState<'d> {
         // Update remote state.
         self.remote_last_ts = Some(now);
 
-        // RFC 9293 3.10.7.4: the send window is updated only if
-        // SND.UNA <= SEG.ACK <= SND.NXT, so an old ACK leaves it alone.
+        // RFC 9293 3.10.7.4: old ACKs cannot update SND.WND. For acceptable
+        // ACKs, SND.WL1/WL2 prevent a reordered segment from replacing a newer
+        // window advertisement.
         let mut is_window_update = false;
-        if !old_ack {
+        let window_ack = repr.ack_number.unwrap_or(self.local_seq_no);
+        let window_is_current = self
+            .remote_win_last_update
+            .is_none_or(|(seq, ack)| repr.seq_number > seq || (repr.seq_number == seq && window_ack >= ack));
+        if !old_ack && window_is_current {
             // RFC 1323: The window field (SEG.WND) in the header of every incoming segment, with the
             // exception of SYN segments, is left-shifted by Snd.Wind.Scale bits before updating SND.WND.
             let scale = match repr.control {
@@ -1390,6 +1399,7 @@ impl<'d> TcpSocketState<'d> {
             is_window_update = new_remote_win_len != self.remote_win_len;
             self.remote_win_len = new_remote_win_len;
             self.remote_max_win_len = self.remote_max_win_len.max(new_remote_win_len);
+            self.remote_win_last_update = Some((repr.seq_number, window_ack));
 
             self.congestion_controller.set_remote_window(new_remote_win_len);
         }
@@ -8077,6 +8087,71 @@ mod test {
     }
 
     #[test]
+    fn test_reordered_segment_cannot_replace_newer_window() {
+        for remote_seq in [REMOTE_SEQ + 1, TcpSeqNumber(i32::MAX - 6)] {
+            for stale_window in [0, 128] {
+                let mut s = socket_established();
+                s.remote_seq_no = remote_seq;
+                s.remote_last_ack = Some(remote_seq);
+                s.remote_mss = 3;
+                s.view().set_nagle_enabled(false);
+
+                send!(
+                    s,
+                    TcpRepr {
+                        seq_number: remote_seq + 8,
+                        ack_number: Some(LOCAL_SEQ + 1),
+                        window_len: 3,
+                        ..SEND_TEMPL
+                    }
+                );
+                send!(
+                    s,
+                    TcpRepr {
+                        seq_number: remote_seq + 4,
+                        ack_number: Some(LOCAL_SEQ + 1),
+                        window_len: stale_window,
+                        ..SEND_TEMPL
+                    }
+                );
+                // Neither a stale close nor a stale larger advertisement may
+                // replace the current three-byte send window.
+                s.view().send_slice(b"abcdef").unwrap();
+                recv!(
+                    s,
+                    [TcpRepr {
+                        seq_number: LOCAL_SEQ + 1,
+                        ack_number: Some(remote_seq),
+                        payload: b"abc",
+                        ..RECV_TEMPL
+                    }]
+                );
+
+                // At equal sequence and ACK numbers a fresh window update
+                // still opens the window without acknowledging the first data.
+                send!(
+                    s,
+                    TcpRepr {
+                        seq_number: remote_seq + 8,
+                        ack_number: Some(LOCAL_SEQ + 1),
+                        window_len: 6,
+                        ..SEND_TEMPL
+                    }
+                );
+                recv!(
+                    s,
+                    [TcpRepr {
+                        seq_number: LOCAL_SEQ + 4,
+                        ack_number: Some(remote_seq),
+                        payload: b"def",
+                        ..RECV_TEMPL
+                    }]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_fast_retransmit_duplicate_detection() {
         let mut s = socket_established();
         s.remote_mss = 6;
@@ -11997,18 +12072,18 @@ mod test {
             })
         );
 
-        // Queued data plus a closed remote window arms the probe timer
+        // A fresh window update uses the peer's next sequence after the island.
+        // An older sequence would be stale and must not close the send window.
         s.view().send_slice(b"abcdef").unwrap();
         send!(
             s,
             TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
+                seq_number: REMOTE_SEQ + 1 + 30,
                 ack_number: Some(LOCAL_SEQ + 1),
                 window_len: 0,
                 ..SEND_TEMPL
             }
         );
-        assert!(s.timer.is_zero_window_probe());
 
         // Timer triggers and ZWP triggers containing the SACK ranges
         recv_nothing!(s, time 999);

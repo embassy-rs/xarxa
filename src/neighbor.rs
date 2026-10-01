@@ -180,6 +180,12 @@ impl NeighborCache {
         }
     }
 
+    /// Whether the cache has an entry for a neighbor, in any state.
+    #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+    pub(crate) fn contains(&self, key: &Key) -> bool {
+        self.storage.iter().any(|(probe, _)| probe == key)
+    }
+
     /// Create an INCOMPLETE entry for a neighbor, starting address resolution.
     ///
     /// The caller sends the first solicitation itself. The end of the next poll

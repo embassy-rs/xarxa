@@ -2192,8 +2192,17 @@ impl StackInner {
         let source_protocol_addr = Ipv4Addr::from(<[u8; 4]>::try_from(arp_packet.source_protocol_addr()).unwrap());
         let target_protocol_addr = Ipv4Addr::from(<[u8; 4]>::try_from(arp_packet.target_protocol_addr()).unwrap());
 
-        // Only process ARP packets for us.
-        if !iface.has_ip_addr(target_protocol_addr.into()) {
+        // RFC 826 merges an existing sender mapping before checking the target.
+        // In particular, gratuitous ARP must replace an old hardware address.
+        // Only packets aimed at us may create an unsolicited cache entry. The rest
+        // of the ARP traffic on the link is ignored here, before the checks below
+        // log anything about it.
+        let for_us = iface.has_ip_addr(target_protocol_addr.into());
+        if !for_us
+            && !self
+                .neighbor_cache
+                .contains(&(iface.handle, IpAddr::V4(source_protocol_addr)))
+        {
             return;
         }
 
@@ -2214,10 +2223,6 @@ impl StackInner {
             return;
         }
 
-        // Fill the ARP cache from any ARP packet aimed at us (both request or response).
-        // We fill from requests too because if someone is requesting our address they
-        // are probably going to talk to us, so we avoid having to request their address
-        // when we later reply to them.
         self.fill_neighbor(
             iface,
             IpAddr::V4(source_protocol_addr),
@@ -2225,7 +2230,7 @@ impl StackInner {
             now,
         );
 
-        if operation == ArpOperation::Request {
+        if for_us && operation == ArpOperation::Request {
             let Some(mut reply) = PacketBuf::try_new() else {
                 trace!("arp: no packet buffer for reply");
                 return;
@@ -6937,7 +6942,7 @@ pub(crate) mod test {
     }
 
     /// An ARP request for an address that isn't ours is neither answered nor
-    /// used to fill the cache.
+    /// used to create a cache entry for an unknown sender.
     #[test]
     fn test_arp_request_for_other_address_ignored() {
         let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
@@ -6959,6 +6964,63 @@ pub(crate) mod test {
             ArpPacket::new_unchecked(&mut frame[ETHERNET_HEADER_LEN..]).operation(),
             ArpOperation::Request
         );
+    }
+
+    #[test]
+    fn test_arp_announcement_replaces_cached_hardware_address() {
+        for operation in [ArpOperation::Request, ArpOperation::Reply] {
+            let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+            inject(&mut stack, &rx, arp_request_from(OTHER_HW, REMOTE_V4));
+            tx.borrow_mut().clear();
+
+            let new_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x03]);
+            let mut announcement = arp_request_from(new_hw, REMOTE_V4);
+            let mut arp = ArpPacket::new_unchecked(&mut announcement[ETHERNET_HEADER_LEN..]);
+            arp.set_operation(operation);
+            arp.set_target_protocol_addr(&REMOTE_V4.octets());
+            inject(&mut stack, &rx, announcement);
+            // The sender's announcement is not a request for our address.
+            assert!(tx.borrow().is_empty());
+
+            let udp = stack.add_udp_socket().unwrap();
+            stack.udp_socket(udp).bind(5555, ListenSocketAddr::UNSPECIFIED).unwrap();
+            stack
+                .udp_socket(udp)
+                .send_slice(b"after move", (REMOTE_V4, 1000))
+                .unwrap();
+            let tx = tx.borrow();
+            assert_eq!(tx.len(), 1);
+            let mut frame = tx[0].clone();
+            let eth = EthernetFrame::new_checked(&mut frame[..]).unwrap();
+            assert_eq!(eth.ethertype(), EthernetProtocol::Ipv4);
+            assert_eq!(eth.dst_addr(), new_hw);
+        }
+    }
+
+    #[test]
+    fn test_arp_other_target_resolves_pending_sender() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(5555, ListenSocketAddr::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp).send_slice(b"parked", (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
+        tx.borrow_mut().clear();
+
+        let mut request = arp_request_from(OTHER_HW, REMOTE_V4);
+        ArpPacket::new_unchecked(&mut request[ETHERNET_HEADER_LEN..])
+            .set_target_protocol_addr(&Ipv4Addr::new(192, 168, 1, 3).octets());
+        inject(&mut stack, &rx, request);
+
+        // The existing incomplete mapping is resolved without answering a
+        // request for someone else. Its queued datagram is released exactly once.
+        let tx = tx.borrow();
+        assert_eq!(tx.len(), 1);
+        let mut frame = tx[0].clone();
+        let eth = EthernetFrame::new_checked(&mut frame[..]).unwrap();
+        assert_eq!(eth.ethertype(), EthernetProtocol::Ipv4);
+        assert_eq!(eth.dst_addr(), OTHER_HW);
+        let udp = UdpPacket::new_checked(&mut frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..]).unwrap();
+        assert_eq!(udp.payload(), b"parked");
     }
 
     /// A raw socket watching UDP gets a copy of each datagram, and the UDP socket

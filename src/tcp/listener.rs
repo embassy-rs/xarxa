@@ -239,6 +239,7 @@ impl AcceptToken {
         s.local_seq_no = TcpSocketState::random_seq_no(rand);
         s.remote_seq_no = syn.remote_seq_no;
         s.remote_last_seq = s.local_seq_no;
+        s.remote_send_max = s.local_seq_no;
         #[cfg(feature = "tcp-sack")]
         {
             s.remote_has_sack = syn.remote_has_sack;

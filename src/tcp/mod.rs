@@ -269,7 +269,8 @@ struct RttEstimator {
     /// Retransmission Time-Out
     rto: Duration,
     timestamp: Option<(Instant, TcpSeqNumber)>,
-    max_seq_sent: Option<TcpSeqNumber>,
+    /// The highest sequence number sent, like BSD's `snd_max`.
+    send_max: Option<TcpSeqNumber>,
     rto_count: u8,
 }
 
@@ -281,7 +282,7 @@ impl Default for RttEstimator {
             rttvar: Duration::ZERO, // ignored, will be overwritten on first measurement.
             rto: RTTE_INITIAL_RTO,
             timestamp: None,
-            max_seq_sent: None,
+            send_max: None,
             rto_count: 0,
         }
     }
@@ -327,8 +328,8 @@ impl RttEstimator {
     }
 
     fn on_send(&mut self, timestamp: Instant, seq: TcpSeqNumber) {
-        if self.max_seq_sent.map(|max_seq_sent| seq > max_seq_sent).unwrap_or(true) {
-            self.max_seq_sent = Some(seq);
+        if self.send_max.map(|send_max| seq > send_max).unwrap_or(true) {
+            self.send_max = Some(seq);
             if self.timestamp.is_none() {
                 self.timestamp = Some((timestamp, seq));
                 trace!("rtte: sampling at seq={:?}", seq);
@@ -519,36 +520,43 @@ pub(crate) struct TcpSocketState<'d> {
     /// newer error overwrites an unread older one.
     #[cfg(feature = "icmp-errors")]
     icmp_error: Option<IcmpError>,
-    /// The sequence number corresponding to the beginning of the transmit buffer.
-    /// I.e. an ACK(local_seq_no+n) packet removes n bytes from the transmit buffer.
-    local_seq_no: TcpSeqNumber,
-    /// The sequence number corresponding to the beginning of the receive buffer.
-    /// I.e. userspace reading n bytes adds n to remote_seq_no.
-    remote_seq_no: TcpSeqNumber,
-    /// The last sequence number sent.
-    /// I.e. in an idle socket, local_seq_no+tx_buffer.len().
-    remote_last_seq: TcpSeqNumber,
-    /// The last acknowledgement number sent.
-    /// I.e. in an idle socket, remote_seq_no+rx_buffer.len().
-    remote_last_ack: Option<TcpSeqNumber>,
-    /// The last window length sent.
-    remote_last_win: u16,
-    /// The sending window scaling factor advertised to remotes which support RFC 1323.
-    /// It is zero if the window <= 64KiB and/or the remote does not support it.
-    remote_win_shift: u8,
-    /// The remote window size, relative to local_seq_no
-    /// I.e. we're allowed to send octets until local_seq_no+remote_win_len
-    remote_win_len: usize,
-    /// The largest remote window ever received (MAX.SND.WND of RFC 5961).
-    /// An ACK further than this below local_seq_no is not acceptable.
-    remote_max_win_len: usize,
-    /// The receive window scaling factor for remotes which support RFC 1323, None if unsupported.
-    remote_win_scale: Option<u8>,
-    /// Whether or not the remote supports selective ACK as described in RFC 2018.
+    /// SND.UNA: the oldest unacknowledged sequence number. The transmit buffer
+    /// starts here, or one later while our SYN is unacknowledged. An
+    /// ACK(send_unack+n) removes n bytes from the transmit buffer.
+    send_unack: TcpSeqNumber,
+    /// The sequence number of the first octet in the receive buffer, plus one once
+    /// the FIN arrived. Userspace reading n bytes adds n to it. Not an RFC variable:
+    /// `recv_read + rx_buffer.len()` is RCV.NXT.
+    recv_read: TcpSeqNumber,
+    /// SND.NXT: the next sequence number to send. In an idle socket,
+    /// send_unack+tx_buffer.len(). Unlike the RFC's, it is rewound to `send_unack`
+    /// on a retransmission timeout.
+    send_next: TcpSeqNumber,
+    /// Last.ACK.sent (RFC 7323): the ACK number of the last segment sent. In an
+    /// idle socket, RCV.NXT.
+    recv_ack_sent: Option<TcpSeqNumber>,
+    /// The window field of the last segment sent, as on the wire. The window it
+    /// advertised starts at `recv_ack_sent`.
+    recv_window_sent: u16,
+    /// Rcv.Wind.Shift (RFC 7323): the shift applied to the window we advertise.
+    /// Before the handshake completes, the shift we offer. It is zero if the
+    /// window <= 64KiB and/or the remote does not support window scaling.
+    recv_window_shift: u8,
+    /// SND.WND: the remote window size, relative to send_unack.
+    /// I.e. we're allowed to send octets until send_unack+send_window
+    send_window: usize,
+    /// MAX.SND.WND (RFC 5961): the largest remote window ever received.
+    /// An ACK further than this below send_unack is not acceptable.
+    send_window_max: usize,
+    /// Snd.Wind.Shift (RFC 7323): the shift applied to the remote's window.
+    /// None if the remote does not support window scaling (Snd.WS.OK clear).
+    send_window_shift: Option<u8>,
+    /// Whether the remote sent SACK-permitted (RFC 2018), so we send it SACK blocks.
     #[cfg(feature = "tcp-sack")]
-    remote_has_sack: bool,
-    /// The maximum number of data octets that the remote side may receive.
-    remote_mss: usize,
+    send_sack: bool,
+    /// SendMSS (RFC 9293 3.7.1): the maximum number of data octets that the remote
+    /// side may receive.
+    send_mss: usize,
     /// The IP MTU of the interface this connection's packets go out of, as of the
     /// last `dispatch` that routed the destination. Feeds the local MSS: cached
     /// here so that a `dispatch` with no route keeps sizing segments the same way.
@@ -560,7 +568,7 @@ pub(crate) struct TcpSocketState<'d> {
     local_rx_last_seq: Option<TcpSeqNumber>,
     /// The number of packets received directly after
     /// each other which have the same ACK number.
-    local_rx_dup_acks: u8,
+    dup_acks: u8,
     /// If a fast retransmit needs to occur
     pending_fast_retransmit: bool,
 
@@ -588,22 +596,22 @@ pub(crate) struct TcpSocketState<'d> {
     /// The congestion control algorithm.
     congestion_controller: congestion::Congestion,
 
-    /// Whether the TCP timestamp option (RFC 7323) is in use on this connection.
+    /// Snd.TS.OK (RFC 7323): whether the TCP timestamp option is in use on this connection.
     /// We offer it in the SYN of every connection we open, and answer with it if
     /// the peer offered it; it stays on only if both ends did.
     #[cfg(feature = "tcp-timestamps")]
-    timestamps: bool,
+    send_ts_ok: bool,
 
-    /// The last tsval received from the peer, echoed back as tsecr in every
+    /// TS.Recent (RFC 7323): the last tsval received from the peer, echoed back as tsecr in every
     /// segment we send. Zero until the first segment carrying a timestamp.
     #[cfg(feature = "tcp-timestamps")]
-    last_remote_tsval: u32,
+    ts_recent: u32,
 
-    /// Random offset added to every tsval this connection sends.
+    /// Snd.TSoffset (RFC 7323): random offset added to every tsval this connection sends.
     /// - Avoids leaking system uptime
     /// - Prevents correlating connections for hosts behind NAT.
     #[cfg(feature = "tcp-timestamps")]
-    tsval_offset: u32,
+    send_ts_offset: u32,
 
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
@@ -650,23 +658,23 @@ impl<'d> TcpSocketState<'d> {
             binding: IfaceBinding::Any,
             #[cfg(feature = "icmp-errors")]
             icmp_error: None,
-            local_seq_no: TcpSeqNumber::default(),
-            remote_seq_no: TcpSeqNumber::default(),
-            remote_last_seq: TcpSeqNumber::default(),
-            remote_last_ack: None,
-            remote_last_win: 0,
-            remote_win_len: 0,
-            remote_max_win_len: 0,
-            remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
-            remote_win_scale: None,
+            send_unack: TcpSeqNumber::default(),
+            recv_read: TcpSeqNumber::default(),
+            send_next: TcpSeqNumber::default(),
+            recv_ack_sent: None,
+            recv_window_sent: 0,
+            send_window: 0,
+            send_window_max: 0,
+            recv_window_shift: rx_cap_log2.saturating_sub(16) as u8,
+            send_window_shift: None,
             #[cfg(feature = "tcp-sack")]
-            remote_has_sack: false,
-            remote_mss: DEFAULT_MSS,
+            send_sack: false,
+            send_mss: DEFAULT_MSS,
             ip_mtu: DEFAULT_IP_MTU,
             remote_last_ts: None,
             #[cfg(feature = "tcp-sack")]
             local_rx_last_seq: None,
-            local_rx_dup_acks: 0,
+            dup_acks: 0,
             pending_fast_retransmit: false,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
@@ -676,11 +684,11 @@ impl<'d> TcpSocketState<'d> {
             #[cfg(feature = "tcp-sack")]
             local_sack_history: [None, None, None],
             #[cfg(feature = "tcp-timestamps")]
-            timestamps: false,
+            send_ts_ok: false,
             #[cfg(feature = "tcp-timestamps")]
-            last_remote_tsval: 0,
+            ts_recent: 0,
             #[cfg(feature = "tcp-timestamps")]
-            tsval_offset: 0,
+            send_ts_offset: 0,
             congestion_controller: congestion::Congestion::new(),
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -694,26 +702,26 @@ impl<'d> TcpSocketState<'d> {
     /// Used in internal calculations as well as packet generation.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+        u16::try_from(self.rx_buffer.window() >> self.recv_window_shift).unwrap_or(u16::MAX)
     }
 
     /// Return the last window field value, including scaling according to RFC 1323.
     ///
     /// Used in internal calculations as well as packet generation.
     ///
-    /// Unlike `remote_last_win`, we take into account new packets received (but not acknowledged)
+    /// Unlike `recv_window_sent`, we take into account new packets received (but not acknowledged)
     /// since the last window update and adjust the window length accordingly. This ensures a fair
     /// comparison between the last window length and the new window length we're going to
     /// advertise.
     #[inline]
     fn last_scaled_window(&self) -> Option<u16> {
-        let last_ack = self.remote_last_ack?;
-        let next_ack = self.remote_seq_no + self.rx_buffer.len();
+        let last_ack = self.recv_ack_sent?;
+        let next_ack = self.recv_read + self.rx_buffer.len();
 
-        let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
+        let last_win = (self.recv_window_sent as usize) << self.recv_window_shift;
         let last_win_adjusted = last_ack + last_win - next_ack;
 
-        Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
+        Some(u16::try_from(last_win_adjusted >> self.recv_window_shift).unwrap_or(u16::MAX))
     }
 
     /// Whether the socket is open: it processes incoming and dispatches
@@ -745,31 +753,31 @@ impl<'d> TcpSocketState<'d> {
         {
             self.icmp_error = None;
         }
-        self.local_seq_no = TcpSeqNumber::default();
+        self.send_unack = TcpSeqNumber::default();
         #[cfg(feature = "tcp-sack")]
         {
             self.local_rx_last_seq = None;
         }
-        self.local_rx_dup_acks = 0;
+        self.dup_acks = 0;
         self.pending_fast_retransmit = false;
-        self.remote_seq_no = TcpSeqNumber::default();
-        self.remote_last_seq = TcpSeqNumber::default();
-        self.remote_last_ack = None;
-        self.remote_last_win = 0;
-        self.remote_win_len = 0;
-        self.remote_max_win_len = 0;
-        self.remote_win_scale = None;
+        self.recv_read = TcpSeqNumber::default();
+        self.send_next = TcpSeqNumber::default();
+        self.recv_ack_sent = None;
+        self.recv_window_sent = 0;
+        self.send_window = 0;
+        self.send_window_max = 0;
+        self.send_window_shift = None;
         #[cfg(feature = "tcp-sack")]
         {
-            self.remote_has_sack = false;
+            self.send_sack = false;
         }
-        self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
-        self.remote_mss = DEFAULT_MSS;
+        self.recv_window_shift = rx_cap_log2.saturating_sub(16) as u8;
+        self.send_mss = DEFAULT_MSS;
         self.ip_mtu = DEFAULT_IP_MTU;
         self.remote_last_ts = None;
         #[cfg(feature = "tcp-timestamps")]
         {
-            self.last_remote_tsval = 0;
+            self.ts_recent = 0;
         }
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_limit = ChallengeAckLimit::None;
@@ -809,7 +817,7 @@ impl<'d> TcpSocketState<'d> {
 
     /// Number of octets transmitted but not yet ACKed.
     fn flight_size(&self) -> usize {
-        self.remote_last_seq - self.local_seq_no
+        self.send_next - self.send_unack
     }
 
     fn set_state(&mut self, state: State) {
@@ -869,8 +877,8 @@ impl<'d> TcpSocketState<'d> {
     /// monotonic, and at the granularity RFC 7323 asks for.
     #[cfg(feature = "tcp-timestamps")]
     fn timestamp_repr(&self, now: Instant, tsecr: u32) -> Option<TcpTimestampRepr> {
-        self.timestamps.then(|| {
-            let tsval = now.as_millis().wrapping_add(self.tsval_offset);
+        self.send_ts_ok.then(|| {
+            let tsval = now.as_millis().wrapping_add(self.send_ts_offset);
             TcpTimestampRepr::new(tsval, tsecr)
         })
     }
@@ -931,7 +939,7 @@ impl<'d> TcpSocketState<'d> {
     #[cfg(feature = "icmp-errors")]
     pub(crate) fn process_icmp_error(&mut self, error: IcmpError, seq: TcpSeqNumber) {
         // The quoted segment must be one we actually have in flight.
-        if seq < self.local_seq_no || seq > self.remote_last_seq {
+        if seq < self.send_unack || seq > self.send_next {
             trace!("icmp error quoting out-of-window seq, ignoring");
             return;
         }
@@ -986,7 +994,7 @@ impl<'d> TcpSocketState<'d> {
                 return ProcessResult::None;
             }
             (State::SynSent, TcpControl::Rst, Some(ack_number)) => {
-                if ack_number != self.local_seq_no + 1 {
+                if ack_number != self.send_unack + 1 {
                     debug!("unacceptable RST|ACK in response to initial SYN");
                     return ProcessResult::None;
                 }
@@ -995,7 +1003,7 @@ impl<'d> TcpSocketState<'d> {
             (_, TcpControl::Rst, _) => (),
             // SYN|ACK in the SYN-SENT state must have the exact ACK number.
             (State::SynSent, TcpControl::Syn, Some(ack_number)) => {
-                if ack_number != self.local_seq_no + 1 {
+                if ack_number != self.send_unack + 1 {
                     debug!("unacceptable SYN|ACK in response to initial SYN");
                     return ProcessResult::Rst;
                 }
@@ -1010,7 +1018,7 @@ impl<'d> TcpSocketState<'d> {
                 // I'm not sure why, I think it may be a workaround for broken TCP
                 // servers, or a defense against reordering. Either way, if Linux
                 // does it, we do too.
-                if ack_number == self.local_seq_no + 1 {
+                if ack_number == self.send_unack + 1 {
                     debug!("expecting a SYN|ACK, received an ACK with the right ack_number, ignoring.");
                     return ProcessResult::None;
                 }
@@ -1030,7 +1038,7 @@ impl<'d> TcpSocketState<'d> {
             }
             // ACK in the SYN-RECEIVED state must have the exact ACK number, or we RST it.
             (State::SynReceived, _, Some(ack_number)) => {
-                if ack_number != self.local_seq_no + 1 {
+                if ack_number != self.send_unack + 1 {
                     debug!("unacceptable ACK in response to SYN|ACK");
                     return ProcessResult::Rst;
                 }
@@ -1040,8 +1048,8 @@ impl<'d> TcpSocketState<'d> {
                 let unacknowledged = self.tx_buffer.len() + control_len;
 
                 // Acceptable ACK range (both inclusive)
-                let mut ack_min = self.local_seq_no;
-                let ack_max = self.local_seq_no + unacknowledged;
+                let mut ack_min = self.send_unack;
+                let ack_max = self.send_unack + unacknowledged;
 
                 // If we have sent a SYN, it MUST be acknowledged.
                 if sent_syn {
@@ -1057,10 +1065,10 @@ impl<'d> TcpSocketState<'d> {
                 if ack_number < ack_min {
                     // RFC 5961 5.2: acceptable only if
                     // (SND.UNA - MAX.SND.WND) <= SEG.ACK <= SND.NXT.
-                    if ack_number < ack_min - self.remote_max_win_len {
+                    if ack_number < ack_min - self.send_window_max {
                         debug!(
                             "unacceptable ACK ({} more than {} below {})",
-                            ack_number, self.remote_max_win_len, ack_min
+                            ack_number, self.send_window_max, ack_min
                         );
                         self.challenge_ack(now);
                         return ProcessResult::None;
@@ -1077,9 +1085,9 @@ impl<'d> TcpSocketState<'d> {
             }
         }
 
-        let window_start = self.remote_seq_no + self.rx_buffer.len();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
+        let window_start = self.recv_read + self.rx_buffer.len();
+        let window_end = if let Some(last_ack) = self.recv_ack_sent {
+            last_ack + ((self.recv_window_sent as usize) << self.recv_window_shift)
         } else {
             window_start
         };
@@ -1200,9 +1208,9 @@ impl<'d> TcpSocketState<'d> {
             && let Some(ack_number) = repr.ack_number
         {
             // Sequence number corresponding to the first byte in `tx_buffer`.
-            // This normally equals `local_seq_no`, but is 1 higher if we have sent a SYN,
+            // This normally equals `send_unack`, but is 1 higher if we have sent a SYN,
             // as the SYN occupies 1 sequence number "before" the data.
-            let tx_buffer_start_seq = self.local_seq_no + (sent_syn as usize);
+            let tx_buffer_start_seq = self.send_unack + (sent_syn as usize);
 
             if ack_number >= tx_buffer_start_seq {
                 ack_len = ack_number - tx_buffer_start_seq;
@@ -1215,7 +1223,7 @@ impl<'d> TcpSocketState<'d> {
                     ack_of_fin = true;
                 }
 
-                ack_all = self.remote_last_seq <= ack_number;
+                ack_all = self.send_next <= ack_number;
             }
         }
 
@@ -1252,7 +1260,7 @@ impl<'d> TcpSocketState<'d> {
             // It's not obvious from RFC 793 that this is permitted, but
             // 7th and 8th steps in the "SEGMENT ARRIVES" event describe this behavior.
             (State::SynReceived, TcpControl::Fin) => {
-                self.remote_seq_no += 1;
+                self.recv_read += 1;
                 self.rx_fin_received = true;
                 self.set_state(State::CloseWait);
             }
@@ -1268,27 +1276,27 @@ impl<'d> TcpSocketState<'d> {
                 if let Some(max_seg_size) = repr.max_seg_size {
                     // Treat a zero MSS as if the option were absent, like Linux does.
                     if max_seg_size != 0 {
-                        self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
-                        self.congestion_controller.set_mss(self.remote_mss);
+                        self.send_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
+                        self.congestion_controller.set_mss(self.send_mss);
                     }
                 }
 
-                self.remote_seq_no = repr.seq_number + 1;
-                self.remote_last_seq = self.local_seq_no + 1;
-                self.remote_last_ack = Some(repr.seq_number);
+                self.recv_read = repr.seq_number + 1;
+                self.send_next = self.send_unack + 1;
+                self.recv_ack_sent = Some(repr.seq_number);
                 #[cfg(feature = "tcp-sack")]
                 {
-                    self.remote_has_sack = repr.sack_permitted;
+                    self.send_sack = repr.sack_permitted;
                 }
-                self.remote_win_scale = repr.window_scale;
+                self.send_window_shift = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
-                if self.remote_win_scale.is_none() {
-                    self.remote_win_shift = 0;
+                if self.send_window_shift.is_none() {
+                    self.recv_window_shift = 0;
                 }
                 // Timestamps stay on only if the remote offered them too.
                 #[cfg(feature = "tcp-timestamps")]
                 {
-                    self.timestamps = repr.timestamp.is_some();
+                    self.send_ts_ok = repr.timestamp.is_some();
                 }
 
                 if repr.ack_number.is_some() {
@@ -1302,7 +1310,7 @@ impl<'d> TcpSocketState<'d> {
 
             // FIN packets in ESTABLISHED state indicate the remote side has closed.
             (State::Established, TcpControl::Fin) => {
-                self.remote_seq_no += 1;
+                self.recv_read += 1;
                 self.rx_fin_received = true;
                 self.set_state(State::CloseWait);
             }
@@ -1318,7 +1326,7 @@ impl<'d> TcpSocketState<'d> {
             // FIN packets in FIN-WAIT-1 state change it to CLOSING, or to TIME-WAIT
             // if they also acknowledge our FIN.
             (State::FinWait1, TcpControl::Fin) => {
-                self.remote_seq_no += 1;
+                self.recv_read += 1;
                 self.rx_fin_received = true;
                 if ack_of_fin {
                     self.set_state(State::TimeWait);
@@ -1332,7 +1340,7 @@ impl<'d> TcpSocketState<'d> {
 
             // FIN packets in FIN-WAIT-2 state change it to TIME-WAIT.
             (State::FinWait2, TcpControl::Fin) => {
-                self.remote_seq_no += 1;
+                self.recv_read += 1;
                 self.rx_fin_received = true;
                 self.set_state(State::TimeWait);
                 self.timer.set_for_close(now);
@@ -1380,14 +1388,14 @@ impl<'d> TcpSocketState<'d> {
             // exception of SYN segments, is left-shifted by Snd.Wind.Scale bits before updating SND.WND.
             let scale = match repr.control {
                 TcpControl::Syn => 0,
-                _ => self.remote_win_scale.unwrap_or(0),
+                _ => self.send_window_shift.unwrap_or(0),
             };
-            let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
-            is_window_update = new_remote_win_len != self.remote_win_len;
-            self.remote_win_len = new_remote_win_len;
-            self.remote_max_win_len = self.remote_max_win_len.max(new_remote_win_len);
+            let new_send_window = (repr.window_len as usize) << (scale as usize);
+            is_window_update = new_send_window != self.send_window;
+            self.send_window = new_send_window;
+            self.send_window_max = self.send_window_max.max(new_send_window);
 
-            self.congestion_controller.set_remote_window(new_remote_win_len);
+            self.congestion_controller.set_remote_window(new_send_window);
         }
 
         if ack_len > 0 {
@@ -1416,33 +1424,33 @@ impl<'d> TcpSocketState<'d> {
             // Increment duplicate ACK count, notify congestion controller and
             // set for retransmit if we just received the third duplicate ACK
             if repr.payload.is_empty()
-                && ack_number == self.local_seq_no
-                && ack_number < self.remote_last_seq
+                && ack_number == self.send_unack
+                && ack_number < self.send_next
                 && !is_window_update
             {
                 // Increment duplicate ACK count
-                self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+                self.dup_acks = self.dup_acks.saturating_add(1);
 
                 debug!(
                     "received duplicate ACK for seq {} (duplicate nr {}{})",
                     ack_number,
-                    self.local_rx_dup_acks,
-                    if self.local_rx_dup_acks == u8::MAX { "+" } else { "" }
+                    self.dup_acks,
+                    if self.dup_acks == u8::MAX { "+" } else { "" }
                 );
 
-                if self.local_rx_dup_acks == 3 {
+                if self.dup_acks == 3 {
                     self.timer.set_for_fast_retransmit();
                     debug!("started fast retransmit");
                 }
 
                 // Notify of duplicate ACK
                 let in_flight = self.flight_size();
-                self.congestion_controller.on_dup_ack(now, self.remote_mss, in_flight);
+                self.congestion_controller.on_dup_ack(now, self.send_mss, in_flight);
             } else {
                 // No duplicate ACK means we reset the duplicate ACK count
                 // and notify the congestion controller of the fresh ACK
-                if self.local_rx_dup_acks > 0 {
-                    self.local_rx_dup_acks = 0;
+                if self.dup_acks > 0 {
+                    self.dup_acks = 0;
                     debug!("reset duplicate ACK count");
                 }
 
@@ -1455,22 +1463,22 @@ impl<'d> TcpSocketState<'d> {
 
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
-            self.local_seq_no = ack_number;
+            self.send_unack = ack_number;
 
             // During retransmission, if an earlier segment got lost but later was
-            // successfully received, self.local_seq_no can move past self.remote_last_seq.
+            // successfully received, self.send_unack can move past self.send_next.
             // Do not attempt to retransmit the latter segments; not only this is pointless
             // in theory but also impossible in practice, since they have been already
             // deallocated from the buffer.
-            if self.remote_last_seq < self.local_seq_no {
-                self.remote_last_seq = self.local_seq_no
+            if self.send_next < self.send_unack {
+                self.send_next = self.send_unack
             }
         }
 
         // update last remote tsval
         #[cfg(feature = "tcp-timestamps")]
         if let Some(timestamp) = repr.timestamp {
-            self.last_remote_tsval = timestamp.tsval;
+            self.ts_recent = timestamp.tsval;
         }
 
         // update timers.
@@ -1493,12 +1501,12 @@ impl<'d> TcpSocketState<'d> {
         }
 
         // start/stop the Zero Window Probe timer.
-        if self.remote_win_len == 0 && !self.tx_buffer.is_empty() && (self.timer.is_idle() || ack_len > 0) {
+        if self.send_window == 0 && !self.tx_buffer.is_empty() && (self.timer.is_idle() || ack_len > 0) {
             let delay = self.rtte.retransmission_timeout();
             trace!("starting zero-window-probe timer for t+{}", delay);
             self.timer.set_for_zero_window_probe(now, delay);
         }
-        if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
+        if self.send_window != 0 && self.timer.is_zero_window_probe() {
             trace!("stopping zero-window-probe timer");
             self.timer.set_for_idle(now, self.keep_alive);
         }
@@ -1646,8 +1654,8 @@ impl<'d> TcpSocketState<'d> {
     }
 
     fn ack_to_transmit(&self) -> bool {
-        if let Some(remote_last_ack) = self.remote_last_ack {
-            remote_last_ack < self.remote_seq_no + self.rx_buffer.len()
+        if let Some(recv_ack_sent) = self.recv_ack_sent {
+            recv_ack_sent < self.recv_read + self.rx_buffer.len()
         } else {
             false
         }
@@ -1664,8 +1672,8 @@ impl<'d> TcpSocketState<'d> {
     /// byte of new data. For details, see
     /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
     fn immediate_ack_to_transmit(&self) -> bool {
-        if let Some(remote_last_ack) = self.remote_last_ack {
-            remote_last_ack + self.remote_mss < self.remote_seq_no + self.rx_buffer.len()
+        if let Some(recv_ack_sent) = self.recv_ack_sent {
+            recv_ack_sent + self.send_mss < self.recv_read + self.rx_buffer.len()
         } else {
             false
         }
@@ -1694,8 +1702,8 @@ impl<'d> TcpSocketState<'d> {
     /// Record that a segment carrying this ACK and window went out, and stop the
     /// delayed-ACK timer.
     fn ack_sent(&mut self, ack_number: Option<TcpSeqNumber>, window_len: u16) {
-        self.remote_last_ack = ack_number;
-        self.remote_last_win = window_len;
+        self.recv_ack_sent = ack_number;
+        self.recv_window_sent = window_len;
 
         match self.ack_delay_timer {
             AckDelayTimer::Idle => {}
@@ -1827,7 +1835,7 @@ impl<'d> TcpSocketState<'d> {
 
         // Data queued into a zero window since the last dispatch: the first probe
         // goes out one RTO from now (RFC 9293 3.8.6.1).
-        if self.remote_win_len == 0
+        if self.send_window == 0
             && !self.tx_buffer.is_empty()
             && self.timer.is_idle()
             && matches!(
@@ -1860,7 +1868,7 @@ impl<'d> TcpSocketState<'d> {
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue
                 // to be sent again.
-                self.remote_last_seq = self.local_seq_no;
+                self.send_next = self.send_unack;
 
                 // Inform RTTE, so that it can can handle RTO backoff
                 self.rtte.on_rto();
@@ -1923,12 +1931,12 @@ impl<'d> TcpSocketState<'d> {
         let local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
 
         // Every segment starts out as an empty ACK.
-        let ack = self.remote_seq_no + self.rx_buffer.len();
+        let ack = self.recv_read + self.rx_buffer.len();
         let repr = TcpRepr {
             src_port: tuple.local.port,
             dst_port: tuple.remote.port,
             control: TcpControl::None,
-            seq_number: self.remote_last_seq,
+            seq_number: self.send_next,
             ack_number: Some(ack),
             window_len: self.scaled_window(),
             window_scale: None,
@@ -1938,15 +1946,14 @@ impl<'d> TcpSocketState<'d> {
             // We fill blocks before payload sizing to ensure the options header
             // length is taken into account.
             #[cfg(feature = "tcp-sack")]
-            sack_ranges: if self.remote_has_sack
-                && !matches!(self.state, State::Closed | State::SynSent | State::SynReceived)
+            sack_ranges: if self.send_sack && !matches!(self.state, State::Closed | State::SynSent | State::SynReceived)
             {
                 self.generate_sack_ranges(ack)
             } else {
                 [None, None, None]
             },
             #[cfg(feature = "tcp-timestamps")]
-            timestamp: self.timestamp_repr(now, self.last_remote_tsval),
+            timestamp: self.timestamp_repr(now, self.ts_recent),
             payload: &[],
             payload2: &[],
         };
@@ -1985,7 +1992,7 @@ impl<'d> TcpSocketState<'d> {
             // SYN-RECEIVED state: if it's not in flight yet, or to carry an ACK
             // (a simultaneous open acknowledges the remote's SYN with one).
             State::SynSent | State::SynReceived => {
-                if self.remote_last_seq == self.local_seq_no || self.ack_due(clock) {
+                if self.send_next == self.send_unack || self.ack_due(clock) {
                     let mut syn = TcpRepr {
                         // window len must NOT be scaled in SYNs.
                         window_len: u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX),
@@ -1994,7 +2001,7 @@ impl<'d> TcpSocketState<'d> {
                     };
                     if self.state == State::SynSent {
                         syn.ack_number = None;
-                        syn.window_scale = Some(self.remote_win_shift);
+                        syn.window_scale = Some(self.recv_window_shift);
                         #[cfg(feature = "tcp-sack")]
                         {
                             syn.sack_permitted = true;
@@ -2002,9 +2009,9 @@ impl<'d> TcpSocketState<'d> {
                     } else {
                         #[cfg(feature = "tcp-sack")]
                         {
-                            syn.sack_permitted = self.remote_has_sack;
+                            syn.sack_permitted = self.send_sack;
                         }
-                        syn.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
+                        syn.window_scale = self.send_window_shift.map(|_| self.recv_window_shift);
                     }
                     self.send_segment(clock, &mut send, &syn, TcpControl::Syn, 0, 0)?;
                 }
@@ -2017,7 +2024,7 @@ impl<'d> TcpSocketState<'d> {
                 // the remote is willing to accept and by our MTU. Per RFC 6691 §2 the
                 // MSS counts payload only and excludes TCP options.
                 let options_len = repr.header_len() - TCP_HEADER_LEN;
-                let mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+                let mss = local_mss.min(self.send_mss).saturating_sub(options_len);
 
                 // A fast retransmit resends the earliest unacknowledged segment,
                 // whatever the remote and congestion windows say.
@@ -2031,7 +2038,7 @@ impl<'d> TcpSocketState<'d> {
                 // New data, in segments of up to one MSS, up to the edge of the remote
                 // window, with no more in flight than the congestion window. Offsets
                 // count from the first unacknowledged octet.
-                let limit = tx_len.min(self.remote_win_len).min(self.congestion_controller.window());
+                let limit = tx_len.min(self.send_window).min(self.congestion_controller.window());
                 loop {
                     let offset = self.flight_size();
                     let len = limit.saturating_sub(offset).min(mss);
@@ -2065,7 +2072,7 @@ impl<'d> TcpSocketState<'d> {
             let payload = self.tx_buffer.get_allocated(offset, 1);
             send(TcpRepr {
                 control: data_control(offset, payload.len()),
-                seq_number: self.remote_last_seq,
+                seq_number: self.send_next,
                 payload,
                 ..repr
             })?;
@@ -2114,7 +2121,7 @@ impl<'d> TcpSocketState<'d> {
             {
                 trace!("sending a keep-alive");
                 send(TcpRepr {
-                    seq_number: self.remote_last_seq - 1,
+                    seq_number: self.send_next - 1,
                     payload: b"\x00",
                     ..repr
                 })?;
@@ -2156,7 +2163,7 @@ impl<'d> TcpSocketState<'d> {
             .get_allocated(offset + payload.len(), len - payload.len());
         let repr = TcpRepr {
             control,
-            seq_number: self.local_seq_no + offset,
+            seq_number: self.send_unack + offset,
             payload,
             payload2,
             ..*repr
@@ -2190,9 +2197,9 @@ impl<'d> TcpSocketState<'d> {
         let segment_len = repr.segment_len();
         let seq_end = repr.seq_number + segment_len;
 
-        // Use max() so a fast-retransmit segment (whose seq_number is local_seq_no, well
+        // Use max() so a fast-retransmit segment (whose seq_number is send_unack, well
         // behind the current frontier) doesn't rewind the tracked "highest sent" sequence.
-        self.remote_last_seq = self.remote_last_seq.max(seq_end);
+        self.send_next = self.send_next.max(seq_end);
         self.ack_sent(repr.ack_number, repr.window_len);
 
         // We've sent something, so rewind the keep-alive timer.
@@ -2621,7 +2628,7 @@ impl<'d> TcpSocket<'_, 'd> {
         }
         let seq = TcpSocketState::random_seq_no(self.tx.rand());
         #[cfg(feature = "tcp-timestamps")]
-        let tsval_offset = TcpSocketState::random_tsval_offset(self.tx.rand());
+        let send_ts_offset = TcpSocketState::random_tsval_offset(self.tx.rand());
 
         let s = self.inner_mut();
         s.reset();
@@ -2630,15 +2637,15 @@ impl<'d> TcpSocket<'_, 'd> {
             remote,
         });
         s.set_state(State::SynSent);
-        s.local_seq_no = seq;
-        s.remote_last_seq = seq;
+        s.send_unack = seq;
+        s.send_next = seq;
         // Every connection we open offers timestamps; the SYN|ACK decides
         // whether they stay on.
         #[cfg(feature = "tcp-timestamps")]
         {
-            s.timestamps = true;
-            s.last_remote_tsval = 0;
-            s.tsval_offset = tsval_offset;
+            s.send_ts_ok = true;
+            s.ts_recent = 0;
+            s.send_ts_offset = send_ts_offset;
         }
         Ok(())
     }
@@ -2883,7 +2890,7 @@ impl<'d> TcpSocket<'_, 'd> {
         let s = self.inner_mut();
         let _old_length = s.rx_buffer.len();
         let (size, result) = f(&mut s.rx_buffer);
-        s.remote_seq_no += size;
+        s.recv_read += size;
         if size > 0 {
             trace!("rx buffer: dequeueing {} octets (now {})", size, _old_length - size);
         }
@@ -3239,13 +3246,13 @@ mod test {
             let (s1, s2) = ($socket1, $socket2);
             assert_eq!(s1.state, s2.state, "state");
             assert_eq!(s1.tuple, s2.tuple, "tuple");
-            assert_eq!(s1.local_seq_no, s2.local_seq_no, "local_seq_no");
-            assert_eq!(s1.remote_seq_no, s2.remote_seq_no, "remote_seq_no");
-            assert_eq!(s1.remote_last_seq, s2.remote_last_seq, "remote_last_seq");
-            assert_eq!(s1.remote_last_ack, s2.remote_last_ack, "remote_last_ack");
-            assert_eq!(s1.remote_last_win, s2.remote_last_win, "remote_last_win");
-            assert_eq!(s1.remote_win_len, s2.remote_win_len, "remote_win_len");
-            assert_eq!(s1.remote_max_win_len, s2.remote_max_win_len, "remote_max_win_len");
+            assert_eq!(s1.send_unack, s2.send_unack, "send_unack");
+            assert_eq!(s1.recv_read, s2.recv_read, "recv_read");
+            assert_eq!(s1.send_next, s2.send_next, "send_next");
+            assert_eq!(s1.recv_ack_sent, s2.recv_ack_sent, "recv_ack_sent");
+            assert_eq!(s1.recv_window_sent, s2.recv_window_sent, "recv_window_sent");
+            assert_eq!(s1.send_window, s2.send_window, "send_window");
+            assert_eq!(s1.send_window_max, s2.send_window_max, "send_window_max");
             assert_eq!(s1.timer, s2.timer, "timer");
         }};
     }
@@ -3288,11 +3295,11 @@ mod test {
         let mut s = socket_with_buffer_sizes(tx_len, rx_len);
         s.state = State::SynReceived;
         s.tuple = Some(TUPLE);
-        s.local_seq_no = LOCAL_SEQ;
-        s.remote_seq_no = REMOTE_SEQ + 1;
-        s.remote_last_seq = LOCAL_SEQ;
-        s.remote_win_len = 256;
-        s.remote_max_win_len = 256;
+        s.send_unack = LOCAL_SEQ;
+        s.recv_read = REMOTE_SEQ + 1;
+        s.send_next = LOCAL_SEQ;
+        s.send_window = 256;
+        s.send_window_max = 256;
         s
     }
 
@@ -3304,8 +3311,8 @@ mod test {
         let mut s = socket_with_buffer_sizes(tx_len, rx_len);
         s.state = State::SynSent;
         s.tuple = Some(TUPLE);
-        s.local_seq_no = LOCAL_SEQ;
-        s.remote_last_seq = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
+        s.send_next = LOCAL_SEQ;
         s
     }
 
@@ -3316,10 +3323,10 @@ mod test {
     fn socket_established_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
         let mut s = socket_syn_received_with_buffer_sizes(tx_len, rx_len);
         s.state = State::Established;
-        s.local_seq_no = LOCAL_SEQ + 1;
-        s.remote_last_seq = LOCAL_SEQ + 1;
-        s.remote_last_ack = Some(REMOTE_SEQ + 1);
-        s.remote_last_win = s.scaled_window();
+        s.send_unack = LOCAL_SEQ + 1;
+        s.send_next = LOCAL_SEQ + 1;
+        s.recv_ack_sent = Some(REMOTE_SEQ + 1);
+        s.recv_window_sent = s.scaled_window();
         s
     }
 
@@ -3336,16 +3343,16 @@ mod test {
     fn socket_fin_wait_2() -> TestSocket {
         let mut s = socket_fin_wait_1();
         s.state = State::FinWait2;
-        s.local_seq_no = LOCAL_SEQ + 1 + 1;
-        s.remote_last_seq = LOCAL_SEQ + 1 + 1;
+        s.send_unack = LOCAL_SEQ + 1 + 1;
+        s.send_next = LOCAL_SEQ + 1 + 1;
         s
     }
 
     fn socket_closing() -> TestSocket {
         let mut s = socket_fin_wait_1();
         s.state = State::Closing;
-        s.remote_last_seq = LOCAL_SEQ + 1 + 1;
-        s.remote_seq_no = REMOTE_SEQ + 1 + 1;
+        s.send_next = LOCAL_SEQ + 1 + 1;
+        s.recv_read = REMOTE_SEQ + 1 + 1;
         s.timer = Timer::Retransmit {
             expires_at: Instant::from_millis(1000),
         };
@@ -3355,9 +3362,9 @@ mod test {
     fn socket_time_wait(from_closing: bool) -> TestSocket {
         let mut s = socket_fin_wait_2();
         s.state = State::TimeWait;
-        s.remote_seq_no = REMOTE_SEQ + 1 + 1;
+        s.recv_read = REMOTE_SEQ + 1 + 1;
         if from_closing {
-            s.remote_last_ack = Some(REMOTE_SEQ + 1 + 1);
+            s.recv_ack_sent = Some(REMOTE_SEQ + 1 + 1);
         }
         s.timer = Timer::Close {
             expires_at: Instant::from_secs(1) + CLOSE_DELAY,
@@ -3368,8 +3375,8 @@ mod test {
     fn socket_close_wait() -> TestSocket {
         let mut s = socket_established();
         s.state = State::CloseWait;
-        s.remote_seq_no = REMOTE_SEQ + 1 + 1;
-        s.remote_last_ack = Some(REMOTE_SEQ + 1 + 1);
+        s.recv_read = REMOTE_SEQ + 1 + 1;
+        s.recv_ack_sent = Some(REMOTE_SEQ + 1 + 1);
         s
     }
 
@@ -3873,7 +3880,7 @@ mod test {
 
         let sh = listener_accept(&mut stack, h, 64, 64).unwrap();
         assert!(stack.tcp_listener(h).accept().is_none());
-        assert_eq!(stack.sockets.tcp.get(sh.index()).remote_seq_no, REMOTE_SEQ + 101);
+        assert_eq!(stack.sockets.tcp.get(sh.index()).recv_read, REMOTE_SEQ + 101);
     }
 
     #[cfg(feature = "tcp-listener")]
@@ -3965,7 +3972,7 @@ mod test {
                 }
             ));
             let sh = listener_accept(&mut stack, h, 64, 64).unwrap();
-            assert_eq!(stack.sockets.tcp.get(sh.index()).remote_mss, effective);
+            assert_eq!(stack.sockets.tcp.get(sh.index()).send_mss, effective);
         }
     }
 
@@ -3998,8 +4005,8 @@ mod test {
                 }
             ));
             let sh = listener_accept(&mut stack, h, buffer_size, 64).unwrap();
-            assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_scale, Some(7));
-            assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_shift, shift);
+            assert_eq!(stack.sockets.tcp.get(sh.index()).send_window_shift, Some(7));
+            assert_eq!(stack.sockets.tcp.get(sh.index()).recv_window_shift, shift);
 
             let mut s = TestSocket {
                 sockets: {
@@ -4028,8 +4035,8 @@ mod test {
         let (mut stack, h) = listener_stack();
         assert!(listener_deliver(&mut stack, &syn_repr()));
         let sh = listener_accept(&mut stack, h, 65536, 64).unwrap();
-        assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_scale, None);
-        assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_shift, 0);
+        assert_eq!(stack.sockets.tcp.get(sh.index()).send_window_shift, None);
+        assert_eq!(stack.sockets.tcp.get(sh.index()).recv_window_shift, 0);
         let mut s = TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
@@ -4192,8 +4199,8 @@ mod test {
         assert_eq!(s.state, State::CloseWait);
 
         let mut s2 = socket_close_wait();
-        s2.remote_last_ack = Some(REMOTE_SEQ + 1 + 6 + 1);
-        s2.remote_last_win = 58;
+        s2.recv_ack_sent = Some(REMOTE_SEQ + 1 + 6 + 1);
+        s2.recv_window_sent = 58;
         sanity!(s, s2);
     }
 
@@ -4263,7 +4270,7 @@ mod test {
                 }
             );
             assert_eq!(s.state, State::Established);
-            assert_eq!(s.remote_win_scale, Some(scale));
+            assert_eq!(s.send_window_shift, Some(scale));
         }
     }
 
@@ -4301,7 +4308,7 @@ mod test {
     #[test]
     fn test_connect() {
         let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
         assert_eq!(s.tuple, Some(TUPLE));
         recv!(
@@ -4336,7 +4343,7 @@ mod test {
     #[test]
     fn test_connect_synack_tiny_mss_is_clamped() {
         let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
         recv!(
             s,
@@ -4365,13 +4372,13 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Established);
-        assert_eq!(s.remote_mss, MIN_REMOTE_MSS);
+        assert_eq!(s.send_mss, MIN_REMOTE_MSS);
     }
 
     #[test]
     fn test_connect_synack_zero_mss_is_ignored() {
         let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
         recv!(
             s,
@@ -4400,7 +4407,7 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Established);
-        assert_eq!(s.remote_mss, DEFAULT_MSS);
+        assert_eq!(s.send_mss, DEFAULT_MSS);
     }
 
     /// RFC 2018: If the data receiver has not received a SACK-Permitted option
@@ -4436,7 +4443,7 @@ mod test {
             }
         );
 
-        assert!(!s.remote_has_sack);
+        assert!(!s.send_sack);
 
         recv!(
             s,
@@ -4459,7 +4466,7 @@ mod test {
         let mut s = socket_syn_received();
 
         // Ensure the remote not sending SACK results in SACK options not being sent.
-        assert!(!s.remote_has_sack);
+        assert!(!s.send_sack);
         recv!(
             s,
             [TcpRepr {
@@ -4492,7 +4499,7 @@ mod test {
             sack_permitted: true,
             ..syn_repr()
         });
-        assert!(s.remote_has_sack);
+        assert!(s.send_sack);
         recv!(
             s,
             [TcpRepr {
@@ -4640,7 +4647,7 @@ mod test {
     #[test]
     fn test_syn_sent_sanity() {
         let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END).unwrap();
         sanity!(s, socket_syn_sent());
     }
@@ -5024,7 +5031,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(s.remote_has_sack);
+        assert!(s.send_sack);
 
         let mut s = socket_syn_sent();
         recv!(
@@ -5051,7 +5058,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(!s.remote_has_sack);
+        assert!(!s.send_sack);
     }
 
     #[test]
@@ -5071,8 +5078,8 @@ mod test {
             (1048576, 5),
         ] {
             let mut s = socket_with_buffer_sizes(64, *buffer_size);
-            s.local_seq_no = LOCAL_SEQ;
-            assert_eq!(s.remote_win_shift, *shift_amt);
+            s.send_unack = LOCAL_SEQ;
+            assert_eq!(s.recv_window_shift, *shift_amt);
             s.view().connect(REMOTE_END, LOCAL_END).unwrap();
             recv!(
                 s,
@@ -5111,7 +5118,7 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        assert_eq!(s.remote_win_shift, 5);
+        assert_eq!(s.recv_window_shift, 5);
         send!(
             s,
             TcpRepr {
@@ -5125,9 +5132,9 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Established);
-        assert_eq!(s.remote_win_shift, 0);
-        assert_eq!(s.remote_win_scale, None);
-        assert_eq!(s.remote_win_len, 42);
+        assert_eq!(s.recv_window_shift, 0);
+        assert_eq!(s.send_window_shift, None);
+        assert_eq!(s.send_window, 42);
     }
 
     #[test]
@@ -5159,9 +5166,9 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Established);
-        assert_eq!(s.remote_win_scale, Some(7));
+        assert_eq!(s.send_window_shift, Some(7));
         // scaling does NOT apply to the window value in SYN packets
-        assert_eq!(s.remote_win_len, 42);
+        assert_eq!(s.send_window, 42);
     }
 
     // =========================================================================================//
@@ -5248,9 +5255,9 @@ mod test {
     #[cfg(feature = "tcp-sack")]
     fn test_established_sack_no_overflow_on_near_max_seqnumber() {
         let mut s = socket_established();
-        s.remote_has_sack = true;
-        s.remote_seq_no = TcpSeqNumber(-4);
-        s.remote_last_ack = Some(TcpSeqNumber(-4));
+        s.send_sack = true;
+        s.recv_read = TcpSeqNumber(-4);
+        s.recv_ack_sent = Some(TcpSeqNumber(-4));
 
         // Create first island - [-2..2) - and SACK reports it
         send!(
@@ -5302,9 +5309,9 @@ mod test {
         assert_eq!(s.rx_buffer.len(), 0);
         s.rx_buffer = SocketBuffer::new(vec![0; 262143].leak());
         s.assembler = Assembler::new();
-        s.remote_win_scale = Some(0);
-        s.remote_last_win = 65535;
-        s.remote_win_shift = 2;
+        s.send_window_shift = Some(0);
+        s.recv_window_sent = 65535;
+        s.recv_window_shift = 2;
 
         // Create a TCP segment that will mostly fill an IP frame.
         let mut segment: Vec<u8> = Vec::with_capacity(1400);
@@ -5416,7 +5423,7 @@ mod test {
         }
 
         let mut s = socket_established();
-        s.remote_win_len = 16;
+        s.send_window = 16;
         s.view().send_slice(&data[..]).unwrap();
         recv!(
             s,
@@ -5447,8 +5454,8 @@ mod test {
         assert_eq!(s.tx_buffer.len(), 6);
 
         println!(
-            "local_seq_no={} remote_win_len={} remote_last_seq={}",
-            s.local_seq_no, s.remote_win_len, s.remote_last_seq
+            "send_unack={} send_window={} send_next={}",
+            s.send_unack, s.send_window, s.send_next
         );
 
         // - Peer doesn't ack them yet
@@ -5468,8 +5475,8 @@ mod test {
         assert_eq!(s.tx_buffer.len(), 6);
 
         println!(
-            "local_seq_no={} remote_win_len={} remote_last_seq={}",
-            s.local_seq_no, s.remote_win_len, s.remote_last_seq
+            "send_unack={} send_window={} send_next={}",
+            s.send_unack, s.send_window, s.send_next
         );
 
         // More data should not get sent since it doesn't fit in the window
@@ -5576,8 +5583,8 @@ mod test {
     fn test_established_send_wrap() {
         let mut s = socket_established();
         let local_seq_start = TcpSeqNumber(i32::MAX - 1);
-        s.local_seq_no = local_seq_start + 1;
-        s.remote_last_seq = local_seq_start + 1;
+        s.send_unack = local_seq_start + 1;
+        s.send_next = local_seq_start + 1;
         s.view().send_slice(b"abc").unwrap();
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: local_seq_start + 1,
@@ -5613,7 +5620,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1);
         // Data not yet transmitted.
         send!(
             s,
@@ -5631,7 +5638,7 @@ mod test {
                 ..RECV_TEMPL
             })
         );
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1);
     }
 
     // RFC 9293 3.10.7.4: an ACK below SND.UNA is ignored, but the segment
@@ -5660,7 +5667,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1 + 3);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1 + 3);
         // Then the data segment the peer sent before it. It acknowledges less
         // than SND.UNA and advertises an older window.
         send!(
@@ -5690,8 +5697,8 @@ mod test {
             })
             .unwrap();
         // The old ACK moved neither SND.UNA nor the send window.
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1 + 3);
-        assert_eq!(s.remote_win_len, 256);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1 + 3);
+        assert_eq!(s.send_window, 256);
     }
 
     // RFC 5961 5.2: an ACK more than MAX.SND.WND below SND.UNA discards the
@@ -5699,7 +5706,7 @@ mod test {
     #[test]
     fn test_established_ack_below_max_window_challenge_ack() {
         let mut s = socket_established();
-        assert_eq!(s.remote_max_win_len, 256);
+        assert_eq!(s.send_window_max, 256);
         send!(
             s,
             TcpRepr {
@@ -5719,7 +5726,7 @@ mod test {
         );
         // Nothing was delivered, and nothing else is sent.
         assert!(!s.view().can_recv());
-        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1);
+        assert_eq!(s.recv_read, REMOTE_SEQ + 1);
         recv_nothing!(s);
 
         // Challenge ACKs are rate-limited.
@@ -5763,7 +5770,7 @@ mod test {
                 (6, ())
             })
             .unwrap();
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1);
     }
 
     // MAX.SND.WND is the largest window the peer ever advertised, not the
@@ -5780,7 +5787,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.remote_max_win_len, 1000);
+        assert_eq!(s.send_window_max, 1000);
         send!(
             s,
             TcpRepr {
@@ -5790,8 +5797,8 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.remote_win_len, 10);
-        assert_eq!(s.remote_max_win_len, 1000);
+        assert_eq!(s.send_window, 10);
+        assert_eq!(s.send_window_max, 1000);
         // 1000 below SND.UNA is still within MAX.SND.WND: an old ACK, ignored.
         send!(
             s,
@@ -5801,8 +5808,8 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
-        assert_eq!(s.remote_win_len, 10);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1);
+        assert_eq!(s.send_window, 10);
         // 1001 below is not.
         send!(
             s,
@@ -5842,7 +5849,7 @@ mod test {
                 ..RECV_TEMPL
             })
         );
-        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1);
+        assert_eq!(s.recv_read, REMOTE_SEQ + 1);
 
         // Challenge ACKs are rate-limited, we don't get a second one immediately.
         send!(
@@ -5874,7 +5881,7 @@ mod test {
                 ..RECV_TEMPL
             })
         );
-        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1);
+        assert_eq!(s.recv_read, REMOTE_SEQ + 1);
     }
 
     #[test]
@@ -6027,8 +6034,8 @@ mod test {
 
         // construct socket where remote MSS is less than local MSS
         let mut s = socket_established();
-        s.timestamps = true;
-        s.remote_mss = EFFECTIVE_MSS;
+        s.send_ts_ok = true;
+        s.send_mss = EFFECTIVE_MSS;
 
         // Payload should contain 12 bytes less due to timestamp
         s.view().send_slice(&[0; EFFECTIVE_MSS]).unwrap();
@@ -6051,9 +6058,9 @@ mod test {
 
         // construct socket where remote MSS is more than local MSS
         let mut s = socket_established_with_buffer_sizes(EFFECTIVE_MSS, 64);
-        s.timestamps = true;
-        s.remote_mss = 9999;
-        s.remote_win_len = 9999;
+        s.send_ts_ok = true;
+        s.send_mss = 9999;
+        s.send_window = 9999;
 
         // Payload should contain 12 bytes less due to timestamp
         s.view().send_slice(&[0; EFFECTIVE_MSS]).unwrap();
@@ -6086,8 +6093,8 @@ mod test {
             .unwrap();
         s.state = State::SynSent;
         s.tuple = Some(TUPLE);
-        s.local_seq_no = LOCAL_SEQ;
-        s.remote_last_seq = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
+        s.send_next = LOCAL_SEQ;
 
         // The SYN advertises the MSS derived from the egress interface's MTU.
         recv!(
@@ -6156,7 +6163,7 @@ mod test {
         // options length would result in an effective MSS of zero, sending
         // empty segments in a loop without ever making progress.
         let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
         recv!(
             s,
@@ -6185,7 +6192,7 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Established);
-        assert_eq!(s.remote_mss, MIN_REMOTE_MSS);
+        assert_eq!(s.send_mss, MIN_REMOTE_MSS);
 
         s.view().send_slice(&[0; 64]).unwrap();
         recv!(
@@ -6521,7 +6528,7 @@ mod test {
     #[test]
     fn test_fin_wait_1_fin_with_data_queued() {
         let mut s = socket_established();
-        s.remote_win_len = 6;
+        s.send_window = 6;
         s.view().send_slice(b"abcdef123456").unwrap();
         s.view().close();
         recv!(
@@ -6853,7 +6860,7 @@ mod test {
     #[test]
     fn test_last_ack_duplicate_ack_challenge_ack() {
         let mut s = socket_last_ack();
-        // Trigger dispatch so our FIN is sent and remote_last_seq advances.
+        // Trigger dispatch so our FIN is sent and send_next advances.
         recv!(
             s,
             [TcpRepr {
@@ -6908,11 +6915,11 @@ mod test {
         let mut s = socket_last_ack();
         // Push one byte into the tx buffer to simulate data that preceded the FIN.
         let _ = s.tx_buffer.enqueue_slice(b"x");
-        // Mark it as already sent (remote_last_seq is past the data byte and the FIN).
-        s.remote_last_seq = LOCAL_SEQ + 1 + 1 + 1; // data(1) + FIN(1)
+        // Mark it as already sent (send_next is past the data byte and the FIN).
+        s.send_next = LOCAL_SEQ + 1 + 1 + 1; // data(1) + FIN(1)
 
         // Remote ACKs just the data byte, not the FIN (partial ACK).
-        // ack_number = local_seq_no + 1  =>  ack_len = 1, ack_of_fin = false.
+        // ack_number = send_unack + 1  =>  ack_len = 1, ack_of_fin = false.
         // Per RFC 9293, a valid partial ACK should advance SND.UNA normally;
         // no challenge ACK should be emitted.
         send!(
@@ -6926,7 +6933,7 @@ mod test {
         // State remains LAST-ACK; FIN retransmission is handled by the timer.
         assert_eq!(s.state, State::LastAck);
         // SND.UNA has advanced to the partial ACK number.
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1 + 1);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1 + 1);
     }
 
     #[test]
@@ -7333,28 +7340,28 @@ mod test {
         let mut s = socket_established();
         #[cfg(feature = "tcp-sack")]
         {
-            s.remote_has_sack = true;
+            s.send_sack = true;
             s.local_rx_last_seq = Some(TcpSeqNumber(42));
         }
-        s.local_rx_dup_acks = 2;
+        s.dup_acks = 2;
         s.pending_fast_retransmit = true;
         #[cfg(feature = "tcp-timestamps")]
         {
-            s.last_remote_tsval = 7;
+            s.ts_recent = 7;
         }
 
         s.reset();
 
         #[cfg(feature = "tcp-sack")]
         {
-            assert!(!s.remote_has_sack);
+            assert!(!s.send_sack);
             assert_eq!(s.local_rx_last_seq, None);
         }
-        assert_eq!(s.local_rx_dup_acks, 0);
+        assert_eq!(s.dup_acks, 0);
         assert!(!s.pending_fast_retransmit);
         #[cfg(feature = "tcp-timestamps")]
         {
-            assert_eq!(s.last_remote_tsval, 0);
+            assert_eq!(s.ts_recent, 0);
         }
     }
 
@@ -7362,8 +7369,8 @@ mod test {
     #[test]
     fn test_congestion_window_limits_data_in_flight() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
-        s.remote_win_len = 65535;
-        s.remote_mss = 1024;
+        s.send_window = 65535;
+        s.send_mss = 1024;
 
         let data = [b'x'; 8192];
         s.view().send_slice(&data[..]).unwrap();
@@ -7407,8 +7414,8 @@ mod test {
     #[test]
     fn test_congestion_window_doesnt_limit_fast_retransmit() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
-        s.remote_win_len = 65535;
-        s.remote_mss = 1024;
+        s.send_window = 65535;
+        s.send_mss = 1024;
 
         // Normal ACK of previously received segment
         send!(s, time 0, TcpRepr {
@@ -7483,7 +7490,7 @@ mod test {
     #[test]
     fn test_data_retransmit_bursts() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef012345").unwrap();
 
         recv!(s, time 0, [TcpRepr {
@@ -7521,7 +7528,7 @@ mod test {
     #[test]
     fn test_data_retransmit_bursts_half_ack() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef012345").unwrap();
 
         recv!(s, time 0, [TcpRepr {
@@ -7559,7 +7566,7 @@ mod test {
     #[test]
     fn test_retransmit_timer_restart_on_partial_ack() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef012345").unwrap();
 
         recv!(s, time 0, [TcpRepr {
@@ -7597,7 +7604,7 @@ mod test {
     #[test]
     fn test_data_retransmit_bursts_half_ack_close() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef012345").unwrap();
         s.view().close();
 
@@ -7705,7 +7712,7 @@ mod test {
     #[test]
     fn test_established_retransmit_reset_after_ack() {
         let mut s = socket_established();
-        s.remote_win_len = 6;
+        s.send_window = 6;
         s.view().send_slice(b"abcdef").unwrap();
         s.view().send_slice(b"123456").unwrap();
         s.view().send_slice(b"ABCDEF").unwrap();
@@ -7744,7 +7751,7 @@ mod test {
     #[test]
     fn test_established_queue_during_retransmission() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef123456ABCDEF").unwrap();
         recv!(s, time 1000, [TcpRepr {
             seq_number: LOCAL_SEQ + 1,
@@ -7785,7 +7792,7 @@ mod test {
     #[test]
     fn test_close_wait_retransmit_reset_after_ack() {
         let mut s = socket_close_wait();
-        s.remote_win_len = 6;
+        s.send_window = 6;
         s.view().send_slice(b"abcdef").unwrap();
         s.view().send_slice(b"123456").unwrap();
         s.view().send_slice(b"ABCDEF").unwrap();
@@ -7824,7 +7831,7 @@ mod test {
     #[test]
     fn test_fin_wait_1_retransmit_reset_after_ack() {
         let mut s = socket_established();
-        s.remote_win_len = 6;
+        s.send_window = 6;
         s.view().send_slice(b"abcdef").unwrap();
         s.view().send_slice(b"123456").unwrap();
         s.view().send_slice(b"ABCDEF").unwrap();
@@ -7865,7 +7872,7 @@ mod test {
     #[test]
     fn test_fast_retransmit_after_triple_duplicate_ack() {
         let mut s = socket_established();
-        s.remote_mss = 3;
+        s.send_mss = 3;
 
         // Normal ACK of previously received segment
         send!(s, time 0, TcpRepr {
@@ -7965,7 +7972,7 @@ mod test {
             }
         );
 
-        assert_eq!(s.local_rx_dup_acks, 2, "duplicate ACK counter is not set");
+        assert_eq!(s.dup_acks, 2, "duplicate ACK counter is not set");
 
         // This packet has content, hence should not be detected
         // as a duplicate ACK and should reset the duplicate ACK count
@@ -7989,10 +7996,7 @@ mod test {
             }]
         );
 
-        assert_eq!(
-            s.local_rx_dup_acks, 0,
-            "duplicate ACK counter is not reset when receiving data"
-        );
+        assert_eq!(s.dup_acks, 0, "duplicate ACK counter is not reset when receiving data");
     }
 
     #[test]
@@ -8026,7 +8030,7 @@ mod test {
             }
         );
 
-        assert_eq!(s.local_rx_dup_acks, 2, "duplicate ACK counter is not set");
+        assert_eq!(s.dup_acks, 2, "duplicate ACK counter is not set");
 
         // This packet has a window update, hence should not be detected
         // as a duplicate ACK and should reset the duplicate ACK count
@@ -8041,7 +8045,7 @@ mod test {
         );
 
         assert_eq!(
-            s.local_rx_dup_acks, 0,
+            s.dup_acks, 0,
             "duplicate ACK counter is not reset when receiving a window update"
         );
     }
@@ -8049,7 +8053,7 @@ mod test {
     #[test]
     fn test_fast_retransmit_duplicate_detection() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
 
         // Normal ACK of previously received segment
         send!(s, time 0, TcpRepr {
@@ -8066,12 +8070,12 @@ mod test {
         });
 
         assert_eq!(
-            s.local_rx_dup_acks, 0,
+            s.dup_acks, 0,
             "duplicate ACK counter is set but wound not transmit data"
         );
 
         // Send a long string of text divided into several packets
-        // because of small remote_mss
+        // because of small send_mss
         s.view().send_slice(b"xxxxxxyyyyyywwwwwwzzzzzz").unwrap();
 
         // The first packet is reordered in network
@@ -8117,7 +8121,7 @@ mod test {
         });
 
         assert_eq!(
-            s.local_rx_dup_acks, 0,
+            s.dup_acks, 0,
             "duplicate ACK counter is not reset when receiving ACK which updates send window"
         );
 
@@ -8148,11 +8152,11 @@ mod test {
         });
 
         // A lot of retransmits happen here
-        s.local_rx_dup_acks = u8::MAX - 1;
+        s.dup_acks = u8::MAX - 1;
 
-        // Send 3 more ACKs, which could overflow local_rx_dup_acks,
+        // Send 3 more ACKs, which could overflow dup_acks,
         // but intended behaviour is that we saturate the bounds
-        // of local_rx_dup_acks
+        // of dup_acks
         send!(s, time 0, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
@@ -8169,7 +8173,7 @@ mod test {
             ..SEND_TEMPL
         });
         assert_eq!(
-            s.local_rx_dup_acks,
+            s.dup_acks,
             u8::MAX,
             "duplicate ACK count should not overflow but saturate"
         );
@@ -8181,7 +8185,7 @@ mod test {
     #[test]
     fn test_fast_retransmit_old_ack_not_counted() {
         let mut s = socket_established();
-        s.remote_mss = 3;
+        s.send_mss = 3;
 
         s.view().send_slice(b"aaaBBB").unwrap();
         recv!(s, time 0, [TcpRepr {
@@ -8200,7 +8204,7 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1 + 3),
             ..SEND_TEMPL
         });
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1 + 3);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1 + 3);
 
         // "BBB" is lost, so the peer keeps acknowledging "aaa".
         send!(s, time 20, TcpRepr {
@@ -8213,7 +8217,7 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1 + 3),
             ..SEND_TEMPL
         });
-        assert_eq!(s.local_rx_dup_acks, 2);
+        assert_eq!(s.dup_acks, 2);
 
         // A reordered old ACK in between is not a duplicate ACK.
         send!(s, time 30, TcpRepr {
@@ -8221,8 +8225,8 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         });
-        assert_eq!(s.local_rx_dup_acks, 2);
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1 + 3);
+        assert_eq!(s.dup_acks, 2);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1 + 3);
 
         // The third duplicate triggers fast retransmit.
         send!(s, time 35, TcpRepr {
@@ -8230,7 +8234,7 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1 + 3),
             ..SEND_TEMPL
         });
-        assert_eq!(s.local_rx_dup_acks, 3);
+        assert_eq!(s.dup_acks, 3);
         recv!(s, time 40, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 3,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -8242,7 +8246,7 @@ mod test {
     #[test]
     fn test_fast_retransmit_retries_when_device_refuses_packet() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef123456").unwrap();
         recv!(s, time 0, [
             TcpRepr {
@@ -8378,7 +8382,7 @@ mod test {
     #[test]
     fn test_data_retransmit_ack_more_than_expected() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"aaaaaabbbbbbcccccc").unwrap();
 
         recv!(s, time 0, [TcpRepr {
@@ -8449,7 +8453,7 @@ mod test {
     #[test]
     fn test_data_burst_resumes_after_device_full() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef123456ABCDEF").unwrap();
 
         // The device has room for two segments, so the third is held back...
@@ -8558,8 +8562,8 @@ mod test {
         let mut s = socket_established_with_buffer_sizes(32767, 64);
         // The remote advertised MSS 1000 in its SYN, and a 32767-byte window in
         // its handshake ACK: segments are capped at 1000 bytes.
-        s.remote_mss = 1000;
-        s.remote_win_len = 32767;
+        s.send_mss = 1000;
+        s.send_window = 32767;
         s.view().send_slice(&[0; 1200][..]).unwrap();
         recv!(
             s,
@@ -8576,7 +8580,7 @@ mod test {
     fn test_recv_out_of_recv_win() {
         let mut s = socket_established();
         s.view().set_ack_delay(Some(ACK_DELAY_DEFAULT));
-        s.remote_mss = 32;
+        s.send_mss = 32;
 
         // No ACKs are sent due to the ACK delay.
         send!(
@@ -8713,7 +8717,7 @@ mod test {
     #[test]
     fn test_psh_transmit() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef").unwrap();
         s.view().send_slice(b"123456").unwrap();
         recv!(s, time 0, [TcpRepr {
@@ -9030,7 +9034,7 @@ mod test {
     #[test]
     fn test_fill_peer_window() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef123456!@#$%^").unwrap();
         recv!(
             s,
@@ -9080,8 +9084,8 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        // Test that `dispatch` updates `remote_last_win`
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
+        // Test that `dispatch` updates `recv_window_sent`
+        assert_eq!(s.recv_window_sent, s.rx_buffer.window() as u16);
         s.view().recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
         recv!(
@@ -9093,8 +9097,8 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
-        // Provoke immediate ACK to test that `process` updates `remote_last_win`
+        assert_eq!(s.recv_window_sent, s.rx_buffer.window() as u16);
+        // Provoke immediate ACK to test that `process` updates `recv_window_sent`
         send!(
             s,
             TcpRepr {
@@ -9131,7 +9135,7 @@ mod test {
                 ..RECV_TEMPL
             })
         );
-        assert_eq!(s.remote_last_win, s.rx_buffer.window() as u16);
+        assert_eq!(s.recv_window_sent, s.rx_buffer.window() as u16);
         s.view().recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
     }
@@ -9271,8 +9275,8 @@ mod test {
     #[test]
     fn test_zero_window_probe_not_capped_by_cwnd() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
-        s.remote_win_len = 65535;
-        s.remote_mss = 1024;
+        s.send_window = 65535;
+        s.send_mss = 1024;
 
         let data = [b'x'; 4096];
         s.view().send_slice(&data[..]).unwrap();
@@ -9623,7 +9627,7 @@ mod test {
     #[test]
     fn test_connect_timeout() {
         let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
         s.view().set_timeout(Some(Duration::from_millis(100)));
         recv!(s, time 150, Ok(TcpRepr {
@@ -10729,7 +10733,7 @@ mod test {
     #[test]
     fn test_nagle() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
 
         s.view().send_slice(b"abcdef").unwrap();
         recv!(
@@ -10795,8 +10799,8 @@ mod test {
 
         let mut s = socket_established_with_buffer_sizes(256, 64);
         s.view().set_nagle_enabled(true);
-        s.timestamps = true;
-        s.remote_mss = EFFECTIVE_MSS;
+        s.send_ts_ok = true;
+        s.send_mss = EFFECTIVE_MSS;
 
         // Send small segment to "arm" Nagle's
         s.view().send_slice(b"abcdef").unwrap();
@@ -10829,7 +10833,7 @@ mod test {
     #[test]
     fn test_nagle_held_data_rides_on_ack() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef").unwrap();
         recv!(
             s,
@@ -10870,7 +10874,7 @@ mod test {
     #[test]
     fn test_final_packet_in_stream_doesnt_wait_for_nagle() {
         let mut s = socket_established();
-        s.remote_mss = 6;
+        s.send_mss = 6;
         s.view().send_slice(b"abcdef0").unwrap();
         s.view().close();
 
@@ -11008,7 +11012,7 @@ mod test {
     #[cfg(feature = "tcp-timestamps")]
     fn test_tsval_established_connection() {
         let mut s = socket_established();
-        s.timestamps = true;
+        s.send_ts_ok = true;
 
         // First roundtrip after establishing.
         s.view().send_slice(b"abcdef").unwrap();
@@ -11064,8 +11068,8 @@ mod test {
         // The tsval is the clock plus the connection's random offset, so it
         // does not leak the time since boot. The sum wraps.
         let mut s = socket_established();
-        s.timestamps = true;
-        s.tsval_offset = 0xffff_ff00;
+        s.send_ts_ok = true;
+        s.send_ts_offset = 0xffff_ff00;
 
         s.view().send_slice(b"abcdef").unwrap();
         recv!(
@@ -11089,7 +11093,7 @@ mod test {
             timestamp: Some(TcpTimestampRepr::new(500, 0)),
             ..syn_repr()
         });
-        assert!(s.timestamps);
+        assert!(s.send_ts_ok);
         recv!(
             s,
             [TcpRepr {
@@ -11105,7 +11109,7 @@ mod test {
         // A SYN without one gets a SYN|ACK without one: we only answer with
         // timestamps if the remote offered them.
         let mut s = accepted_socket(&syn_repr());
-        assert!(!s.timestamps);
+        assert!(!s.send_ts_ok);
         recv!(
             s,
             [TcpRepr {
@@ -11125,9 +11129,9 @@ mod test {
         // Every connection we open offers timestamps, and a remote that answers
         // with one keeps them on for the rest of the connection.
         let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
-        assert!(s.timestamps);
+        assert!(s.send_ts_ok);
         recv!(
             s,
             [TcpRepr {
@@ -11154,7 +11158,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(s.timestamps);
+        assert!(s.send_ts_ok);
         s.view().send_slice(b"abcdef").unwrap();
         recv!(
             s,
@@ -11173,9 +11177,9 @@ mod test {
     fn test_tsval_disabled_in_remote_server() {
         // A remote that answers our SYN without a timestamp turns them off.
         let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
+        s.send_unack = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
-        assert!(s.timestamps);
+        assert!(s.send_ts_ok);
         recv!(
             s,
             [TcpRepr {
@@ -11202,7 +11206,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert!(!s.timestamps);
+        assert!(!s.send_ts_ok);
         s.view().send_slice(b"abcdef").unwrap();
         recv!(
             s,
@@ -11239,7 +11243,7 @@ mod test {
     #[cfg(feature = "tcp-sack")]
     fn setup_rfc2018_cases_with_rx_buffer(rx_len: usize) -> (TestSocket, Vec<u8>) {
         let mut s = socket_established_with_buffer_sizes(4000, rx_len);
-        s.remote_has_sack = true;
+        s.send_sack = true;
 
         // The window advertised while one 500 byte segment sits undrained.
         let win = (rx_len - 500) as u16;
@@ -11278,7 +11282,7 @@ mod test {
                 })
                 .unwrap();
         }
-        assert_eq!(s.remote_last_win, win);
+        assert_eq!(s.recv_window_sent, win);
         (s, segment)
     }
 
@@ -11883,9 +11887,9 @@ mod test {
         const SEG: usize = REMOTE_MSS - ONE_BLOCK_OPTS;
 
         let mut s = socket_established_with_buffer_sizes(SEG * 2, 1024);
-        s.remote_has_sack = true;
-        s.remote_mss = REMOTE_MSS;
-        s.remote_win_len = 9999;
+        s.send_sack = true;
+        s.send_mss = REMOTE_MSS;
+        s.send_window = 9999;
         s.view().set_nagle_enabled(false);
 
         //  Open an island 100 bytes past the left edge
@@ -11944,7 +11948,7 @@ mod test {
     #[cfg(feature = "tcp-sack")]
     fn test_sack_emitted_on_zero_window_probe() {
         let mut s = socket_established_with_buffer_sizes(64, 128);
-        s.remote_has_sack = true;
+        s.send_sack = true;
 
         // A segment 20 bytes past the left edge opens one island
         send!(
@@ -12008,7 +12012,7 @@ mod test {
     #[cfg(feature = "tcp-sack")]
     fn test_sack_emitted_on_window_update() {
         let mut s = socket_established_with_buffer_sizes(64, 128);
-        s.remote_has_sack = true;
+        s.send_sack = true;
 
         // Contiguous data to advance left edge and fill the buffer
         send!(

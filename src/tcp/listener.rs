@@ -27,17 +27,17 @@ define_handle! {
 #[derive(Debug)]
 struct PendingSyn {
     tuple: Tuple,
-    /// The remote's initial sequence number plus one.
-    remote_seq_no: TcpSeqNumber,
-    /// The remote window advertised in the SYN (never scaled).
-    remote_win_len: usize,
-    /// The window scale the remote offered, if any.
-    remote_win_scale: Option<u8>,
-    /// Whether the remote supports selective ACK.
+    /// RCV.NXT: the remote's initial sequence number plus one.
+    recv_next: TcpSeqNumber,
+    /// SND.WND: the remote window advertised in the SYN (never scaled).
+    send_window: usize,
+    /// Snd.Wind.Shift: the window scale the remote offered, if any.
+    send_window_shift: Option<u8>,
+    /// Whether the remote sent SACK-permitted.
     #[cfg(feature = "tcp-sack")]
-    remote_has_sack: bool,
-    /// The MSS the remote advertised (clamped), or the default.
-    remote_mss: usize,
+    send_sack: bool,
+    /// SendMSS: the MSS the remote advertised (clamped), or the default.
+    send_mss: usize,
     /// The timestamp option of the SYN, if present.
     #[cfg(feature = "tcp-timestamps")]
     timestamp: Option<TcpTimestampRepr>,
@@ -100,13 +100,13 @@ impl TcpListenerState {
         };
         let syn = PendingSyn {
             tuple,
-            remote_seq_no: repr.seq_number + 1,
+            recv_next: repr.seq_number + 1,
             // The window field of a SYN is never scaled.
-            remote_win_len: repr.window_len as usize,
-            remote_win_scale: repr.window_scale,
+            send_window: repr.window_len as usize,
+            send_window_shift: repr.window_scale,
             #[cfg(feature = "tcp-sack")]
-            remote_has_sack: repr.sack_permitted,
-            remote_mss: match repr.max_seg_size {
+            send_sack: repr.sack_permitted,
+            send_mss: match repr.max_seg_size {
                 // A zero MSS is treated as if the option were absent, a tiny
                 // one is clamped.
                 Some(mss) if mss != 0 => (mss as usize).max(MIN_REMOTE_MSS),
@@ -145,7 +145,7 @@ impl TcpListenerState {
         };
         // The queue holds at most one SYN per 4-tuple.
         match self.queue.iter().position(|s| s.tuple == tuple) {
-            Some(i) if self.queue[i].remote_seq_no == repr.seq_number => {
+            Some(i) if self.queue[i].recv_next == repr.seq_number => {
                 self.queue.remove(i);
                 trace!("listener: queued SYN {} reset by remote", tuple);
                 true
@@ -236,28 +236,28 @@ impl AcceptToken {
         s.set_state(State::SynReceived);
         s.tuple = Some(syn.tuple);
         s.binding = self.binding;
-        s.local_seq_no = TcpSocketState::random_seq_no(rand);
-        s.remote_seq_no = syn.remote_seq_no;
-        s.remote_last_seq = s.local_seq_no;
+        s.send_unack = TcpSocketState::random_seq_no(rand);
+        s.recv_read = syn.recv_next;
+        s.send_next = s.send_unack;
         #[cfg(feature = "tcp-sack")]
         {
-            s.remote_has_sack = syn.remote_has_sack;
+            s.send_sack = syn.send_sack;
         }
-        s.remote_win_scale = syn.remote_win_scale;
+        s.send_window_shift = syn.send_window_shift;
         // Remote doesn't support window scaling, don't do it.
-        if syn.remote_win_scale.is_none() {
-            s.remote_win_shift = 0;
+        if syn.send_window_shift.is_none() {
+            s.recv_window_shift = 0;
         }
-        s.remote_win_len = syn.remote_win_len;
-        s.remote_max_win_len = syn.remote_win_len;
-        s.remote_mss = syn.remote_mss;
-        s.congestion_controller.set_mss(syn.remote_mss);
+        s.send_window = syn.send_window;
+        s.send_window_max = syn.send_window;
+        s.send_mss = syn.send_mss;
+        s.congestion_controller.set_mss(syn.send_mss);
         // Answer with timestamps only if the SYN offered them.
         #[cfg(feature = "tcp-timestamps")]
         {
-            s.timestamps = syn.timestamp.is_some();
-            s.last_remote_tsval = syn.timestamp.map_or(0, |ts| ts.tsval);
-            s.tsval_offset = TcpSocketState::random_tsval_offset(rand);
+            s.send_ts_ok = syn.timestamp.is_some();
+            s.ts_recent = syn.timestamp.map_or(0, |ts| ts.tsval);
+            s.send_ts_offset = TcpSocketState::random_tsval_offset(rand);
         }
     }
 }

@@ -558,8 +558,6 @@ pub(crate) struct TcpSocketState<'d> {
     /// The sequence number of the last packet received, used for sACK
     #[cfg(feature = "tcp-sack")]
     local_rx_last_seq: Option<TcpSeqNumber>,
-    /// The ACK number of the last packet received.
-    local_rx_last_ack: Option<TcpSeqNumber>,
     /// The number of packets received directly after
     /// each other which have the same ACK number.
     local_rx_dup_acks: u8,
@@ -666,7 +664,6 @@ impl<'d> TcpSocketState<'d> {
             remote_mss: DEFAULT_MSS,
             ip_mtu: DEFAULT_IP_MTU,
             remote_last_ts: None,
-            local_rx_last_ack: None,
             #[cfg(feature = "tcp-sack")]
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
@@ -753,7 +750,6 @@ impl<'d> TcpSocketState<'d> {
         {
             self.local_rx_last_seq = None;
         }
-        self.local_rx_last_ack = None;
         self.local_rx_dup_acks = 0;
         self.pending_fast_retransmit = false;
         self.remote_seq_no = TcpSeqNumber::default();
@@ -1416,52 +1412,46 @@ impl<'d> TcpSocketState<'d> {
             // TODO: When flow control is implemented,
             // refractor the following block within that implementation
 
-            match self.local_rx_last_ack {
-                // Duplicate ACK if payload empty and ACK doesn't move send window ->
-                // Increment duplicate ACK count, notify congestion controller and
-                // set for retransmit if we just received the third duplicate ACK
-                Some(last_rx_ack)
-                    if repr.payload.is_empty()
-                        && last_rx_ack == ack_number
-                        && ack_number < self.remote_last_seq
-                        && !is_window_update =>
-                {
-                    // Increment duplicate ACK count
-                    self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+            // Duplicate ACK if payload empty and ACK doesn't move send window ->
+            // Increment duplicate ACK count, notify congestion controller and
+            // set for retransmit if we just received the third duplicate ACK
+            if repr.payload.is_empty()
+                && ack_number == self.local_seq_no
+                && ack_number < self.remote_last_seq
+                && !is_window_update
+            {
+                // Increment duplicate ACK count
+                self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
 
-                    debug!(
-                        "received duplicate ACK for seq {} (duplicate nr {}{})",
-                        ack_number,
-                        self.local_rx_dup_acks,
-                        if self.local_rx_dup_acks == u8::MAX { "+" } else { "" }
-                    );
+                debug!(
+                    "received duplicate ACK for seq {} (duplicate nr {}{})",
+                    ack_number,
+                    self.local_rx_dup_acks,
+                    if self.local_rx_dup_acks == u8::MAX { "+" } else { "" }
+                );
 
-                    if self.local_rx_dup_acks == 3 {
-                        self.timer.set_for_fast_retransmit();
-                        debug!("started fast retransmit");
-                    }
-
-                    // Notify of duplicate ACK
-                    let in_flight = self.flight_size();
-                    self.congestion_controller.on_dup_ack(now, self.remote_mss, in_flight);
+                if self.local_rx_dup_acks == 3 {
+                    self.timer.set_for_fast_retransmit();
+                    debug!("started fast retransmit");
                 }
 
+                // Notify of duplicate ACK
+                let in_flight = self.flight_size();
+                self.congestion_controller.on_dup_ack(now, self.remote_mss, in_flight);
+            } else {
                 // No duplicate ACK means we reset the duplicate ACK count
                 // and notify the congestion controller of the fresh ACK
-                _ => {
-                    if self.local_rx_dup_acks > 0 {
-                        self.local_rx_dup_acks = 0;
-                        debug!("reset duplicate ACK count");
-                    }
-                    self.local_rx_last_ack = Some(ack_number);
-
-                    // Notify of fresh ACK
-                    self.rtte.on_ack(now, ack_number);
-                    let new_flight_size = self.flight_size().saturating_sub(ack_len);
-                    self.congestion_controller
-                        .on_ack(now, ack_len, new_flight_size, &self.rtte);
+                if self.local_rx_dup_acks > 0 {
+                    self.local_rx_dup_acks = 0;
+                    debug!("reset duplicate ACK count");
                 }
-            };
+
+                // Notify of fresh ACK
+                self.rtte.on_ack(now, ack_number);
+                let new_flight_size = self.flight_size().saturating_sub(ack_len);
+                self.congestion_controller
+                    .on_ack(now, ack_len, new_flight_size, &self.rtte);
+            }
 
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
@@ -7346,7 +7336,6 @@ mod test {
             s.remote_has_sack = true;
             s.local_rx_last_seq = Some(TcpSeqNumber(42));
         }
-        s.local_rx_last_ack = Some(TcpSeqNumber(42));
         s.local_rx_dup_acks = 2;
         s.pending_fast_retransmit = true;
         #[cfg(feature = "tcp-timestamps")]
@@ -7361,7 +7350,6 @@ mod test {
             assert!(!s.remote_has_sack);
             assert_eq!(s.local_rx_last_seq, None);
         }
-        assert_eq!(s.local_rx_last_ack, None);
         assert_eq!(s.local_rx_dup_acks, 0);
         assert!(!s.pending_fast_retransmit);
         #[cfg(feature = "tcp-timestamps")]
@@ -7958,15 +7946,6 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        // Normal ACK of previously received segment
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                ..SEND_TEMPL
-            }
-        );
         // First duplicate
         send!(
             s,
@@ -8028,15 +8007,6 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        // Normal ACK of previously received segment
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                ..SEND_TEMPL
-            }
-        );
         // First duplicate
         send!(
             s,
@@ -8252,7 +8222,7 @@ mod test {
             ..SEND_TEMPL
         });
         assert_eq!(s.local_rx_dup_acks, 2);
-        assert_eq!(s.local_rx_last_ack, Some(LOCAL_SEQ + 1 + 3));
+        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1 + 3);
 
         // The third duplicate triggers fast retransmit.
         send!(s, time 35, TcpRepr {

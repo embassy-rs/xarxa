@@ -4,15 +4,13 @@
 //! ## Feature flags
 #![doc = document_features::document_features!(feature_label = r#"<span class="stab portability"><code>{feature}</code></span>"#)]
 
-pub mod config;
-
 mod buf;
 mod meta;
 
 #[cfg(feature = "async")]
 use core::task::Waker;
 
-pub use buf::PacketBuf;
+pub use buf::{PacketBuf, RawPacketBuf};
 pub use meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
 pub use meta::{Timestamp, TxTimestamp};
@@ -238,6 +236,27 @@ pub trait Driver {
         Err(NotSupported)
     }
 
+    /// How many more empty buffers the driver can take right now, to receive
+    /// frames into.
+    ///
+    /// The stack asks on poll, and each call to [`receive`](Self::receive), and gives the
+    /// driver up to that many with [`rx_give`](Self::rx_give). It gives fewer if its
+    /// pool runs low.
+    ///
+    /// A driver with a receive ring returns the number of slots that have no
+    /// buffer. One that reads frames into a buffer on demand can ask for one.
+    fn rx_wanted(&mut self) -> usize;
+
+    /// Give the driver an empty buffer to receive a frame into.
+    ///
+    /// The driver owns it from then on. It hands it back with a frame in it from
+    /// [`receive`](Self::receive). It may also drop it, which gives it back to the
+    /// stack's pool.
+    ///
+    /// The stack never gives more buffers than [`rx_wanted`](Self::rx_wanted) asked
+    /// for. The buffer has zero headroom and length.
+    fn rx_give(&mut self, buf: PacketBuf);
+
     /// Poll for a received frame.
     ///
     /// Returns a buffer holding the received frame if one is available, transferring
@@ -340,6 +359,12 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     #[cfg(feature = "async")]
     fn register_waker(&mut self, waker: &Waker) -> Result<(), NotSupported> {
         T::register_waker(self, waker)
+    }
+    fn rx_wanted(&mut self) -> usize {
+        T::rx_wanted(self)
+    }
+    fn rx_give(&mut self, buf: PacketBuf) {
+        T::rx_give(self, buf)
     }
     fn receive(&mut self) -> Option<PacketBuf> {
         T::receive(self)

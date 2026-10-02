@@ -1,11 +1,11 @@
-//! This is an integration test rather than a unit test because it has to own the
-//! whole pool, and unit tests run in parallel threads of one process
+//! Packet pool exhaustion. The test has a pool of its own, so it can take every
+//! buffer in it.
 
-use xarxa::Stack;
 use xarxa::driver::PacketBuf;
 use xarxa::iface::Medium;
 use xarxa::udp::SendError;
 use xarxa::wire::{HardwareAddress, IpCidr, Ipv4Addr, ListenSocketAddr, SocketAddr};
+use xarxa::{Pool, Stack, StaticPool};
 
 use test_device::TestDevice;
 
@@ -14,10 +14,13 @@ use test_device::TestDevice;
 #[path = "../src/test_device.rs"]
 mod test_device;
 
+/// The pool every stack in this test allocates from.
+static POOL: StaticPool = StaticPool::new();
+
 /// One test function, so that every step runs in order on the one pool.
 #[test]
 fn exhaustion() {
-    let mut stack = Stack::new(0x1234_5678_dead_beef);
+    let mut stack = Stack::new(&POOL, 0x1234_5678_dead_beef);
     // The device copies out and drops (frees) whatever it is given.
     let iface = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
     stack
@@ -34,11 +37,11 @@ fn exhaustion() {
 
     // Take every buffer.
     let mut held = Vec::new();
-    while let Some(buf) = PacketBuf::try_new() {
+    while let Some(buf) = POOL.alloc() {
         held.push(buf);
     }
     assert!(!held.is_empty());
-    assert!(PacketBuf::try_new().is_none());
+    assert!(POOL.alloc().is_none());
 
     // A send now fails, and the socket is unharmed.
     assert_eq!(
@@ -52,13 +55,13 @@ fn exhaustion() {
     buf.set_len(5);
     buf.copy_from_slice(b"hello");
     stack.udp_socket(udp).send_packet(buf, dst).unwrap();
-    held.push(PacketBuf::try_new().unwrap());
-    assert!(PacketBuf::try_new().is_none());
+    held.push(POOL.alloc().unwrap());
+    assert!(POOL.alloc().is_none());
 
     // Freeing one buffer is enough for a send. Taking it back starves sends again.
     drop(held.pop());
     stack.udp_socket(udp).send_slice(b"hello", dst).unwrap();
-    held.push(PacketBuf::try_new().unwrap());
+    held.push(POOL.alloc().unwrap());
     assert_eq!(
         stack.udp_socket(udp).send_slice(b"hello", dst),
         Err(SendError::NoBuffer)
@@ -68,7 +71,7 @@ fn exhaustion() {
     let count = held.len();
     drop(held);
     let mut again = Vec::new();
-    while let Some(buf) = PacketBuf::try_new() {
+    while let Some(buf) = POOL.alloc() {
         again.push(buf);
     }
     assert!(again.len() >= count);
@@ -82,7 +85,7 @@ fn exhaustion() {
         use xarxa::time::Instant;
         use xarxa::wire::EthernetAddress;
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(&POOL, 0x1234_5678_dead_beef);
         let hw = HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01]));
         let iface = TestDevice::new(Medium::Ethernet).install(&mut stack, hw);
         stack.iface(iface).set_slaac(Some(SlaacConfig::default())).unwrap();
@@ -124,7 +127,7 @@ fn exhaustion() {
     {
         use xarxa::time::{Duration, Instant};
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(&POOL, 0x1234_5678_dead_beef);
         let device = TestDevice::new(Medium::Ip);
         let tx = device.tx.clone();
         let iface = device.install(&mut stack, HardwareAddress::Ip);
@@ -149,7 +152,7 @@ fn exhaustion() {
         assert_eq!(tx.borrow().len(), 1);
         assert!(deadline > retry + Duration::from_millis(1));
         // The device freed the SYN's buffer. Take it back.
-        again.push(PacketBuf::try_new().unwrap());
+        again.push(POOL.alloc().unwrap());
     }
 
     // The fragments of a datagram wait for buffers the same way. With one free
@@ -158,7 +161,7 @@ fn exhaustion() {
     {
         use xarxa::time::{Duration, Instant};
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(&POOL, 0x1234_5678_dead_beef);
         let device = TestDevice::new(Medium::Ip).with_mtu(600);
         let tx = device.tx.clone();
         let iface = device.install(&mut stack, HardwareAddress::Ip);
@@ -206,6 +209,11 @@ fn exhaustion() {
             fn hardware_address(&self) -> xarxa::driver::HardwareAddress {
                 xarxa::driver::HardwareAddress::Ip
             }
+            // It has its one frame already, and wants no buffers.
+            fn rx_wanted(&mut self) -> usize {
+                0
+            }
+            fn rx_give(&mut self, _buf: PacketBuf) {}
             fn receive(&mut self) -> Option<PacketBuf> {
                 self.0.take()
             }
@@ -217,7 +225,7 @@ fn exhaustion() {
             }
         }
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(&POOL, 0x1234_5678_dead_beef);
         let device = TestDevice::new(Medium::Ip).with_mtu(600);
         let tx = device.tx.clone();
         let iface = device.install(&mut stack, HardwareAddress::Ip);
@@ -233,7 +241,7 @@ fn exhaustion() {
 
         // Take back what the steps above left free. Then the datagram takes the
         // one free buffer, and its fragments wait.
-        while let Some(buf) = PacketBuf::try_new() {
+        while let Some(buf) = POOL.alloc() {
             again.push(buf);
         }
         drop(again.pop());
@@ -244,7 +252,7 @@ fn exhaustion() {
         // The second interface is polled after the first one's fragments tried and
         // failed, and before they try again at the end of the poll.
         drop(again.pop());
-        let junk = Junk(Some(PacketBuf::try_new().unwrap()));
+        let junk = Junk(Some(POOL.alloc().unwrap()));
         stack.add_iface_borrowed(Box::leak(Box::new(junk))).unwrap();
 
         let now = Instant::from_secs(1);
@@ -302,7 +310,7 @@ fn exhaustion() {
             tcp.ack_number()
         };
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(&POOL, 0x1234_5678_dead_beef);
         let device = TestDevice::new(Medium::Ip);
         let (rx, tx, room) = (device.rx.clone(), device.tx.clone(), device.room.clone());
         let iface = device.install(&mut stack, HardwareAddress::Ip);
@@ -312,7 +320,7 @@ fn exhaustion() {
             .unwrap();
 
         // One free buffer from here on.
-        while let Some(buf) = PacketBuf::try_new() {
+        while let Some(buf) = POOL.alloc() {
             again.push(buf);
         }
         drop(again.pop());
@@ -357,7 +365,7 @@ fn exhaustion() {
         stack.poll(now);
         assert!(tx.borrow().is_empty());
         room.set(None);
-        again.push(PacketBuf::try_new().unwrap());
+        again.push(POOL.alloc().unwrap());
         let retry = now + Duration::from_millis(1);
         assert_eq!(stack.poll(now), retry);
         assert!(tx.borrow().is_empty());

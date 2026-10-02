@@ -515,6 +515,7 @@ dependencies = [
  "bitflags 2.13.1",
  "byteorder",
  "cbor4ii",
+ "critical-section",
  "defmt",
  "document-features",
  "env_logger",
@@ -532,7 +533,6 @@ dependencies = [
 name = "xarxa-driver"
 version = "0.1.0"
 dependencies = [
- "critical-section",
  "defmt",
  "document-features",
 ]

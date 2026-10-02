@@ -10,7 +10,7 @@
 //!   interfaces. The socket may be bound to an IP version and/or an IP protocol,
 //!   both optional.
 
-use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use crate::config::RAW_RX_QUEUE_COUNT;
 use crate::storage::BoundedDeque;
@@ -21,6 +21,7 @@ use crate::driver::PacketMeta;
 use crate::iface::IfaceHandle;
 #[cfg(feature = "raw-ethernet")]
 use crate::iface::Medium;
+use crate::pool::PoolRef;
 use crate::stack::{IfaceBinding, Stack, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -206,8 +207,8 @@ impl RawSocketState {
 /// Copy a packet into a freshly allocated buffer. Used when both a raw socket and
 /// the stack's own protocol handlers want an ingress packet. `None` if the pool
 /// is empty: the socket misses the packet, the stack still processes it.
-fn copy_packet(buf: &PacketBuf) -> Option<PacketBuf> {
-    let Some(mut copy) = PacketBuf::try_new() else {
+fn copy_packet(pool: PoolRef, buf: &PacketBuf) -> Option<PacketBuf> {
+    let Some(mut copy) = pool.alloc() else {
         trace!("raw: no packet buffer for a copy, socket misses the packet");
         return None;
     };
@@ -544,7 +545,7 @@ impl RawSocket<'_, '_> {
             RawMode::Ip { .. } => None,
         };
 
-        let Some(mut buf) = PacketBuf::try_new() else {
+        let Some(mut buf) = self.tx.inner.pool.alloc() else {
             return Err(SendError::NoBuffer);
         };
         if max_size > buf.capacity() - headroom {
@@ -692,7 +693,7 @@ impl Stack<'_> {
 
             trace!("raw: receiving {} octet frame (ethertype {})", buf.len(), ethertype);
             if stack_wants {
-                if let Some(copy) = copy_packet(&buf) {
+                if let Some(copy) = copy_packet(self.inner.pool, &buf) {
                     socket.rx_enqueue(copy);
                 }
                 return Some(buf);
@@ -746,7 +747,7 @@ impl Stack<'_> {
 
             trace!("raw: receiving {} octets ({} {})", buf.len(), version, protocol);
             if stack_wants {
-                if let Some(copy) = copy_packet(&buf) {
+                if let Some(copy) = copy_packet(self.inner.pool, &buf) {
                     socket.rx_enqueue(copy);
                 }
                 return Some((buf, true));
@@ -875,7 +876,7 @@ mod test {
     }
 
     fn buf_from(bytes: &[u8]) -> PacketBuf {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
         buf.set_len(bytes.len());
         buf.copy_from_slice(bytes);
         buf
@@ -883,7 +884,7 @@ mod test {
 
     #[test]
     fn test_bind_ip() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         assert!(!socket.is_open());
@@ -919,7 +920,7 @@ mod test {
     fn test_bind_ethernet() {
         // An unbound Ethernet-mode bind is fine: the socket covers every
         // Ethernet interface.
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         assert_eq!(
@@ -934,7 +935,7 @@ mod test {
     #[cfg(feature = "iface-bind")]
     #[test]
     fn test_bind_to_iface_ethernet() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (eth_iface, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (ip_iface, _) = add_test_iface(&mut stack, Medium::Ip, vec![]);
 
@@ -969,7 +970,7 @@ mod test {
 
     #[test]
     fn test_recv() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
 
@@ -1000,7 +1001,7 @@ mod test {
 
     #[test]
     fn test_peek_and_recv_slice() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         socket
@@ -1025,7 +1026,7 @@ mod test {
 
     #[test]
     fn test_recv_slice_truncated() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         socket
@@ -1047,7 +1048,7 @@ mod test {
 
     #[test]
     fn test_demux_ip() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let h_icmp = stack.add_raw_socket().unwrap();
         let h_any = stack.add_raw_socket().unwrap();
         stack
@@ -1118,7 +1119,7 @@ mod test {
     fn test_packet_meta() {
         let driver = TestDevice::new(Medium::Ethernet);
         let sent = driver.tx_meta.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let iface = driver.install(
             &mut stack,
             HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
@@ -1157,7 +1158,7 @@ mod test {
 
     #[test]
     fn test_demux_ethernet() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (iface_a, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (iface_b, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
 
@@ -1197,7 +1198,7 @@ mod test {
     #[cfg(feature = "iface-bind")]
     #[test]
     fn test_bind_to_iface_ethernet_demux() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (iface_a, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (iface_b, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
 
@@ -1235,7 +1236,7 @@ mod test {
             let driver = TestDevice::new(if ethernet { Medium::Ethernet } else { Medium::Ip });
             let tx = driver.tx.clone();
             let room = driver.room.clone();
-            let mut stack = Stack::new(0x1234_5678_dead_beef);
+            let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
             let hw = if ethernet {
                 HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 1]))
             } else {
@@ -1270,7 +1271,7 @@ mod test {
 
     #[test]
     fn test_send_ethernet() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (_iface, tx) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let handle = stack.add_raw_socket().unwrap();
 
@@ -1301,7 +1302,7 @@ mod test {
 
     #[test]
     fn test_send_ethernet_unbound_iface_selection() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(handle)
@@ -1328,7 +1329,7 @@ mod test {
     #[test]
     fn test_bind_to_iface_ethernet_send() {
         // A bound socket sends out its interface, not the first one.
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (_eth_a, tx_a) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (eth_b, tx_b) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
 
@@ -1347,7 +1348,7 @@ mod test {
 
     #[test]
     fn test_send_ip() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(handle)
@@ -1390,7 +1391,7 @@ mod test {
         // Too big for a packet buffer (IP mode leaves room for the Ethernet header).
         assert_eq!(
             stack.raw_socket(handle).send_with(
-                crate::driver::config::PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN + 1,
+                crate::pool::TEST_POOL_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN + 1,
                 |_| unreachable!()
             ),
             Err(SendError::BufferFull)
@@ -1401,7 +1402,7 @@ mod test {
     #[cfg(feature = "iface-bind")]
     #[test]
     fn test_bind_to_iface_ip() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (if0, tx0) = add_test_iface(&mut stack, Medium::Ip, vec![IpCidr::new(IpAddr::v4(10, 0, 0, 1), 24)]);
         let (if1, tx1) = add_test_iface(
             &mut stack,
@@ -1453,7 +1454,7 @@ mod test {
 
     #[test]
     fn test_send_ip_protocol_filter() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (_iface, tx) = add_test_iface(
             &mut stack,
             Medium::Ip,
@@ -1486,7 +1487,7 @@ mod test {
 
     #[test]
     fn test_send_ipv6() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(handle)
@@ -1524,7 +1525,7 @@ mod test {
         );
         // Too big for a packet buffer: IP mode leaves room for the link header,
         // whatever medium the packet ends up going out of.
-        let max = crate::driver::config::PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN;
+        let max = crate::pool::TEST_POOL_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN;
         assert_eq!(
             stack.raw_socket(handle).send_with(max + 1, |_| unreachable!()),
             Err(SendError::BufferFull)
@@ -1561,7 +1562,7 @@ mod test {
     fn test_send_icmpv4_echo() {
         // Ping goes through a raw socket: the whole packet, ICMP header and
         // checksum included, is the user's and goes out untouched.
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (_iface, tx) = add_test_iface(&mut stack, Medium::Ip, vec![LOCAL_V4]);
         let handle = stack.add_raw_socket().unwrap();
         stack
@@ -1594,7 +1595,7 @@ mod test {
 
     #[test]
     fn test_send_icmpv6_echo() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (_iface, tx) = add_test_iface(&mut stack, Medium::Ip, vec![LOCAL_V6]);
         // Adding an IPv6 address may make the stack transmit on its own.
         tx.borrow_mut().clear();
@@ -1633,7 +1634,7 @@ mod test {
     fn test_unfiltered_sends_all() {
         // One unfiltered socket sends packets of either IP version and any
         // protocol.
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let (_iface, tx) = add_test_iface(&mut stack, Medium::Ip, vec![LOCAL_V4, LOCAL_V6]);
         // Adding an IPv6 address may make the stack transmit on its own.
         tx.borrow_mut().clear();
@@ -1662,7 +1663,7 @@ mod test {
     fn test_unfiltered_accepts_all() {
         // Every one of these is a stack protocol, so ingress offers each socket a
         // copy and hands the original back for the stack's own processing.
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let iface = IfaceHandle::new(0);
         let packets = [
             (IpProtocol::Icmp, ipv4_packet(IpProtocol::Icmp, b"v4 icmp")),

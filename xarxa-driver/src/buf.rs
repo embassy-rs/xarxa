@@ -1,181 +1,41 @@
 //! Owned packet buffers.
 //!
-//! Every packet in the stack is a [`PacketBuf`]: one fixed-size buffer, owned by
-//! whoever holds it (the driver, the stack, a socket, the application).
+//! Every packet in the stack is a [`PacketBuf`]: one buffer, owned by whoever
+//! holds it (the driver, the stack, a socket, the application).
 //!
-//! Buffers are allocated from a static pool.
-//!
-//! On bare-metal targets (`target_os = "none"`), the pool is placed in
-//! `.bss.xarxa.packet_pool`. A linker script can place it in DMA-accessible RAM.
-//! That requires manually zeroing before using the pool.
+//! Buffers come from the network stack's pool. A driver gets the buffers it
+//! receives frames into from the stack, with
+//! [`Driver::rx_give`](crate::Driver::rx_give). Dropping a buffer gives it back
+//! to the pool it came from.
 
-use core::cell::UnsafeCell;
 use core::fmt;
-use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
-use core::sync::atomic::{AtomicU32, Ordering};
-
-use crate::config::PACKET_BUF_SIZE;
 use crate::meta::PacketMeta;
 
-#[cfg(not(test))]
-const PACKET_BUF_COUNT: usize = crate::config::PACKET_BUF_COUNT;
-// The unit tests run in parallel threads of one process, all sharing the one
-// pool. The default is too small.
-#[cfg(test)]
-const PACKET_BUF_COUNT: usize = if crate::config::PACKET_BUF_COUNT > 1024 {
-    crate::config::PACKET_BUF_COUNT
-} else {
-    1024
-};
-
-const BITMAP_WORDS: usize = PACKET_BUF_COUNT.div_ceil(32);
-
-#[rustfmt::skip]
-cfg_select! {
-    feature = "packet-buf-align-32" => { #[repr(C, align(32))] struct Data([u8; PACKET_BUF_SIZE]); }
-    feature = "packet-buf-align-16" => { #[repr(C, align(16))] struct Data([u8; PACKET_BUF_SIZE]); }
-    feature = "packet-buf-align-8" => { #[repr(C, align(8))] struct Data([u8; PACKET_BUF_SIZE]); }
-    feature = "packet-buf-align-4" => { #[repr(C, align(4))] struct Data([u8; PACKET_BUF_SIZE]); }
-    feature = "packet-buf-align-2" => { #[repr(C, align(2))] struct Data([u8; PACKET_BUF_SIZE]); }
-    _ => { #[repr(C, align(1))] struct Data([u8; PACKET_BUF_SIZE]); }
-}
-
-impl Deref for Data {
-    type Target = [u8; PACKET_BUF_SIZE];
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for Data {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-struct PacketBufInner {
-    /// Offset of the first valid byte within `data`.
-    headroom: u16,
+/// The bookkeeping of one [`PacketBuf`]: where its storage is, its headroom and
+/// length, its metadata, and how to free it.
+///
+/// Only pool implementations deal with this type. They keep one for each buffer,
+/// fill it in, and pass it to [`PacketBuf::from_raw`].
+pub struct RawPacketBuf {
+    /// Called with this `RawPacketBuf` when the buffer is dropped. It gives the buffer
+    /// back to its pool.
+    pub free: unsafe fn(NonNull<RawPacketBuf>),
+    /// For the pool's own use, for example to find itself in `free`. The buffer
+    /// never reads it.
+    pub pool: *const (),
+    /// Start of the storage.
+    pub data: NonNull<u8>,
+    /// Size of the storage at `data`, in bytes.
+    pub capacity: usize,
+    /// Offset of the first valid byte within the storage.
+    pub headroom: usize,
     /// Number of valid bytes.
-    len: u16,
-    // invariant: headroom + len <= PACKET_BUF_SIZE
+    pub len: usize,
     /// Per-packet metadata. Zero-sized unless a `packetmeta-*` feature is enabled.
-    meta: PacketMeta,
-    data: Data,
-}
-
-struct Pool {
-    /// Bit `i` is set while slot `i` is owned by a `PacketBuf`.
-    used: [AtomicU32; BITMAP_WORDS],
-    slots: [UnsafeCell<MaybeUninit<PacketBufInner>>; PACKET_BUF_COUNT],
-}
-
-// SAFETY: a slot is handed to at most one `PacketBuf` at a time. Its bit is
-// set by the one CAS that wins it in `alloc_slot`, and cleared only by the
-// `PacketBuf` that owns it, in `Drop`. So no two threads ever touch the same
-// slot, and the bitmap is atomic.
-unsafe impl Sync for Pool {}
-
-#[cfg_attr(target_os = "none", unsafe(link_section = ".bss.xarxa.packet_pool"))]
-static POOL: Pool = Pool {
-    used: [const { AtomicU32::new(0) }; BITMAP_WORDS],
-    slots: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; PACKET_BUF_COUNT],
-};
-
-/// Claim a free slot: the first zero bit of the bitmap, set with a CAS.
-#[cfg(target_has_atomic = "32")]
-fn alloc_slot() -> Option<usize> {
-    for (w, word) in POOL.used.iter().enumerate() {
-        let mut cur = word.load(Ordering::Relaxed);
-        loop {
-            let bit = cur.trailing_ones() as usize;
-            if bit >= 32 {
-                break;
-            }
-            let index = w * 32 + bit;
-            if index >= PACKET_BUF_COUNT {
-                // Only the last word can have bits past the end. Everything
-                // before it was full, so the pool is.
-                return None;
-            }
-            // Acquire pairs with the Release in `Drop`: the previous owner's
-            // writes to the slot are done before ours start.
-            match word.compare_exchange_weak(cur, cur | (1 << bit), Ordering::Acquire, Ordering::Relaxed) {
-                Ok(_) => return Some(index),
-                Err(actual) => cur = actual,
-            }
-        }
-    }
-    None
-}
-
-/// Give a slot back: clear its bit.
-#[cfg(target_has_atomic = "32")]
-#[inline(never)]
-fn free_slot(index: usize) {
-    POOL.used[index / 32].fetch_and(!(1 << (index % 32)), Ordering::Release);
-}
-
-// Fallback for targets with 32-bit atomic load/store but no atomic
-// read-modify-write (e.g. thumbv6m): the whole bit update runs inside a
-// critical section, so a plain load + store can't race another one. The
-// Acquire load here still pairs with the Release store in `free_slot`, same
-// as the atomic version.
-
-/// Claim a free slot: the first zero bit of the bitmap.
-#[cfg(not(target_has_atomic = "32"))]
-fn alloc_slot() -> Option<usize> {
-    critical_section::with(|_| {
-        for (w, word) in POOL.used.iter().enumerate() {
-            let cur = word.load(Ordering::Acquire);
-            let bit = cur.trailing_ones() as usize;
-            if bit >= 32 {
-                continue;
-            }
-            let index = w * 32 + bit;
-            if index >= PACKET_BUF_COUNT {
-                // Only the last word can have bits past the end. Everything
-                // before it was full, so the pool is.
-                return None;
-            }
-            word.store(cur | (1 << bit), Ordering::Relaxed);
-            return Some(index);
-        }
-        None
-    })
-}
-
-/// Give a slot back: clear its bit.
-#[cfg(not(target_has_atomic = "32"))]
-fn free_slot(index: usize) {
-    critical_section::with(|_| {
-        let word = &POOL.used[index / 32];
-        word.store(word.load(Ordering::Relaxed) & !(1 << (index % 32)), Ordering::Release);
-    })
-}
-
-/// Claim a free slot and initialize its header, for a new `PacketBuf`.
-#[inline(never)] // helps code size: it is all of `PacketBuf::try_new`, which has many callers
-fn alloc() -> Option<NonNull<PacketBufInner>> {
-    let index = alloc_slot()?;
-    let ptr = POOL.slots[index].get().cast::<PacketBufInner>();
-    // SAFETY:
-    // - the slot is ours (its bit is set), and nothing else points into it.
-    // - `data` is valid thanks to `MaybeUninit::zeroed()`, we don't have to initialize it.
-    // - We do initialize the header.
-    unsafe {
-        (&raw mut (*ptr).headroom).write(0);
-        (&raw mut (*ptr).len).write(0);
-        (&raw mut (*ptr).meta).write(PacketMeta::default());
-        // Catch code that relies on fresh buffers being zeroed.
-        #[cfg(test)]
-        (*ptr).data.fill(0xa5);
-    }
-    // SAFETY: a pointer into a static is never null.
-    Some(unsafe { NonNull::new_unchecked(ptr) })
+    pub meta: PacketMeta,
 }
 
 /// An owned network packet buffer.
@@ -183,37 +43,59 @@ fn alloc() -> Option<NonNull<PacketBufInner>> {
 /// ```text
 /// | headroom | data (len) | tailroom |
 /// ```
+///
+/// Dropping it gives it back to the pool it came from.
 pub struct PacketBuf {
-    inner: NonNull<PacketBufInner>,
+    raw: NonNull<RawPacketBuf>,
 }
 
-// SAFETY: a `PacketBuf` is the unique owner of its slot, like a `Box` of it.
+// SAFETY: a `PacketBuf` is the unique owner of its `RawPacketBuf` and storage, like a
+// `Box` of them. Its `free` can be called from any thread (see `from_raw`).
 unsafe impl Send for PacketBuf {}
 unsafe impl Sync for PacketBuf {}
 
 impl PacketBuf {
-    /// Allocate a buffer.
+    /// Make a buffer out of a `RawPacketBuf` a pool filled in.
     ///
-    /// - Zero headroom, len.
-    /// - Default metadata.
-    /// - **Uncleared** storage.
+    /// For pool implementations. Dropping the buffer calls `raw.free` with `raw`.
     ///
-    /// Storage is not cleared and may contain data from previous, unrelated packets.
-    pub fn try_new() -> Option<Self> {
-        Some(Self { inner: alloc()? })
+    /// A fresh buffer usually has zero `headroom` and `len`, and default `meta`.
+    ///
+    /// # Safety
+    ///
+    /// - `raw` must be initialized, and valid for reads and writes until
+    ///   `free` is called.
+    /// - Its `data` must be valid for reads and writes of `capacity` bytes until
+    ///   then. Those bytes must be initialized.
+    /// - Its `headroom + len` must be at most `capacity`.
+    /// - Nothing else may access `raw` or the storage until `free` is
+    ///   called.
+    /// - `free` must be safe to call once with `raw`, from any thread, after
+    ///   the buffer is dropped.
+    pub unsafe fn from_raw(raw: NonNull<RawPacketBuf>) -> Self {
+        Self { raw }
     }
 
     #[inline]
-    fn inner(&self) -> &PacketBufInner {
-        // SAFETY: we own the slot for as long as `self` exists.
-        unsafe { self.inner.as_ref() }
+    fn raw(&self) -> &RawPacketBuf {
+        // SAFETY: we own the `RawPacketBuf` for as long as `self` exists.
+        unsafe { self.raw.as_ref() }
     }
 
     #[inline]
-    fn inner_mut(&mut self) -> &mut PacketBufInner {
-        // SAFETY: we own the slot for as long as `self` exists, and `&mut self`
+    fn raw_mut(&mut self) -> &mut RawPacketBuf {
+        // SAFETY: we own the `RawPacketBuf` for as long as `self` exists, and `&mut self`
         // makes this the only reference.
-        unsafe { self.inner.as_mut() }
+        unsafe { self.raw.as_mut() }
+    }
+
+    /// The whole storage, ignoring headroom and length.
+    #[inline]
+    fn storage(&self) -> &[u8] {
+        let raw = self.raw();
+        // SAFETY: `data` is valid and initialized for `capacity` bytes, and only
+        // this buffer accesses it.
+        unsafe { core::slice::from_raw_parts(raw.data.as_ptr(), raw.capacity) }
     }
 
     /// The packet's metadata.
@@ -223,42 +105,42 @@ impl PacketBuf {
     /// [`Driver::transmit`](crate::Driver::transmit). It travels with the
     /// buffer through the whole stack, unaffected by header pushes and pulls.
     pub fn meta(&self) -> PacketMeta {
-        self.inner().meta
+        self.raw().meta
     }
 
     /// Mutable reference to the packet's metadata.
     pub fn meta_mut(&mut self) -> &mut PacketMeta {
-        &mut self.inner_mut().meta
+        &mut self.raw_mut().meta
     }
 
     /// Replace the packet's metadata.
     pub fn set_meta(&mut self, meta: PacketMeta) {
-        self.inner_mut().meta = meta;
+        self.raw_mut().meta = meta;
     }
 
     /// Total storage capacity of the buffer, in bytes.
-    pub const fn capacity(&self) -> usize {
-        PACKET_BUF_SIZE
+    pub fn capacity(&self) -> usize {
+        self.raw().capacity
     }
 
     /// Amount of free space in front of the payload.
     pub fn headroom(&self) -> usize {
-        self.inner().headroom as usize
+        self.raw().headroom
     }
 
     /// Length of the payload.
     pub fn len(&self) -> usize {
-        self.inner().len as usize
+        self.raw().len
     }
 
     /// Whether the payload is empty.
     pub fn is_empty(&self) -> bool {
-        self.inner().len == 0
+        self.raw().len == 0
     }
 
     /// Amount of free space behind the payload.
     pub fn tailroom(&self) -> usize {
-        PACKET_BUF_SIZE - self.headroom() - self.len()
+        self.capacity() - self.headroom() - self.len()
     }
 
     /// Empty the buffer, with `headroom` bytes of room in front of the payload.
@@ -268,10 +150,10 @@ impl PacketBuf {
     /// # Panics
     /// Panics if `headroom > capacity`.
     pub fn reserve(&mut self, headroom: usize) {
-        assert!(headroom <= PACKET_BUF_SIZE);
-        let inner = self.inner_mut();
-        inner.headroom = headroom as u16;
-        inner.len = 0;
+        assert!(headroom <= self.capacity());
+        let raw = self.raw_mut();
+        raw.headroom = headroom;
+        raw.len = 0;
     }
 
     /// Grow the payload at the front by `n` bytes, taking them from the headroom.
@@ -280,9 +162,9 @@ impl PacketBuf {
     /// Panics if `n > headroom`.
     pub fn push_front(&mut self, n: usize) {
         assert!(n <= self.headroom());
-        let inner = self.inner_mut();
-        inner.headroom -= n as u16;
-        inner.len += n as u16;
+        let raw = self.raw_mut();
+        raw.headroom -= n;
+        raw.len += n;
     }
 
     /// Shrink the payload at the front by `n` bytes, returning them to the headroom.
@@ -291,9 +173,9 @@ impl PacketBuf {
     /// Panics if `n > len`.
     pub fn pull_front(&mut self, n: usize) {
         assert!(n <= self.len());
-        let inner = self.inner_mut();
-        inner.headroom += n as u16;
-        inner.len -= n as u16;
+        let raw = self.raw_mut();
+        raw.headroom += n;
+        raw.len -= n;
     }
 
     /// Make room for `headroom` bytes in front of the payload, moving the payload
@@ -305,14 +187,13 @@ impl PacketBuf {
         if self.headroom() >= headroom {
             return true;
         }
-        let inner = self.inner_mut();
-        let len = inner.len as usize;
-        if headroom + len > PACKET_BUF_SIZE {
+        let len = self.len();
+        if headroom + len > self.capacity() {
             return false;
         }
-        let old = inner.headroom as usize;
-        inner.data.copy_within(old..old + len, headroom);
-        inner.headroom = headroom as u16;
+        let old = self.headroom();
+        self.storage_mut().copy_within(old..old + len, headroom);
+        self.raw_mut().headroom = headroom;
         true
     }
 
@@ -323,46 +204,51 @@ impl PacketBuf {
     /// # Panics
     /// Panics if `headroom + len > capacity`.
     pub fn set_len(&mut self, len: usize) {
-        assert!(self.headroom() + len <= PACKET_BUF_SIZE);
-        self.inner_mut().len = len as u16;
+        assert!(self.headroom() + len <= self.capacity());
+        self.raw_mut().len = len;
     }
 
     /// The whole underlying storage, ignoring headroom and length.
     ///
-    /// The returned slice is aligned to [`PACKET_BUF_ALIGN`](crate::config::PACKET_BUF_ALIGN), and its length
-    /// ([`PACKET_BUF_SIZE`]) is a multiple of it.
+    /// Its alignment is up to the pool the buffer came from.
     pub fn storage_mut(&mut self) -> &mut [u8] {
-        &mut self.inner_mut().data[..]
+        let raw = self.raw_mut();
+        // SAFETY: `data` is valid and initialized for `capacity` bytes, and only
+        // this buffer accesses it. `&mut self` makes this the only reference.
+        unsafe { core::slice::from_raw_parts_mut(raw.data.as_ptr(), raw.capacity) }
     }
 }
 
 impl Drop for PacketBuf {
     #[inline(never)] // helps code size
     fn drop(&mut self) {
-        let base = POOL.slots.as_ptr() as usize;
-        let index =
-            (self.inner.as_ptr() as usize - base) / core::mem::size_of::<UnsafeCell<MaybeUninit<PacketBufInner>>>();
-        free_slot(index);
+        let free = self.raw().free;
+        // SAFETY: `from_raw` was given this `RawPacketBuf`, and the buffer is never used
+        // again.
+        unsafe { free(self.raw) }
     }
 }
 
 impl Deref for PacketBuf {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
-        let inner = self.inner();
-        let start = inner.headroom as usize;
-        // SAFETY: `headroom + len <= PACKET_BUF_SIZE`, which every method that
-        // changes either of them checks.
-        unsafe { inner.data.get_unchecked(start..start + inner.len as usize) }
+        let raw = self.raw();
+        let start = raw.headroom;
+        let len = raw.len;
+        // SAFETY: `headroom + len <= capacity`, which every method that changes
+        // either of them checks.
+        unsafe { self.storage().get_unchecked(start..start + len) }
     }
 }
+
 impl DerefMut for PacketBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let inner = self.inner_mut();
-        let start = inner.headroom as usize;
-        // SAFETY: `headroom + len <= PACKET_BUF_SIZE`, which every method that
-        // changes either of them checks.
-        unsafe { inner.data.get_unchecked_mut(start..start + inner.len as usize) }
+        let raw = self.raw();
+        let start = raw.headroom;
+        let len = raw.len;
+        // SAFETY: `headroom + len <= capacity`, which every method that changes
+        // either of them checks.
+        unsafe { self.storage_mut().get_unchecked_mut(start..start + len) }
     }
 }
 
@@ -385,20 +271,74 @@ impl defmt::Format for PacketBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PACKET_BUF_ALIGN;
+    use core::mem::MaybeUninit;
+    use std::boxed::Box;
+    use std::sync::Mutex;
+
+    const SIZE: usize = 256;
+
+    /// A pool of heap buffers, freed on drop. Counts what is out.
+    struct TestPool {
+        out: Mutex<usize>,
+    }
+
+    /// One heap buffer. The `RawPacketBuf` comes first, so a pointer to it is a pointer
+    /// to the whole thing.
+    #[repr(C)]
+    struct TestBuf {
+        raw: MaybeUninit<RawPacketBuf>,
+        data: [u8; SIZE],
+    }
+
+    impl TestPool {
+        fn alloc(&'static self) -> Option<PacketBuf> {
+            *self.out.lock().unwrap() += 1;
+            let buf = Box::leak(Box::new(TestBuf {
+                raw: MaybeUninit::uninit(),
+                data: [0xa5; SIZE],
+            }));
+            let raw = buf.raw.write(RawPacketBuf {
+                free,
+                pool: (self as *const TestPool).cast(),
+                data: NonNull::from(&mut buf.data).cast(),
+                capacity: SIZE,
+                headroom: 0,
+                len: 0,
+                meta: PacketMeta::default(),
+            });
+            // SAFETY: the allocation is fresh and only given to this buffer.
+            // `free` gets back the `RawPacketBuf` of a `TestBuf`.
+            Some(unsafe { PacketBuf::from_raw(NonNull::from(raw)) })
+        }
+    }
+
+    unsafe fn free(raw: NonNull<RawPacketBuf>) {
+        // SAFETY: the `RawPacketBuf` is the first field of a `TestBuf` from `Box::leak`,
+        // and its pool is a `&'static TestPool`.
+        unsafe {
+            let pool = &*raw.as_ref().pool.cast::<TestPool>();
+            drop(Box::from_raw(raw.cast::<TestBuf>().as_ptr()));
+            *pool.out.lock().unwrap() -= 1;
+        }
+    }
+
+    fn pool() -> &'static TestPool {
+        Box::leak(Box::new(TestPool { out: Mutex::new(0) }))
+    }
 
     #[test]
     fn push_pull() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = pool().alloc().unwrap();
         assert_eq!(buf.len(), 0);
         assert_eq!(buf.headroom(), 0);
-        assert_eq!(buf.tailroom(), PACKET_BUF_SIZE);
+        assert_eq!(buf.capacity(), SIZE);
+        assert_eq!(buf.tailroom(), SIZE);
 
         buf.reserve(42);
         assert_eq!(buf.headroom(), 42);
         buf.set_len(100);
         assert_eq!(buf.len(), 100);
-        assert_eq!(buf.tailroom(), PACKET_BUF_SIZE - 142);
+        assert_eq!(buf.tailroom(), SIZE - 142);
         buf.fill(0xaa);
 
         buf.push_front(20);
@@ -414,7 +354,7 @@ mod tests {
 
     #[test]
     fn ensure_headroom() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = pool().alloc().unwrap();
         buf.reserve(10);
         buf.set_len(4);
         buf.copy_from_slice(&[1, 2, 3, 4]);
@@ -435,46 +375,34 @@ mod tests {
         assert_eq!(&*buf, &[1, 2, 3, 4]);
 
         // Doesn't fit: the buffer is left alone.
-        assert!(!buf.ensure_headroom(PACKET_BUF_SIZE - 3));
+        assert!(!buf.ensure_headroom(SIZE - 3));
         assert_eq!(buf.headroom(), 22);
         assert_eq!(&*buf, &[1, 2, 3, 4]);
-        assert!(buf.ensure_headroom(PACKET_BUF_SIZE - 4));
+        assert!(buf.ensure_headroom(SIZE - 4));
         assert_eq!(&*buf, &[1, 2, 3, 4]);
     }
 
     #[test]
     #[should_panic]
     fn push_beyond_headroom() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = pool().alloc().unwrap();
         buf.push_front(1);
     }
 
-    /// The storage a driver DMAs into must stay aligned to `PACKET_BUF_ALIGN` and
-    /// a multiple of it long, whatever the metadata in front of it does to the
-    /// layout.
+    /// Dropping a buffer gives it back to the pool it came from.
     #[test]
-    fn storage_is_dma_shaped() {
-        let mut buf = PacketBuf::try_new().unwrap();
-        assert_eq!(buf.storage_mut().as_ptr() as usize % PACKET_BUF_ALIGN, 0);
-        assert_eq!(buf.storage_mut().len() % PACKET_BUF_ALIGN, 0);
-        assert!(buf.storage_mut().len() >= PACKET_BUF_SIZE);
-    }
-
-    /// A fresh buffer starts out empty with default metadata, whatever its previous
-    /// owner left behind. (Pool exhaustion and reuse are covered by xarxa's
-    /// `packet_pool` integration test, which has a process's pool to itself.)
-    #[test]
-    fn fresh_buffer_is_reset() {
-        let mut buf = PacketBuf::try_new().unwrap();
-        buf.reserve(100);
-        buf.set_len(200);
-        buf.fill(0xff);
-        drop(buf);
-
-        let buf = PacketBuf::try_new().unwrap();
-        assert_eq!(buf.len(), 0);
-        assert_eq!(buf.headroom(), 0);
-        assert_eq!(buf.meta(), PacketMeta::default());
+    fn drop_releases_to_its_pool() {
+        let a = pool();
+        let b = pool();
+        let buf_a = a.alloc().unwrap();
+        let buf_b = b.alloc().unwrap();
+        assert_eq!(*a.out.lock().unwrap(), 1);
+        assert_eq!(*b.out.lock().unwrap(), 1);
+        drop(buf_a);
+        assert_eq!(*a.out.lock().unwrap(), 0);
+        assert_eq!(*b.out.lock().unwrap(), 1);
+        drop(buf_b);
+        assert_eq!(*b.out.lock().unwrap(), 0);
     }
 
     /// Metadata rides along with the buffer, untouched by the header pushes and pulls
@@ -482,7 +410,7 @@ mod tests {
     #[cfg(feature = "packetmeta-id")]
     #[test]
     fn meta_travels_with_the_buffer() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = pool().alloc().unwrap();
         assert_eq!(buf.meta(), PacketMeta::default());
 
         buf.meta_mut().id = 0xdead_beef;

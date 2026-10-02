@@ -18,10 +18,10 @@
 
 use std::os::unix::io::AsRawFd;
 
-use xarxa::Stack;
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddr, IpCidr, Ipv4Addr, Ipv6Addr, ListenSocketAddr};
+use xarxa::{Stack, StaticPool};
 
 const MDNS_PORT: u16 = 5353;
 const MDNS_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
@@ -42,7 +42,8 @@ fn main() {
     let fd = driver.as_raw_fd();
 
     // Create interface
-    let mut stack = Stack::new(random_seed());
+    static POOL: StaticPool = StaticPool::new();
+    let mut stack = Stack::new(&POOL, random_seed());
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     stack
         .iface(iface)

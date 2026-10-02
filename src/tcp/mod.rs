@@ -7,18 +7,18 @@
 use core::fmt::Display;
 use core::{fmt, mem};
 
-use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 
 #[cfg(all(test, feature = "tcp-listener"))]
 use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
 use crate::driver::ChecksumCapabilities;
 use crate::driver::PacketBuf;
-use crate::driver::config::PACKET_BUF_SIZE;
 #[cfg(feature = "icmp-errors")]
 use crate::error::IcmpError;
 use crate::error::InvalidHopLimit;
 use crate::iface::IfaceHandle;
+use crate::pool::PoolRef;
 use crate::rand::Rand;
 use crate::stack::{Blocked, EgressRoute, IfaceBinding, Stack, TxContext, alloc_ephemeral_port};
 use crate::storage::Slab;
@@ -56,12 +56,8 @@ use crate::storage::Assembler;
 ///
 /// Every `dispatch` refreshes the socket's `ip_mtu` from the routed egress interface
 /// before sizing or sending anything, so this only stands in while there is no route.
-/// Capped by the packet buffer, so a segment sized by it always fits one.
-const DEFAULT_IP_MTU: usize = if PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN < 1500 {
-    PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN
-} else {
-    1500
-};
+/// `dispatch` caps it by the packet buffer, so a segment sized by it always fits one.
+const DEFAULT_IP_MTU: usize = 1500;
 
 define_handle! {
     /// A handle to a TCP socket added to a [`Stack`].
@@ -1915,6 +1911,9 @@ impl<'d> TcpSocketState<'d> {
         };
         if let Some(route) = &route {
             self.ip_mtu = route.ip_mtu;
+        } else {
+            // A routed MTU is capped by the interface already.
+            self.ip_mtu = self.ip_mtu.min(cx.inner.max_ip_mtu());
         }
 
         let hop_limit = self.hop_limit.unwrap_or(64);
@@ -2226,6 +2225,7 @@ impl<'d> TcpSocketState<'d> {
 /// headroom reserved for the IP and Ethernet headers below it. `None` if the
 /// pool is empty.
 pub(crate) fn build_tcp_packet(
+    pool: PoolRef,
     repr: &TcpRepr<'_>,
     src_addr: &IpAddr,
     dst_addr: &IpAddr,
@@ -2237,7 +2237,7 @@ pub(crate) fn build_tcp_packet(
         #[cfg(feature = "ipv6")]
         IpAddr::V6(_) => IPV6_HEADER_LEN,
     };
-    let mut buf = PacketBuf::try_new()?;
+    let mut buf = pool.alloc()?;
     buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + ip_header_len);
     buf.set_len(repr.buffer_len());
     let mut packet = TcpPacket::new_unchecked(&mut buf);
@@ -2289,7 +2289,13 @@ pub(crate) fn transmit(
         trace!("interface has no room for segment to {}, holding it back", dst_addr);
         return Err(blocked);
     }
-    let Some(buf) = build_tcp_packet(&repr, &src_addr, &dst_addr, &cx.checksum_caps(route.iface)) else {
+    let Some(buf) = build_tcp_packet(
+        cx.inner.pool,
+        &repr,
+        &src_addr,
+        &dst_addr,
+        &cx.checksum_caps(route.iface),
+    ) else {
         trace!("no packet buffer for segment to {}, holding it back", dst_addr);
         return Err(Blocked::NoBuffer);
     };
@@ -3263,7 +3269,7 @@ mod test {
 
     /// A stack with one interface owning `LOCAL_ADDR`.
     fn test_stack() -> Stack<'static> {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
@@ -3672,7 +3678,7 @@ mod test {
         crate::test_device::Sent,
         crate::test_device::Sent,
     ) {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let d0 = TestDevice::new(Medium::Ip);
         let tx0 = d0.tx.clone();
         let if0 = d0.install(&mut stack, HardwareAddress::Ip);
@@ -4577,7 +4583,7 @@ mod test {
     fn test_connect_ephemeral_port() {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let h1 = stack
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
@@ -4606,7 +4612,7 @@ mod test {
             port: REMOTE_PORT,
         };
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let h1 = stack
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
@@ -6083,7 +6089,7 @@ mod test {
         const MTU_MSS: usize = MTU - IPV4_HEADER_LEN - TCP_HEADER_LEN;
 
         let mut s = socket_with_buffer_sizes(2048, 64);
-        s.stack = Stack::new(0x1234_5678_dead_beef);
+        s.stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = TestDevice::new(Medium::Ip)
             .with_mtu(MTU)
             .install(&mut s.stack, HardwareAddress::Ip);
@@ -12512,7 +12518,7 @@ mod stack_test {
 
     fn stack() -> (Stack<'static>, TestDevice) {
         let driver = TestDevice::new(Medium::Ip);
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
@@ -12525,6 +12531,7 @@ mod stack_test {
     /// checksums filled, ready for injection into the device RX queue.
     fn tcp_packet(repr: &TcpRepr) -> Vec<u8> {
         let mut buf = build_tcp_packet(
+            crate::pool::test_pool_ref(),
             repr,
             &REMOTE_ADDR.into(),
             &LOCAL_ADDR.into(),

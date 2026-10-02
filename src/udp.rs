@@ -6,7 +6,7 @@
 //! - [`bind`](UdpSocket::bind) it to a local address and optionally also a remote address.
 //! - Send and receive packets.
 
-use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use crate::config::{UDP_RX_QUEUE_COUNT, UDP_SOCKET_COUNT};
 use crate::storage::BoundedDeque;
@@ -882,7 +882,7 @@ impl UdpSocket<'_, '_> {
     ) -> Result<(PacketBuf, DatagramEgress), SendError> {
         let (route, src, hop_limit) = self.route_datagram(&mut meta)?;
         let headroom = send_headroom(meta.remote_addr.addr.version());
-        let Some(mut buf) = PacketBuf::try_new() else {
+        let Some(mut buf) = self.tx.inner.pool.alloc() else {
             return Err(SendError::NoBuffer);
         };
         if max_size > buf.capacity() - headroom {
@@ -1200,7 +1200,7 @@ mod test {
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Addr, Ipv6Addr};
 
     fn stack_with_socket() -> (Stack<'static>, UdpHandle) {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = stack.add_udp_socket().unwrap();
         (stack, handle)
     }
@@ -1217,7 +1217,7 @@ mod test {
     /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
     /// specified remote can resolve their local address.
     fn stack_with_iface() -> Stack<'static> {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
@@ -1240,7 +1240,7 @@ mod test {
         payload: &[u8],
     ) -> PacketBuf {
         let udp_len = UDP_HEADER_LEN + payload.len();
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
         buf.set_len(IPV4_HEADER_LEN + udp_len);
         {
             let mut ip = Ipv4Packet::new_unchecked(&mut buf);
@@ -1331,7 +1331,7 @@ mod test {
     fn test_bind_ephemeral() {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let h1 = stack.add_udp_socket().unwrap();
         let h2 = stack.add_udp_socket().unwrap();
 
@@ -1413,7 +1413,7 @@ mod test {
 
     #[test]
     fn test_bind_conflicts_per_version() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let h1 = stack.add_udp_socket().unwrap();
         let h2 = stack.add_udp_socket().unwrap();
         let h3 = stack.add_udp_socket().unwrap();
@@ -1740,7 +1740,7 @@ mod test {
     fn test_packet_meta() {
         let driver = TestDevice::new(Medium::Ip);
         let sent = driver.tx_meta.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
@@ -1827,7 +1827,7 @@ mod test {
     #[cfg(not(feature = "alloc"))]
     #[test]
     fn test_socket_slab_full() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let mut handles = std::vec::Vec::new();
         for _ in 0..UDP_SOCKET_COUNT {
             handles.push(stack.add_udp_socket().unwrap());
@@ -1941,7 +1941,7 @@ mod test {
         let driver = TestDevice::new(Medium::Ip);
         let tx = driver.tx.clone();
         let room = driver.room.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
@@ -1961,7 +1961,7 @@ mod test {
         ] {
             for headroom in [0, SEND_HEADROOM, SEND_HEADROOM + 2] {
                 for payload in [b"".as_slice(), b"abcde".as_slice()] {
-                    let mut buf = PacketBuf::try_new().unwrap();
+                    let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
                     buf.reserve(headroom);
                     buf.set_len(payload.len());
                     buf.copy_from_slice(payload);
@@ -1986,7 +1986,7 @@ mod test {
             }
         }
 
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
         buf.set_len(buf.capacity());
         buf.fill(0x5a);
         let (err, returned) = socket.send_packet(buf, (REMOTE_ADDR, REMOTE_PORT)).unwrap_err();
@@ -2002,7 +2002,7 @@ mod test {
         // sends, 64 by default. The rest of the headers are checked while at it.
         let driver = TestDevice::new(Medium::Ip);
         let tx = driver.tx.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
@@ -2084,9 +2084,9 @@ mod test {
         // The biggest payload is what is left of a packet buffer once every header
         // below UDP has its headroom. The device takes a whole buffer, so the
         // interface MTU is never what limits the datagram.
-        let driver = TestDevice::new(Medium::Ip).with_mtu(crate::driver::config::PACKET_BUF_SIZE);
+        let driver = TestDevice::new(Medium::Ip).with_mtu(crate::pool::TEST_POOL_SIZE);
         let tx = driver.tx.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
@@ -2096,14 +2096,14 @@ mod test {
         let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
-        let max = crate::driver::config::PACKET_BUF_SIZE - send_headroom(IpVersion::V4);
+        let max = crate::pool::TEST_POOL_SIZE - send_headroom(IpVersion::V4);
         let remote = SocketAddr::new(REMOTE_ADDR.into(), REMOTE_PORT);
 
         // One byte too many: rejected, nothing transmitted.
         assert_eq!(socket.send_slice(&vec![0; max + 1], remote), Err(SendError::BufferFull));
         assert!(tx.borrow().is_empty());
         // The failed send gave its buffer back to the pool.
-        drop(PacketBuf::try_new().unwrap());
+        drop(crate::pool::test_pool_ref().alloc().unwrap());
 
         // Exactly the maximum: one frame carrying the whole datagram.
         assert_eq!(socket.send_slice(&vec![0; max], remote), Ok(()));
@@ -2199,7 +2199,7 @@ mod test {
         crate::test_device::Sent,
         crate::test_device::Sent,
     ) {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let d0 = TestDevice::new(Medium::Ip);
         let tx0 = d0.tx.clone();
         let if0 = d0.install(&mut stack, HardwareAddress::Ip);

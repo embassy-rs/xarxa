@@ -199,7 +199,7 @@ def collect():
             args += ["--features", extra]
         cmds.raw(args)
     cmds.raw(["test", "-p", "xarxa-driver"])
-    cmds.raw(["test", "-p", "xarxa-driver", "--features", "packet-buf-driver-headroom-32"])
+    cmds.raw(["test", "-p", "xarxa-driver", "--features", "packetmeta-timestamp"])
 
     cmds.raw(["test"])
     # Test serde (de)serialize specifically with just ipv4 or just ipv6

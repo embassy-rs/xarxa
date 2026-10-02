@@ -8,7 +8,7 @@
 //! pays one extra copy, on purpose: it is a fallback path.
 
 #[cfg(feature = "ipv4-fragmentation")]
-use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use crate::driver::PacketBuf;
 use crate::iface::IfaceState;
@@ -264,7 +264,7 @@ impl StackInner {
 
         let more_frags = (frag.packet_len - frag.sent_bytes) != payload_len;
 
-        let Some(mut tx_buffer) = PacketBuf::try_new() else {
+        let Some(mut tx_buffer) = self.pool.alloc() else {
             trace!("fragmenter: no packet buffer, fragments wait");
             return false;
         };
@@ -305,7 +305,7 @@ impl StackInner {
 impl IfaceState<'_> {
     /// The maximum IPv4 payload fragment size, aligned per spec.
     pub(crate) fn max_ipv4_fragment_size(&self, ip_header_len: usize) -> usize {
-        let payload_mtu = self.ip_mtu().saturating_sub(ip_header_len);
+        let payload_mtu = self.ip_mtu.saturating_sub(ip_header_len);
         payload_mtu - (payload_mtu % IPV4_FRAGMENT_PAYLOAD_ALIGNMENT)
     }
 }

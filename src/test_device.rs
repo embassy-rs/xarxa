@@ -75,6 +75,8 @@ pub struct TestDevice {
     pub hardware_addr: HardwareAddress,
     /// The link state it reports.
     pub link: Link,
+    /// The empty buffer the next received frame is copied into, given by the stack.
+    pub rx_buf: Rc<RefCell<Option<PacketBuf>>>,
     /// Multicast filter lists the stack set, oldest first.
     pub mcast_filter: McastFilter,
     /// Metadata stamped onto every received packet.
@@ -115,6 +117,7 @@ impl TestDevice {
                 ])),
             },
             link: Rc::new(Cell::new(LinkState::Up)),
+            rx_buf: Rc::new(RefCell::new(None)),
             #[cfg(feature = "packetmeta-id")]
             rx_meta: PacketMeta::default(),
             #[cfg(feature = "packetmeta-timestamp")]
@@ -178,9 +181,23 @@ impl Driver for TestDevice {
         self.link.get()
     }
 
+    // A buffer only when there is a frame to put in it, so a device with nothing
+    // to receive holds none, and tests can count the pool's buffers.
+    fn rx_wanted(&mut self) -> usize {
+        (self.rx_buf.borrow().is_none() && !self.rx.borrow().is_empty()) as usize
+    }
+
+    fn rx_give(&mut self, buf: PacketBuf) {
+        *self.rx_buf.borrow_mut() = Some(buf);
+    }
+
     fn receive(&mut self) -> Option<PacketBuf> {
+        // With no buffer, the frame stays queued for the test to look at.
+        if self.rx_buf.borrow().is_none() || self.rx.borrow().is_empty() {
+            return None;
+        }
         let bytes = self.rx.borrow_mut().pop_front()?;
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = self.rx_buf.borrow_mut().take().unwrap();
         buf.set_len(bytes.len());
         buf.copy_from_slice(&bytes);
         #[cfg(feature = "packetmeta-id")]

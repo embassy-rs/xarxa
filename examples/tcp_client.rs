@@ -25,10 +25,10 @@
 use std::io::Write as _;
 use std::os::unix::io::AsRawFd;
 
-use xarxa::Stack;
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddr, IpCidr, Ipv4Addr, SocketAddr};
+use xarxa::{Stack, StaticPool};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
@@ -57,7 +57,8 @@ fn main() {
     let mut rx_buffer = [0u8; 4096];
     let mut tx_buffer = [0u8; 4096];
 
-    let mut stack = Stack::new(random_seed());
+    static POOL: StaticPool = StaticPool::new();
+    let mut stack = Stack::new(&POOL, random_seed());
     let iface = stack.add_iface_borrowed(&mut driver).unwrap();
     stack
         .iface(iface)

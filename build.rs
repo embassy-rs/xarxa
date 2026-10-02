@@ -66,15 +66,8 @@ fn main() {
         );
     }
 
-    // Knobs of `xarxa-driver`, handled by its own build script. Not an error
-    // to see them here, but not ours either.
-    let driver_configs = ["PACKET_BUF_COUNT", "PACKET_BUF_SIZE", "PACKET_BUF_ALIGN"];
-
     for (var, value) in env::vars() {
         if let Some(name) = var.strip_prefix("XARXA_") {
-            if driver_configs.contains(&name) {
-                continue;
-            }
             let Some(cfg) = configs.get_mut(name) else {
                 panic!("Unknown env var {name}")
             };

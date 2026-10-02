@@ -29,7 +29,6 @@
 
 use std::os::unix::io::AsRawFd;
 
-use xarxa::Stack;
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::raw::RawMode;
 use xarxa::time::{Duration, Instant};
@@ -37,6 +36,7 @@ use xarxa::wire::{
     EthernetAddress, HardwareAddress, IPV4_HEADER_LEN, IPV6_HEADER_LEN, Icmpv4Message, Icmpv4Packet, Icmpv6Message,
     Icmpv6Packet, IpAddr, IpCidr, IpProtocol, Ipv4Addr, Ipv4Packet, Ipv6Addr, Ipv6Packet,
 };
+use xarxa::{Stack, StaticPool};
 
 /// ICMP echo header (type, code, checksum, ident, seq).
 const ICMP_HEADER_LEN: usize = 8;
@@ -64,7 +64,8 @@ fn main() {
     let fd = driver.as_raw_fd();
 
     let seed = random_seed();
-    let mut stack = Stack::new(seed);
+    static POOL: StaticPool = StaticPool::new();
+    let mut stack = Stack::new(&POOL, seed);
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     stack
         .iface(iface)

@@ -18,11 +18,11 @@
 
 use std::os::unix::io::AsRawFd;
 
-use xarxa::Stack;
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::iface::dhcpv4::DhcpConfig;
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress};
+use xarxa::{Stack, StaticPool};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -33,7 +33,8 @@ fn main() {
     let driver = TunTapDriver::new(&name, hardware_addr).unwrap();
     let fd = driver.as_raw_fd();
 
-    let mut stack = Stack::new(random_seed());
+    static POOL: StaticPool = StaticPool::new();
+    let mut stack = Stack::new(&POOL, random_seed());
     let iface = stack.add_iface(Box::new(driver)).unwrap();
 
     // That's all it takes: the stack installs the address and default route

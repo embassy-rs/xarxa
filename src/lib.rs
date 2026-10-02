@@ -53,6 +53,7 @@ mod multicast;
 mod neighbor;
 #[cfg(feature = "packet-log")]
 mod packet_log;
+mod pool;
 mod rand;
 #[cfg(feature = "_raw")]
 pub mod raw;
@@ -79,4 +80,7 @@ pub use xarxa_driver as driver;
 
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 pub use neighbor::{Neighbor, NeighborCache, NeighborState};
+#[cfg(feature = "alloc")]
+pub use pool::AllocPool;
+pub use pool::{Align, Pool, StaticPool, ValidAlign};
 pub use stack::Stack;

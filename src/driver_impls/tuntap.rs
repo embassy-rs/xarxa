@@ -69,6 +69,8 @@ pub struct TunTapDriver {
     lower: libc::c_int,
     mtu: usize,
     hardware_addr: HardwareAddress,
+    /// The buffer the next frame is received into, given by the stack.
+    rx_buf: Option<PacketBuf>,
 }
 
 impl AsRawFd for TunTapDriver {
@@ -106,6 +108,7 @@ impl TunTapDriver {
             lower,
             mtu,
             hardware_addr,
+            rx_buf: None,
         })
     }
 
@@ -121,6 +124,7 @@ impl TunTapDriver {
             lower: fd,
             mtu,
             hardware_addr,
+            rx_buf: None,
         })
     }
 
@@ -215,15 +219,31 @@ impl Driver for TunTapDriver {
         self.hardware_addr.to_driver().unwrap()
     }
 
+    fn rx_wanted(&mut self) -> usize {
+        self.rx_buf.is_none() as usize
+    }
+
+    fn rx_give(&mut self, buf: PacketBuf) {
+        self.rx_buf = Some(buf);
+    }
+
     fn receive(&mut self) -> Option<PacketBuf> {
-        let mut buf = PacketBuf::try_new()?;
+        let Some(mut buf) = self.rx_buf.take() else {
+            // No buffer: drop the frame, if there is one, rather than leave it
+            // pending. A short read takes the whole frame.
+            let _ = self.recv(&mut [0]);
+            return None;
+        };
         buf.set_len(buf.capacity());
         match self.recv(&mut buf[..]) {
             Ok(size) => {
                 buf.set_len(size);
                 Some(buf)
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                self.rx_buf = Some(buf);
+                None
+            }
             Err(err) => core::panic!("{}", err),
         }
     }

@@ -3,15 +3,15 @@
 //!
 //! The fragments of one datagram are copied into a `PacketBuf` taken from the
 //! pool, at their offsets, and the buffer is handed up the stack whole once the
-//! last hole is filled. So a reassembled packet is at most `PACKET_BUF_SIZE`
-//! bytes, and each datagram being reassembled pins one pool buffer until it
-//! completes or expires.
+//! last hole is filled. So a reassembled packet must fit one buffer of the pool,
+//! and each datagram being reassembled pins one pool buffer until it completes or
+//! expires.
 
 use core::fmt;
 
 use crate::config::REASSEMBLY_BUFFER_COUNT;
 use crate::driver::PacketBuf;
-use crate::driver::config::PACKET_BUF_SIZE;
+use crate::pool::PoolRef;
 use crate::stack::Stack;
 use crate::storage::Assembler;
 use crate::time::{Clock, Duration, Instant};
@@ -79,9 +79,9 @@ impl<K> PacketAssembler<K> {
     }
 
     /// The buffer the fragments are assembled into, taken from the pool on first use.
-    fn buffer(&mut self) -> Result<&mut PacketBuf, AssemblerError> {
+    fn buffer(&mut self, pool: PoolRef) -> Result<&mut PacketBuf, AssemblerError> {
         if self.buffer.is_none() {
-            self.buffer = Some(PacketBuf::try_new().ok_or(AssemblerError)?);
+            self.buffer = Some(pool.alloc().ok_or(AssemblerError)?);
         }
         // NOTE(unwrap): filled in just above.
         Ok(unwrap!(self.buffer.as_mut()))
@@ -95,10 +95,6 @@ impl<K> PacketAssembler<K> {
             return Err(AssemblerError);
         }
 
-        if PACKET_BUF_SIZE < size {
-            return Err(AssemblerError);
-        }
-
         self.total_size = Some(size);
         Ok(())
     }
@@ -109,9 +105,9 @@ impl<K> PacketAssembler<K> {
     /// - `AssemblerError`: if the data goes at a place that does not exist, if
     ///   the fragments leave more holes than can be tracked, or if no packet
     ///   buffer is free.
-    pub(crate) fn add(&mut self, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
+    pub(crate) fn add(&mut self, pool: PoolRef, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
         let len = data.len();
-        let buffer = self.buffer()?;
+        let buffer = self.buffer(pool)?;
         if buffer.capacity() < offset + len {
             return Err(AssemblerError);
         }
@@ -132,14 +128,14 @@ impl<K> PacketAssembler<K> {
 
     /// Get the reassembled packet, if reassembly is complete.
     /// This will mark the assembler as empty, so that it can be reused.
-    pub(crate) fn assemble(&mut self) -> Option<PacketBuf> {
+    pub(crate) fn assemble(&mut self, pool: PoolRef) -> Option<PacketBuf> {
         if !self.is_complete() {
             return None;
         }
 
         // NOTE: we can unwrap because `is_complete` already checks this.
         let total_size = self.total_size.unwrap();
-        self.buffer().ok()?.set_len(total_size);
+        self.buffer(pool).ok()?.set_len(total_size);
         let buffer = self.buffer.take();
         self.reset();
         buffer
@@ -299,12 +295,16 @@ impl Stack<'_> {
             ));
         }
 
-        if let Err(e) = f.add(ipv4_packet.payload(), ipv4_packet.frag_offset() as usize) {
+        if let Err(e) = f.add(
+            self.inner.pool,
+            ipv4_packet.payload(),
+            ipv4_packet.frag_offset() as usize,
+        ) {
             debug!("fragmentation error: {:?}", e);
             return None;
         }
 
-        let mut payload = f.assemble()?;
+        let mut payload = f.assemble(self.inner.pool)?;
 
         // The reassembled packet is this fragment's IP header, patched to
         // describe the whole datagram, in front of the reassembled payload.
@@ -345,10 +345,13 @@ mod tests {
         p_assembler.set_total_size(5).unwrap();
 
         let data = b"Rust";
-        p_assembler.add(&data[..], 0).unwrap();
-        p_assembler.add(&data[..], 1).unwrap();
+        p_assembler.add(crate::pool::test_pool_ref(), &data[..], 0).unwrap();
+        p_assembler.add(crate::pool::test_pool_ref(), &data[..], 1).unwrap();
 
-        assert_eq!(p_assembler.assemble().as_deref(), Some(&b"RRust"[..]))
+        assert_eq!(
+            p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(),
+            Some(&b"RRust"[..])
+        )
     }
 
     #[test]
@@ -359,12 +362,17 @@ mod tests {
 
         p_assembler.set_total_size(data.len()).unwrap();
 
-        p_assembler.add(b"Hello ", 0).unwrap();
-        assert_eq!(p_assembler.assemble().as_deref(), None);
+        p_assembler.add(crate::pool::test_pool_ref(), b"Hello ", 0).unwrap();
+        assert_eq!(p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(), None);
 
-        p_assembler.add(b"World!", b"Hello ".len()).unwrap();
+        p_assembler
+            .add(crate::pool::test_pool_ref(), b"World!", b"Hello ".len())
+            .unwrap();
 
-        assert_eq!(p_assembler.assemble().as_deref(), Some(&b"Hello World!"[..]));
+        assert_eq!(
+            p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(),
+            Some(&b"Hello World!"[..])
+        );
     }
 
     #[test]
@@ -375,23 +383,33 @@ mod tests {
 
         p_assembler.set_total_size(data.len()).unwrap();
 
-        p_assembler.add(b"World!", b"Hello ".len()).unwrap();
-        assert_eq!(p_assembler.assemble().as_deref(), None);
+        p_assembler
+            .add(crate::pool::test_pool_ref(), b"World!", b"Hello ".len())
+            .unwrap();
+        assert_eq!(p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(), None);
 
-        p_assembler.add(b"Hello ", 0).unwrap();
+        p_assembler.add(crate::pool::test_pool_ref(), b"Hello ", 0).unwrap();
 
-        assert_eq!(p_assembler.assemble().as_deref(), Some(&b"Hello World!"[..]));
+        assert_eq!(
+            p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(),
+            Some(&b"Hello World!"[..])
+        );
     }
 
     #[test]
     fn packet_assembler_too_large() {
         let mut p_assembler = PacketAssembler::<Key>::new();
 
-        assert_eq!(p_assembler.set_total_size(PACKET_BUF_SIZE), Ok(()));
-        assert_eq!(p_assembler.set_total_size(PACKET_BUF_SIZE), Ok(()));
-        assert_eq!(p_assembler.set_total_size(PACKET_BUF_SIZE + 1), Err(AssemblerError));
-        assert_eq!(p_assembler.add(&[0; 8], PACKET_BUF_SIZE - 8), Ok(()));
-        assert_eq!(p_assembler.add(&[0; 8], PACKET_BUF_SIZE - 7), Err(AssemblerError));
+        assert_eq!(p_assembler.set_total_size(crate::pool::TEST_POOL_SIZE), Ok(()));
+        assert_eq!(p_assembler.set_total_size(crate::pool::TEST_POOL_SIZE), Ok(()));
+        assert_eq!(
+            p_assembler.add(crate::pool::test_pool_ref(), &[0; 8], crate::pool::TEST_POOL_SIZE - 8),
+            Ok(())
+        );
+        assert_eq!(
+            p_assembler.add(crate::pool::test_pool_ref(), &[0; 8], crate::pool::TEST_POOL_SIZE - 7),
+            Err(AssemblerError)
+        );
     }
 
     #[test]
@@ -441,33 +459,36 @@ mod tests {
 
         let key = Key { id: 0 };
         let assr = set.get(&key, Instant::ZERO).unwrap();
-        assert!(assr.assemble().is_none());
+        assert!(assr.assemble(crate::pool::test_pool_ref()).is_none());
         assr.set_total_size(0).unwrap();
-        assr.assemble().unwrap();
+        assr.assemble(crate::pool::test_pool_ref()).unwrap();
 
         // Test that `.assemble()` effectively deletes it.
         let assr = set.get(&key, Instant::ZERO).unwrap();
-        assert!(assr.assemble().is_none());
+        assert!(assr.assemble(crate::pool::test_pool_ref()).is_none());
         assr.set_total_size(0).unwrap();
-        assr.assemble().unwrap();
+        assr.assemble(crate::pool::test_pool_ref()).unwrap();
 
         let key = Key { id: 1 };
         let assr = set.get(&key, Instant::ZERO).unwrap();
         assr.set_total_size(0).unwrap();
-        assr.assemble().unwrap();
+        assr.assemble(crate::pool::test_pool_ref()).unwrap();
 
         let key = Key { id: 2 };
         let assr = set.get(&key, Instant::ZERO).unwrap();
         assr.set_total_size(0).unwrap();
-        assr.assemble().unwrap();
+        assr.assemble(crate::pool::test_pool_ref()).unwrap();
 
         let key = Key { id: 2 };
         let assr = set.get(&key, Instant::ZERO).unwrap();
         assr.set_total_size(2).unwrap();
-        assr.add(&[0x00], 0).unwrap();
-        assert!(assr.assemble().is_none());
+        assr.add(crate::pool::test_pool_ref(), &[0x00], 0).unwrap();
+        assert!(assr.assemble(crate::pool::test_pool_ref()).is_none());
         let assr = set.get(&key, Instant::ZERO).unwrap();
-        assr.add(&[0x01], 1).unwrap();
-        assert_eq!(assr.assemble().as_deref(), Some(&[0x00, 0x01][..]));
+        assr.add(crate::pool::test_pool_ref(), &[0x01], 1).unwrap();
+        assert_eq!(
+            assr.assemble(crate::pool::test_pool_ref()).as_deref(),
+            Some(&[0x00, 0x01][..])
+        );
     }
 }

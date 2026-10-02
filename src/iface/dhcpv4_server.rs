@@ -19,13 +19,14 @@
 //! [`Iface::dhcpv4_server_leases`]: super::Iface::dhcpv4_server_leases
 //! [`Iface::remove_dhcpv4_server_lease`]: super::Iface::remove_dhcpv4_server_lease
 
+use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
-use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use super::IfaceState;
 use crate::config::{DHCP_MAX_DNS_SERVER_COUNT, DHCP_SERVER_CLIENT_ID_SIZE, DHCP_SERVER_LEASE_COUNT};
 use crate::driver::{ChecksumCapabilities, PacketBuf};
+use crate::pool::PoolRef;
 use crate::stack::{StackInner, push_ipv4_header};
 use crate::time::{Duration, Instant};
 use crate::wire::{
@@ -33,13 +34,6 @@ use crate::wire::{
     DhcpPacket, EthernetAddress, EthernetProtocol, IPV4_HEADER_LEN, IpAddr, IpCidr, IpProtocol, Ipv4Addr, Ipv4AddrExt,
     Ipv4Cidr, LINK_HEADER_LEN, UDP_HEADER_LEN, UdpPacket, dhcpv4_field as field,
 };
-
-// DHCP messages can be up to 576 bytes long, the IPv4 minimum MTU (RFC 2131 §2).
-const _: () = core::assert!(
-    crate::driver::config::PACKET_BUF_SIZE
-        >= crate::driver::config::PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + crate::wire::IPV4_MIN_MTU,
-    "DHCP needs PACKET_BUF_SIZE of at least 590 (576 with only `medium-ip`), plus the driver headroom"
-);
 
 /// How long an offered address is held back for the client it was offered to.
 const OFFER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -391,6 +385,7 @@ impl Server {
     /// Ethernet destination, or `None` when the message gets no reply.
     fn handle(
         &mut self,
+        pool: PoolRef,
         now: Instant,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
@@ -408,8 +403,10 @@ impl Server {
         };
 
         match message_type {
-            DhcpMessageType::Discover => self.handle_discover(now, server_cidr, checksum_caps, packet, &id, chaddr),
-            DhcpMessageType::Request => self.handle_request(now, server_cidr, checksum_caps, packet, &id, chaddr),
+            DhcpMessageType::Discover => {
+                self.handle_discover(pool, now, server_cidr, checksum_caps, packet, &id, chaddr)
+            }
+            DhcpMessageType::Request => self.handle_request(pool, now, server_cidr, checksum_caps, packet, &id, chaddr),
             DhcpMessageType::Decline => {
                 let Some(addr) = packet.option(field::OPT_REQUESTED_IP).and_then(parse_ipv4) else {
                     return None;
@@ -445,6 +442,7 @@ impl Server {
                 }
                 debug!("DHCP server: answering INFORM from {}", ciaddr);
                 self.build_reply(
+                    pool,
                     server_cidr,
                     checksum_caps,
                     packet,
@@ -464,8 +462,10 @@ impl Server {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_discover(
         &mut self,
+        pool: PoolRef,
         now: Instant,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
@@ -509,6 +509,7 @@ impl Server {
 
         debug!("DHCP server: offering {} to {}", addr, chaddr);
         self.build_reply(
+            pool,
             server_cidr,
             checksum_caps,
             packet,
@@ -522,8 +523,10 @@ impl Server {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_request(
         &mut self,
+        pool: PoolRef,
         now: Instant,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
@@ -592,7 +595,7 @@ impl Server {
                 self.leases.retain(|l| l.address != addr || l.matches_client(id));
                 let Some(i) = self.entry_for(id, chaddr, now) else {
                     warn!("DHCP server: lease table full, cannot commit {}", addr);
-                    return self.nak(server_cidr, checksum_caps, packet, "no free leases");
+                    return self.nak(pool, server_cidr, checksum_caps, packet, "no free leases");
                 };
                 let lease = &mut self.leases[i];
                 lease.address = addr;
@@ -601,6 +604,7 @@ impl Server {
                 };
                 debug!("DHCP server: leased {} to {}", addr, chaddr);
                 self.build_reply(
+                    pool,
                     server_cidr,
                     checksum_caps,
                     packet,
@@ -615,7 +619,7 @@ impl Server {
             }
             Answer::Nak(reason) => {
                 debug!("DHCP server: NAK to {} for {}: {}", chaddr, addr, reason);
-                self.nak(server_cidr, checksum_caps, packet, reason)
+                self.nak(pool, server_cidr, checksum_caps, packet, reason)
             }
             Answer::Silent => None,
         }
@@ -623,12 +627,14 @@ impl Server {
 
     fn nak(
         &self,
+        pool: PoolRef,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
         packet: &DhcpPacket<'_>,
         reason: &'static str,
     ) -> Option<(PacketBuf, Ipv4Addr, EthernetAddress)> {
         self.build_reply(
+            pool,
             server_cidr,
             checksum_caps,
             packet,
@@ -649,6 +655,7 @@ impl Server {
     /// `outgoing_options` can cause.
     fn build_reply(
         &self,
+        pool: PoolRef,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
         request: &DhcpPacket<'_>,
@@ -671,7 +678,7 @@ impl Server {
             (reply.yiaddr, chaddr)
         };
 
-        let mut buf = PacketBuf::try_new()?;
+        let mut buf = pool.alloc()?;
         buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         buf.set_len(buf.tailroom());
 
@@ -792,6 +799,7 @@ impl IfaceState<'_> {
     ) {
         let checksum_caps = self.checksum_caps();
         let server_cidr = self.dhcpv4_server_cidr();
+        let pool = inner.pool;
         let Some(server) = &mut self.dhcpv4_server else { return };
         let Some(server_cidr) = server_cidr else {
             trace!("DHCP server: no IPv4 address on the interface, ignoring");
@@ -824,7 +832,7 @@ impl IfaceState<'_> {
         }
 
         debug!("DHCP server: recv {:?} from {}", message_type, src_ip);
-        let reply = server.handle(now, server_cidr, &checksum_caps, message_type, &packet);
+        let reply = server.handle(pool, now, server_cidr, &checksum_caps, message_type, &packet);
 
         if let Some((mut buf, dst_addr, dst_hw)) = reply {
             push_ipv4_header(
@@ -898,7 +906,7 @@ mod test {
     fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
         let driver = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
         let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
-        let mut stack = Stack::new(1);
+        let mut stack = Stack::new(crate::pool::test_pool(), 1);
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(SERVER_HW));
         assert_eq!(handle, IFACE);
         stack
@@ -1561,7 +1569,7 @@ mod test {
     #[test]
     #[cfg(feature = "medium-ip")]
     fn test_set_server_wrong_medium() {
-        let mut stack = Stack::new(1);
+        let mut stack = Stack::new(crate::pool::test_pool(), 1);
         let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
@@ -1790,7 +1798,7 @@ mod test {
     fn test_no_ipv4_address_is_silent() {
         let driver = TestDevice::new(Medium::Ethernet);
         let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
-        let mut stack = Stack::new(1);
+        let mut stack = Stack::new(crate::pool::test_pool(), 1);
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(SERVER_HW));
         stack.iface(handle).set_dhcpv4_server(Some(test_config())).unwrap();
         stack.poll(at(0));
@@ -1829,7 +1837,7 @@ mod test {
         use crate::iface::dhcpv4::DhcpConfig;
 
         let server_device = TestDevice::new(Medium::Ethernet);
-        let mut server_stack = Stack::new(1);
+        let mut server_stack = Stack::new(crate::pool::test_pool(), 1);
         let server_iface = server_device.install(&mut server_stack, HardwareAddress::Ethernet(SERVER_HW));
         server_stack
             .iface(server_iface)
@@ -1841,7 +1849,7 @@ mod test {
             .unwrap();
 
         let client_device = TestDevice::new(Medium::Ethernet);
-        let mut client_stack = Stack::new(2);
+        let mut client_stack = Stack::new(crate::pool::test_pool(), 2);
         let client_iface = client_device.install(&mut client_stack, HardwareAddress::Ethernet(CLIENT_HW));
         client_stack
             .iface(client_iface)

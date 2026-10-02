@@ -7,9 +7,9 @@
 //! written into the space the uncompressed one occupied, and the other way
 //! around, with the headroom taking up the difference.
 
+use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::driver::PacketBuf;
-use crate::driver::config::PACKET_BUF_DRIVER_HEADROOM;
 use crate::error::{Full, Malformed};
 use crate::iface::{Iface, IfaceHandle, IfaceState};
 use crate::rand::Rand;
@@ -730,19 +730,19 @@ impl Stack<'_> {
                 debug!("sixlowpan decompress failed");
                 return None;
             }
-            if let Err(e) = frag_slot.add(&buf, 0) {
+            if let Err(e) = frag_slot.add(self.inner.pool, &buf, 0) {
                 debug!("fragmentation error: {:?}", e);
                 return None;
             }
         } else {
             // Add the fragment to the packet assembler.
-            if let Err(e) = frag_slot.add(&buf, offset) {
+            if let Err(e) = frag_slot.add(self.inner.pool, &buf, offset) {
                 debug!("fragmentation error: {:?}", e);
                 return None;
             }
         }
 
-        match frag_slot.assemble() {
+        match frag_slot.assemble(self.inner.pool) {
             Some(payload) => {
                 trace!("6LoWPAN: fragmented packet now complete");
                 Some(payload)
@@ -887,7 +887,7 @@ impl StackInner {
         };
         let frag_len = frag_repr.buffer_len();
 
-        let Some(mut tx_buffer) = PacketBuf::try_new() else {
+        let Some(mut tx_buffer) = self.pool.alloc() else {
             trace!("fragmenter: no packet buffer, fragments wait");
             return false;
         };
@@ -969,7 +969,7 @@ mod test {
     ) -> (Stack<'static>, IfaceHandle, Queue, Sent, Room) {
         let driver = TestDevice::new(Medium::Ieee802154).with_mtu(MTU);
         let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
         let handle = driver.install(&mut stack, HardwareAddress::Ieee802154(hw));
         stack.iface(handle).set_pan_id(pan_id);
         // Drain the solicited-node multicast reports the link-local address
@@ -1022,7 +1022,7 @@ mod test {
     /// if sent from `src` to `dst`. Returns the 6LoWPAN bytes (IPHC first) and
     /// the header difference.
     fn compress(packet: &[u8], src: Ieee802154Address, dst: Ieee802154Address, headroom: usize) -> (Vec<u8>, usize) {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
         buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
         buf.set_len(packet.len());
         buf.copy_from_slice(packet);
@@ -1040,7 +1040,7 @@ mod test {
         headroom: usize,
         total_len: Option<usize>,
     ) -> Result<Vec<u8>, Malformed> {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
         buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
         buf.set_len(payload.len());
         buf.copy_from_slice(payload);
@@ -1664,7 +1664,7 @@ mod test {
     fn test_compress_no_room() {
         let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
         let len = buf.capacity();
         buf.set_len(len);
         let datagram = udp_datagram(src.into(), 1234, dst.into(), 5678, &vec![0; len - 48]);

@@ -13,9 +13,9 @@
 //! [`Iface::config_generation`]: super::Iface::config_generation
 //! [`Stack::poll`]: crate::Stack::poll
 
+use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
-use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use super::{AddrOrigin, IfaceAddr, IfaceState, Preferred};
 use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
@@ -23,6 +23,7 @@ use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
 use crate::config::DHCP_OPTIONS_BUF_SIZE;
 use crate::driver::ChecksumCapabilities;
 use crate::driver::PacketBuf;
+use crate::pool::PoolRef;
 use crate::route::{Route, RouteOrigin};
 use crate::stack::StackInner;
 use crate::time::{Clock, Duration, Instant};
@@ -31,13 +32,6 @@ use crate::wire::{
     DhcpPacket, EthernetAddress, IPV4_HEADER_LEN, IpAddr, IpCidr, Ipv4Addr, Ipv4AddrExt, Ipv4Cidr, LINK_HEADER_LEN,
     UDP_HEADER_LEN, UdpPacket, dhcpv4_field as field,
 };
-
-// DHCP messages can be up to 576 bytes long, the IPv4 minimum MTU (RFC 2131 §2).
-const _: () = core::assert!(
-    crate::driver::config::PACKET_BUF_SIZE
-        >= crate::driver::config::PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + crate::wire::IPV4_MIN_MTU,
-    "DHCP needs PACKET_BUF_SIZE of at least 590 (576 with only `medium-ip`), plus the driver headroom"
-);
 
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(120);
 
@@ -475,6 +469,7 @@ impl Client {
     /// emits are tiny, so only an absurd `outgoing_options` can cause that.
     #[allow(clippy::too_many_arguments)]
     fn build(
+        pool: PoolRef,
         config: &DhcpConfig,
         #[cfg(feature = "hostname")] hostname: Option<&str>,
         message_type: DhcpMessageType,
@@ -493,7 +488,7 @@ impl Client {
         const MAX_IPV4_HEADER_LEN: usize = 60;
         let max_size = (ip_mtu - MAX_IPV4_HEADER_LEN - UDP_HEADER_LEN) as u16;
 
-        let mut buf = PacketBuf::try_new()?;
+        let mut buf = pool.alloc()?;
         buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         let max_payload = buf.tailroom().min(ip_mtu - IPV4_HEADER_LEN - UDP_HEADER_LEN);
         buf.set_len(max_payload);
@@ -702,7 +697,7 @@ impl IfaceState<'_> {
     /// time comes.
     pub(crate) fn dhcpv4_poll(&mut self, inner: &mut StackInner, clock: &mut Clock) {
         let ethernet_addr = self.hardware_addr;
-        let ip_mtu = self.ip_mtu();
+        let ip_mtu = self.ip_mtu;
         let checksum_caps = self.checksum_caps();
         let now = clock.now();
 
@@ -726,6 +721,7 @@ impl IfaceState<'_> {
                         retry_at: clock.after(DISCOVER_TIMEOUT),
                     });
                     let buf = Client::build(
+                        inner.pool,
                         &client.config,
                         #[cfg(feature = "hostname")]
                         inner.hostname(),
@@ -761,6 +757,7 @@ impl IfaceState<'_> {
                     state.retry_at = clock.after(INITIAL_REQUEST_TIMEOUT * (1u32 << (state.retry as u32 / 2)));
                     state.retry += 1;
                     let buf = Client::build(
+                        inner.pool,
                         &client.config,
                         #[cfg(feature = "hostname")]
                         inner.hostname(),
@@ -819,6 +816,7 @@ impl IfaceState<'_> {
                     debug!("DHCP send renew to {}", dst_addr);
                     client.transaction_id = Client::random_transaction_id(inner);
                     let buf = Client::build(
+                        inner.pool,
                         &client.config,
                         #[cfg(feature = "hostname")]
                         inner.hostname(),
@@ -942,7 +940,7 @@ mod test {
     fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
-        let mut stack = Stack::new(1);
+        let mut stack = Stack::new(crate::pool::test_pool(), 1);
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         assert_eq!(handle, IFACE);
         // Drain the solicited-node multicast report the link-local address triggers,
@@ -1538,7 +1536,7 @@ mod test {
 
         let driver = TestDevice::new(Medium::Ip);
         let tx = driver.tx.clone();
-        let mut stack = Stack::new(1);
+        let mut stack = Stack::new(crate::pool::test_pool(), 1);
         let handle = driver.install(&mut stack, HardwareAddress::Ip);
         assert_eq!(
             stack.iface(handle).set_dhcpv4(Some(DhcpConfig::default())),

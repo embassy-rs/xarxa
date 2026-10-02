@@ -43,7 +43,7 @@ This has a few implications:
   - You need to pay at least 2x MTU (1500*2 = 3kb) of RAM for each UDP/raw socket you create. This is why _smoltcp_ implements DNS and DHCP sockets as dedicated `DnsSocket` and `DhcpSocket` types instead of building them on top of UDP and raw sockets. This is not very elegant.
   - For multi-interface you need dedicated pools per interface.
 
-Instead, _xarxa_ has a single global packet pool. It passes owned handles around, so any part of the stack (device, sockets, everything else) can easily own packets. This unlocks many improvements:
+Instead, _xarxa_ uses a packet pool. It passes owned handles around, so any part of the stack (device, sockets, everything else) can easily own packets. This unlocks many improvements:
 - Multi-interface becomes trivial.
 - Zero-copy is now possible. An interface writes a received packet into a buffer, which then goes through dispatch, gets queued in a socket, and then gets handed to the user. Same for egress.
 - It allows fixing "structurally unfixable" bugs like the [tx queue clog](https://github.com/smoltcp-rs/smoltcp/issues/594) when sending to multiple IPs from a single socket.

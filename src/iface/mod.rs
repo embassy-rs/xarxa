@@ -18,7 +18,6 @@ pub mod slaac;
 pub use crate::multicast::MulticastError;
 
 use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
-use crate::driver::config::{PACKET_BUF_DRIVER_HEADROOM, PACKET_BUF_SIZE};
 use crate::driver::{Capabilities, ChecksumCapabilities, Driver, LinkState};
 use crate::error::Full;
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
@@ -277,6 +276,19 @@ pub(crate) fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAdd
     })
 }
 
+/// The IP-layer MTU of a device: its MTU minus the Ethernet header on Ethernet
+/// mediums. Not yet capped by the packet buffer size.
+pub(crate) fn ip_mtu(medium: Medium, caps: &Capabilities) -> usize {
+    match medium {
+        #[cfg(feature = "medium-ethernet")]
+        Medium::Ethernet => caps.max_transmission_unit - ETHERNET_HEADER_LEN,
+        #[cfg(feature = "medium-ip")]
+        Medium::Ip => caps.max_transmission_unit,
+        #[cfg(feature = "medium-ieee802154")]
+        Medium::Ieee802154 => crate::sixlowpan::ip_mtu(caps.max_transmission_unit),
+    }
+}
+
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState<'d> {
     pub(crate) handle: IfaceHandle,
@@ -285,6 +297,10 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) medium: Medium,
     /// The driver's capabilities, read when the interface is added.
     pub(crate) caps: Capabilities,
+    /// The interface's IP-layer MTU, worked out when the interface is added: the
+    /// device MTU minus the link-layer header, capped by what a packet buffer can
+    /// carry.
+    pub(crate) ip_mtu: usize,
     pub(crate) hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
@@ -348,7 +364,7 @@ impl<'d> Iface<'_, 'd> {
     /// The interface's IP-layer MTU: the device MTU minus the link-layer header,
     /// clamped to what a [`PacketBuf`](crate::driver::PacketBuf) can carry.
     pub fn ip_mtu(&self) -> usize {
-        self.state().ip_mtu()
+        self.state().ip_mtu
     }
 
     /// The hardware address of the interface.
@@ -749,22 +765,6 @@ impl IfaceState<'_> {
         self.config_generation = self.config_generation.wrapping_add(1);
         #[cfg(feature = "async")]
         self.waker.wake();
-    }
-
-    /// The interface's IP-layer MTU: the device MTU minus the Ethernet header on
-    /// Ethernet mediums, clamped to what a `PacketBuf` can carry once the
-    /// link-layer headroom egress reserves ([`LINK_HEADER_LEN`]) is taken out.
-    pub(crate) fn ip_mtu(&self) -> usize {
-        let caps = &self.caps;
-        let mtu = match self.medium() {
-            #[cfg(feature = "medium-ethernet")]
-            Medium::Ethernet => caps.max_transmission_unit - ETHERNET_HEADER_LEN,
-            #[cfg(feature = "medium-ip")]
-            Medium::Ip => caps.max_transmission_unit,
-            #[cfg(feature = "medium-ieee802154")]
-            Medium::Ieee802154 => crate::sixlowpan::ip_mtu(caps.max_transmission_unit),
-        };
-        mtu.min(PACKET_BUF_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN)
     }
 
     /// Whether the device can take one more frame right now.

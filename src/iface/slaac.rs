@@ -8,13 +8,13 @@
 //!
 //! Needs the `slaac` feature.
 
-use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use crate::config::{SLAAC_PREFIX_COUNT, SLAAC_ROUTER_COUNT};
 use crate::storage::Vec;
 
 use super::{AddrOrigin, IfaceAddr, IfaceState, Preferred};
-use crate::driver::{LinkState, PacketBuf};
+use crate::driver::LinkState;
 use crate::route::{Route as IfaceRoute, RouteOrigin};
 use crate::stack::StackInner;
 use crate::time::{Clock, Duration, Instant};
@@ -569,7 +569,7 @@ impl IfaceState<'_> {
         // Router solicit: RS header (8 bytes) plus the source link-layer address
         // option. Without a buffer it counts as sent too: the retry timer sends the
         // next one.
-        if let Some(mut buf) = PacketBuf::try_new() {
+        if let Some(mut buf) = inner.pool.alloc() {
             let opt_len = crate::stack::lladdr_option_len(self.hardware_addr);
             buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN);
             buf.set_len(8 + opt_len);

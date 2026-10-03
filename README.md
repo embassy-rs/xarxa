@@ -113,6 +113,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Full TCP implementation
   - TCP listeners implement an accept queue. Buffers are not allocated until you `accept()` a connection. (feature `tcp-listener`)
   - Window scaling
+  - Receiver silly window syndrome (SWS) avoidance
   - Configurable keepalive.
   - RTT estimation automatically tunes retransmission timeout
   - Compile time selection of CUBIC, Reno or no congestion control.

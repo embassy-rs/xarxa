@@ -528,9 +528,11 @@ pub(crate) struct TcpSocketState<'d> {
     /// Last.ACK.sent (RFC 7323): the ACK number of the last segment sent. In an
     /// idle socket, RCV.NXT.
     recv_ack_sent: Option<TcpSeqNumber>,
-    /// The window field of the last segment sent, as on the wire. The window it
-    /// advertised starts at `recv_ack_sent`.
-    recv_window_sent: u16,
+    /// The right edge of the receive window: the highest RCV.NXT+RCV.WND ever
+    /// advertised, like BSD's `rcv_adv`. It never moves left. Data is accepted up
+    /// to it, also after a later segment advertised less (RFC 7323 2.4). Every edge
+    /// fit the free receive buffer when it was advertised, so the data always fits.
+    recv_adv: TcpSeqNumber,
     /// Rcv.Wind.Shift (RFC 7323): the shift applied to the window we advertise.
     /// Before the handshake completes, the shift we offer. It is zero if the
     /// window <= 64KiB and/or the remote does not support window scaling.
@@ -655,7 +657,7 @@ impl<'d> TcpSocketState<'d> {
             recv_read: TcpSeqNumber::default(),
             send_next: TcpSeqNumber::default(),
             recv_ack_sent: None,
-            recv_window_sent: 0,
+            recv_adv: TcpSeqNumber::default(),
             send_window: 0,
             send_window_max: 0,
             recv_window_shift: rx_cap_log2.saturating_sub(16) as u8,
@@ -690,31 +692,58 @@ impl<'d> TcpSocketState<'d> {
         }
     }
 
-    /// Return the current window field value, including scaling according to RFC 1323.
-    ///
-    /// Used in internal calculations as well as packet generation.
+    /// RCV.NXT: the next sequence number expected from the remote.
     #[inline]
-    fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.recv_window_shift).unwrap_or(u16::MAX)
+    fn recv_next(&self) -> TcpSeqNumber {
+        self.recv_read + self.rx_buffer.len()
     }
 
-    /// Return the last window field value, including scaling according to RFC 1323.
-    ///
-    /// Used in internal calculations as well as packet generation.
-    ///
-    /// Unlike `recv_window_sent`, we take into account new packets received (but not acknowledged)
-    /// since the last window update and adjust the window length accordingly. This ensures a fair
-    /// comparison between the last window length and the new window length we're going to
-    /// advertise.
+    /// What is left of the advertised receive window: the octets from RCV.NXT up
+    /// to `recv_adv`.
     #[inline]
-    fn last_scaled_window(&self) -> Option<u16> {
-        let last_ack = self.recv_ack_sent?;
-        let next_ack = self.recv_read + self.rx_buffer.len();
+    fn recv_window_left(&self) -> usize {
+        let recv_next = self.recv_next();
+        if self.recv_adv > recv_next {
+            self.recv_adv - recv_next
+        } else {
+            0
+        }
+    }
 
-        let last_win = (self.recv_window_sent as usize) << self.recv_window_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+    /// The window field of a SYN or SYN|ACK: the free receive buffer, not scaled
+    /// (RFC 7323 2.2).
+    #[inline]
+    fn syn_window(&self) -> u16 {
+        u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX)
+    }
 
-        Some(u16::try_from(last_win_adjusted >> self.recv_window_shift).unwrap_or(u16::MAX))
+    /// RCV.WND: the window to advertise, in octets from RCV.NXT. It is a multiple
+    /// of the window scale and fits the window field, so `>> recv_window_shift`
+    /// is the field.
+    ///
+    /// Receiver SWS avoidance (RFC 9293 3.8.6.2.2): the right edge stays where it
+    /// was advertised until the free receive buffer can move it by at least
+    /// min(RCV.BUFF / 2, MSS). The remote's MSS stands in for Eff.snd.MSS.
+    fn recv_window(&self) -> usize {
+        let shift = self.recv_window_shift;
+        let free = (self.rx_buffer.window() >> shift).min(u16::MAX as usize) << shift;
+        let left = self.recv_window_left();
+        if free >= left + (self.rx_buffer.capacity() / 2).min(self.send_mss) {
+            free
+        } else {
+            // Keep the edge. With a scale the field can only carry it rounded
+            // down, which shows the remote a window shrunk by less than the scale.
+            // `recv_adv` still accepts up to the edge (RFC 7323 2.4).
+            left >> shift << shift
+        }
+    }
+
+    /// Take the remote's FIN, which is at RCV.NXT: RCV.NXT moves past it. The FIN
+    /// takes no buffer space, so the right edge of the window moves with it.
+    fn recv_fin(&mut self) {
+        self.recv_read += 1;
+        self.recv_adv += 1;
+        self.rx_fin_received = true;
     }
 
     /// Whether the socket is open: it processes incoming and dispatches
@@ -756,7 +785,7 @@ impl<'d> TcpSocketState<'d> {
         self.recv_read = TcpSeqNumber::default();
         self.send_next = TcpSeqNumber::default();
         self.recv_ack_sent = None;
-        self.recv_window_sent = 0;
+        self.recv_adv = TcpSeqNumber::default();
         self.send_window = 0;
         self.send_window_max = 0;
         self.send_window_shift = None;
@@ -1078,12 +1107,8 @@ impl<'d> TcpSocketState<'d> {
             }
         }
 
-        let window_start = self.recv_read + self.rx_buffer.len();
-        let window_end = if let Some(last_ack) = self.recv_ack_sent {
-            last_ack + ((self.recv_window_sent as usize) << self.recv_window_shift)
-        } else {
-            window_start
-        };
+        let window_start = self.recv_next();
+        let window_end = self.recv_adv.max(window_start);
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -1253,8 +1278,7 @@ impl<'d> TcpSocketState<'d> {
             // It's not obvious from RFC 793 that this is permitted, but
             // 7th and 8th steps in the "SEGMENT ARRIVES" event describe this behavior.
             (State::SynReceived, TcpControl::Fin) => {
-                self.recv_read += 1;
-                self.rx_fin_received = true;
+                self.recv_fin();
                 self.set_state(State::CloseWait);
             }
 
@@ -1277,6 +1301,14 @@ impl<'d> TcpSocketState<'d> {
                 self.recv_read = repr.seq_number + 1;
                 self.send_next = self.send_unack + 1;
                 self.recv_ack_sent = Some(repr.seq_number);
+                // Our SYN advertised the free receive buffer, which is all of it,
+                // since nothing was received yet. If it never left, nothing was
+                // advertised: in SYN-SENT the SYN is the only segment that takes
+                // up sequence space, so it left if anything did.
+                self.recv_adv = self.recv_read;
+                if self.rtte.send_max.is_some() {
+                    self.recv_adv += self.syn_window() as usize;
+                }
                 #[cfg(feature = "tcp-sack")]
                 {
                     self.send_sack = repr.sack_permitted;
@@ -1303,8 +1335,7 @@ impl<'d> TcpSocketState<'d> {
 
             // FIN packets in ESTABLISHED state indicate the remote side has closed.
             (State::Established, TcpControl::Fin) => {
-                self.recv_read += 1;
-                self.rx_fin_received = true;
+                self.recv_fin();
                 self.set_state(State::CloseWait);
             }
 
@@ -1319,8 +1350,7 @@ impl<'d> TcpSocketState<'d> {
             // FIN packets in FIN-WAIT-1 state change it to CLOSING, or to TIME-WAIT
             // if they also acknowledge our FIN.
             (State::FinWait1, TcpControl::Fin) => {
-                self.recv_read += 1;
-                self.rx_fin_received = true;
+                self.recv_fin();
                 if ack_of_fin {
                     self.set_state(State::TimeWait);
                     self.timer.set_for_close(now);
@@ -1333,8 +1363,7 @@ impl<'d> TcpSocketState<'d> {
 
             // FIN packets in FIN-WAIT-2 state change it to TIME-WAIT.
             (State::FinWait2, TcpControl::Fin) => {
-                self.recv_read += 1;
-                self.rx_fin_received = true;
+                self.recv_fin();
                 self.set_state(State::TimeWait);
                 self.timer.set_for_close(now);
             }
@@ -1648,7 +1677,7 @@ impl<'d> TcpSocketState<'d> {
 
     fn ack_to_transmit(&self) -> bool {
         if let Some(recv_ack_sent) = self.recv_ack_sent {
-            recv_ack_sent < self.recv_read + self.rx_buffer.len()
+            recv_ack_sent < self.recv_next()
         } else {
             false
         }
@@ -1666,7 +1695,7 @@ impl<'d> TcpSocketState<'d> {
     /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
     fn immediate_ack_to_transmit(&self) -> bool {
         if let Some(recv_ack_sent) = self.recv_ack_sent {
-            recv_ack_sent + self.send_mss < self.recv_read + self.rx_buffer.len()
+            recv_ack_sent + self.send_mss < self.recv_next()
         } else {
             false
         }
@@ -1678,25 +1707,32 @@ impl<'d> TcpSocketState<'d> {
     /// more data can be sent. According to the Linux kernel implementation, "significant" means
     /// doubling the receive window. The Linux kernel implementation can be found at
     /// <https://elixir.bootlin.com/linux/v6.9.9/source/net/ipv4/tcp.c#L1472>.
+    ///
+    /// Only the synchronized states take window updates: the window of a SYN|ACK
+    /// can't be scaled, so sending it again would not open the window further.
     fn window_to_update(&self) -> bool {
         match self.state {
-            State::SynSent | State::SynReceived | State::Established | State::FinWait1 | State::FinWait2 => {
-                let new_win = self.scaled_window();
-                if let Some(last_win) = self.last_scaled_window() {
-                    new_win > 0 && new_win / 2 >= last_win
-                } else {
-                    false
-                }
+            State::Established | State::FinWait1 | State::FinWait2 => {
+                let window = self.recv_window();
+                let left = self.recv_window_left();
+                window > left && window / 2 >= left
             }
             _ => false,
         }
     }
 
-    /// Record that a segment carrying this ACK and window went out, and stop the
-    /// delayed-ACK timer.
-    fn ack_sent(&mut self, ack_number: Option<TcpSeqNumber>, window_len: u16) {
+    /// Record that a segment with this control flag, carrying this ACK and window
+    /// field, went out, and stop the delayed-ACK timer.
+    fn ack_sent(&mut self, ack_number: Option<TcpSeqNumber>, window_len: u16, control: TcpControl) {
         self.recv_ack_sent = ack_number;
-        self.recv_window_sent = window_len;
+        if let Some(ack_number) = ack_number {
+            // The window field of a SYN|ACK is not scaled (RFC 7323 2.2).
+            let window = match control {
+                TcpControl::Syn => window_len as usize,
+                _ => (window_len as usize) << self.recv_window_shift,
+            };
+            self.recv_adv = self.recv_adv.max(ack_number + window);
+        }
 
         match self.ack_delay_timer {
             AckDelayTimer::Idle => {}
@@ -1927,14 +1963,14 @@ impl<'d> TcpSocketState<'d> {
         let local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
 
         // Every segment starts out as an empty ACK.
-        let ack = self.recv_read + self.rx_buffer.len();
+        let ack = self.recv_next();
         let repr = TcpRepr {
             src_port: tuple.local.port,
             dst_port: tuple.remote.port,
             control: TcpControl::None,
             seq_number: self.send_next,
             ack_number: Some(ack),
-            window_len: self.scaled_window(),
+            window_len: (self.recv_window() >> self.recv_window_shift) as u16,
             window_scale: None,
             max_seg_size: None,
             #[cfg(feature = "tcp-sack")]
@@ -1990,8 +2026,7 @@ impl<'d> TcpSocketState<'d> {
             State::SynSent | State::SynReceived => {
                 if self.send_next == self.send_unack || self.ack_due(clock) {
                     let mut syn = TcpRepr {
-                        // window len must NOT be scaled in SYNs.
-                        window_len: u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX),
+                        window_len: self.syn_window(),
                         max_seg_size: Some(local_mss as u16),
                         ..repr
                     };
@@ -2072,7 +2107,7 @@ impl<'d> TcpSocketState<'d> {
                 payload,
                 ..repr
             })?;
-            self.ack_sent(repr.ack_number, repr.window_len);
+            self.ack_sent(repr.ack_number, repr.window_len, repr.control);
             let delay = (delay * 2).min(RTTE_MAX_RTO);
             self.timer = Timer::ZeroWindowProbe {
                 expires_at: clock.after(delay),
@@ -2196,7 +2231,7 @@ impl<'d> TcpSocketState<'d> {
         // Use max() so a fast-retransmit segment (whose seq_number is send_unack, well
         // behind the current frontier) doesn't rewind the tracked "highest sent" sequence.
         self.send_next = self.send_next.max(seq_end);
-        self.ack_sent(repr.ack_number, repr.window_len);
+        self.ack_sent(repr.ack_number, repr.window_len, repr.control);
 
         // We've sent something, so rewind the keep-alive timer.
         self.timer.rewind_keep_alive(now, self.keep_alive);
@@ -3255,7 +3290,7 @@ mod test {
             assert_eq!(s1.recv_read, s2.recv_read, "recv_read");
             assert_eq!(s1.send_next, s2.send_next, "send_next");
             assert_eq!(s1.recv_ack_sent, s2.recv_ack_sent, "recv_ack_sent");
-            assert_eq!(s1.recv_window_sent, s2.recv_window_sent, "recv_window_sent");
+            assert_eq!(s1.recv_adv, s2.recv_adv, "recv_adv");
             assert_eq!(s1.send_window, s2.send_window, "send_window");
             assert_eq!(s1.send_window_max, s2.send_window_max, "send_window_max");
             assert_eq!(s1.timer, s2.timer, "timer");
@@ -3302,6 +3337,7 @@ mod test {
         s.tuple = Some(TUPLE);
         s.send_unack = LOCAL_SEQ;
         s.recv_read = REMOTE_SEQ + 1;
+        s.recv_adv = REMOTE_SEQ + 1;
         s.send_next = LOCAL_SEQ;
         s.send_window = 256;
         s.send_window_max = 256;
@@ -3331,7 +3367,7 @@ mod test {
         s.send_unack = LOCAL_SEQ + 1;
         s.send_next = LOCAL_SEQ + 1;
         s.recv_ack_sent = Some(REMOTE_SEQ + 1);
-        s.recv_window_sent = s.scaled_window();
+        s.recv_adv = REMOTE_SEQ + 1 + s.recv_window();
         s
     }
 
@@ -3358,6 +3394,7 @@ mod test {
         s.state = State::Closing;
         s.send_next = LOCAL_SEQ + 1 + 1;
         s.recv_read = REMOTE_SEQ + 1 + 1;
+        s.recv_adv += 1;
         s.timer = Timer::Retransmit {
             expires_at: Instant::from_millis(1000),
         };
@@ -3368,6 +3405,7 @@ mod test {
         let mut s = socket_fin_wait_2();
         s.state = State::TimeWait;
         s.recv_read = REMOTE_SEQ + 1 + 1;
+        s.recv_adv += 1;
         if from_closing {
             s.recv_ack_sent = Some(REMOTE_SEQ + 1 + 1);
         }
@@ -3382,6 +3420,7 @@ mod test {
         s.state = State::CloseWait;
         s.recv_read = REMOTE_SEQ + 1 + 1;
         s.recv_ack_sent = Some(REMOTE_SEQ + 1 + 1);
+        s.recv_adv += 1;
         s
     }
 
@@ -4205,7 +4244,6 @@ mod test {
 
         let mut s2 = socket_close_wait();
         s2.recv_ack_sent = Some(REMOTE_SEQ + 1 + 6 + 1);
-        s2.recv_window_sent = 58;
         sanity!(s, s2);
     }
 
@@ -5263,6 +5301,7 @@ mod test {
         s.send_sack = true;
         s.recv_read = TcpSeqNumber(-4);
         s.recv_ack_sent = Some(TcpSeqNumber(-4));
+        s.recv_adv = TcpSeqNumber(-4) + 64;
 
         // Create first island - [-2..2) - and SACK reports it
         send!(
@@ -5315,8 +5354,8 @@ mod test {
         s.rx_buffer = SocketBuffer::new(vec![0; 262143].leak());
         s.assembler = Assembler::new();
         s.send_window_shift = Some(0);
-        s.recv_window_sent = 65535;
         s.recv_window_shift = 2;
+        s.recv_adv = REMOTE_SEQ + 1 + (65535 << 2);
 
         // Create a TCP segment that will mostly fill an IP frame.
         let mut segment: Vec<u8> = Vec::with_capacity(1400);
@@ -5936,6 +5975,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
                 ..RECV_TEMPL
             })
         );
@@ -5955,6 +5995,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
                 ..RECV_TEMPL
             })
         );
@@ -6625,6 +6666,7 @@ mod test {
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
+                window_len: 61,
                 ..RECV_TEMPL
             }]
         );
@@ -8638,12 +8680,17 @@ mod test {
                 ..SEND_TEMPL
             }
         );
+        // The last byte isn't accepted. The one free byte isn't advertised either
+        // (receiver SWS avoidance), so the window closes, and the ACK waits for
+        // the ACK delay.
+        recv_nothing!(s);
         recv!(
             s,
+            time 10,
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 65),
-                window_len: 1, // The last byte isn't accepted.
+                window_len: 0,
                 ..RECV_TEMPL
             })
         );
@@ -8715,6 +8762,276 @@ mod test {
         recv_nothing!(s);
     }
 
+    #[test]
+    fn test_syn_window_is_not_scaled() {
+        // The SYN|ACK advertises 65535 octets, not scaled (RFC 7323 2.2), though
+        // the scale is 1 afterwards. Data past that edge is not in the window, and
+        // must not be kept: it doesn't fit the free buffer.
+        let mut s = socket_syn_received_with_buffer_sizes(64, 65536);
+        s.send_window_shift = Some(0);
+        assert_eq!(s.recv_window_shift, 1);
+        recv(&mut s, Instant::ZERO, 1, |_, repr| {
+            assert_eq!(repr.control, TcpControl::Syn);
+            assert_eq!(repr.window_len, 65535);
+        });
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 65535,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0xaa; 100],
+                ..SEND_TEMPL
+            }
+        );
+        assert!(s.assembler.is_empty());
+
+        // The remote fills the window it was given.
+        let chunk = [0x11; 1000];
+        for offset in (0..65535).step_by(1000) {
+            let len = (65535 - offset).min(1000);
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &chunk[..len],
+                    ..SEND_TEMPL
+                }
+            );
+        }
+        assert_eq!(s.rx_buffer.len(), 65535);
+        assert!(s.assembler.is_empty());
+    }
+
+    #[test]
+    fn test_window_edge_never_retracts() {
+        // The window scale rounds the window down, so after an odd number of
+        // octets the advertised right edge moves left. Data that was in window for
+        // an earlier ACK must still be accepted (RFC 7323 2.4).
+        let mut s = socket_established_with_buffer_sizes(64, 100_000);
+        s.send_window_shift = Some(0);
+        assert_eq!(s.recv_window_shift, 1);
+        assert_eq!(s.recv_adv, REMOTE_SEQ + 1 + 100_000);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 1],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 1),
+                window_len: 49999,
+                ..RECV_TEMPL
+            }]
+        );
+
+        // The last 1000 octets of the first window, one past the edge just sent.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 99_000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 1000],
+                ..SEND_TEMPL
+            }
+        );
+        let chunk = [0; 1000];
+        for offset in (1..99_000).step_by(1000) {
+            let len = (99_000 - offset).min(1000);
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &chunk[..len],
+                    ..SEND_TEMPL
+                }
+            );
+        }
+        assert_eq!(s.rx_buffer.len(), 100_000);
+    }
+
+    #[test]
+    fn test_fin_at_retracted_edge() {
+        // A FIN right at the edge of the first window, after the window scale
+        // rounding moved the advertised edge one octet left. The data before it
+        // is all kept, and the FIN with it.
+        let mut s = socket_established_with_buffer_sizes(64, 65536);
+        s.send_window_shift = Some(0);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 1],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 1),
+                window_len: 32767,
+                ..RECV_TEMPL
+            }]
+        );
+        let chunk = [0; 1000];
+        for offset in (1..65000).step_by(1000) {
+            let len = (65000 - offset).min(1000);
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &chunk[..len],
+                    ..SEND_TEMPL
+                }
+            );
+        }
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1 + 65000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &chunk[..536],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.rx_buffer.len(), 65536);
+        assert_eq!(s.state, State::CloseWait);
+        recv(&mut s, Instant::ZERO, 1, |_, repr| {
+            assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1 + 65536 + 1));
+        });
+    }
+
+    #[test]
+    fn test_receiver_sws_avoidance() {
+        // RFC 9293 3.8.6.2.2: the right edge only moves once the free buffer can
+        // move it by min(RCV.BUFF / 2, MSS), 32 octets here.
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0; 64],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 64),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+
+        // One free octet: no window update, and the window on other segments stays
+        // closed too.
+        assert_eq!(s.view().recv_slice(&mut [0; 1]), Ok(1));
+        recv_nothing!(s);
+        s.view().send_slice(b"x").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 64),
+                window_len: 0,
+                payload: &b"x"[..],
+                ..RECV_TEMPL
+            }]
+        );
+
+        assert_eq!(s.view().recv_slice(&mut [0; 30]), Ok(30));
+        recv_nothing!(s);
+
+        // 32 free octets open the window.
+        assert_eq!(s.view().recv_slice(&mut [0; 1]), Ok(1));
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 64),
+                window_len: 32,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_syn_sent_syn_before_our_syn_left() {
+        // Our SYN was held back, and the remote's SYN arrives first, a
+        // simultaneous open. Nothing was received and nothing advertised, so
+        // the SYN|ACK can still advertise the whole buffer.
+        let mut s = socket_syn_sent();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::SynReceived);
+        assert_eq!(s.recv_adv, REMOTE_SEQ + 1);
+        recv(&mut s, Instant::ZERO, 1, |_, repr| {
+            assert_eq!(repr.control, TcpControl::Syn);
+            assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1));
+            assert_eq!(repr.window_len, 64);
+        });
+        assert_eq!(s.recv_adv, REMOTE_SEQ + 1 + 64);
+    }
+
+    #[test]
+    fn test_syn_sent_zero_rx_buffer() {
+        // A send-only socket: no receive buffer at all.
+        let mut s = socket_syn_sent_with_buffer_sizes(64, 0);
+        recv(&mut s, Instant::ZERO, 1, |_, repr| {
+            assert_eq!(repr.control, TcpControl::Syn);
+            assert_eq!(repr.window_len, 0);
+        });
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
     // =========================================================================================//
     // Tests for flow control.
     // =========================================================================================//
@@ -8766,9 +9083,7 @@ mod test {
 
     #[test]
     fn test_zero_window_ack() {
-        let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
-        s.assembler = Assembler::new();
+        let mut s = socket_established_with_buffer_sizes(64, 6);
         send!(
             s,
             TcpRepr {
@@ -8809,9 +9124,7 @@ mod test {
 
     #[test]
     fn test_zero_window_ack_not_rate_limited() {
-        let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
-        s.assembler = Assembler::new();
+        let mut s = socket_established_with_buffer_sizes(64, 6);
         send!(
             s,
             TcpRepr {
@@ -8876,9 +9189,7 @@ mod test {
 
     #[test]
     fn test_zero_window_fin() {
-        let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
-        s.assembler = Assembler::new();
+        let mut s = socket_established_with_buffer_sizes(64, 6);
         s.ack_delay = None;
 
         send!(
@@ -8927,9 +9238,7 @@ mod test {
 
     #[test]
     fn test_zero_window_ack_on_window_growth() {
-        let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
-        s.assembler = Assembler::new();
+        let mut s = socket_established_with_buffer_sizes(64, 6);
         send!(
             s,
             TcpRepr {
@@ -8993,47 +9302,42 @@ mod test {
 
         recv_nothing!(s, time 5);
 
+        // Two free octets don't open the window: receiver SWS avoidance waits for
+        // min(RCV.BUFF / 2, MSS), 3 here.
         s.view()
             .recv(|buffer| {
                 assert_eq!(&buffer[..2], b"ab");
                 (2, ())
             })
             .unwrap();
-        recv!(
-            s,
-            time 5,
-            Ok(TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1 + 6),
-                window_len: 2,
-                ..RECV_TEMPL
-            })
-        );
+        recv_nothing!(s, time 5);
 
+        // Three do, and the window update goes out before the ACK delay.
         s.view()
             .recv(|buffer| {
                 assert_eq!(&buffer[..1], b"c");
                 (1, ())
             })
             .unwrap();
-        recv_nothing!(s, time 5);
-
-        s.view()
-            .recv(|buffer| {
-                assert_eq!(&buffer[..1], b"d");
-                (1, ())
-            })
-            .unwrap();
         recv!(
             s,
             time 5,
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 6),
-                window_len: 4,
+                window_len: 3,
                 ..RECV_TEMPL
             })
         );
+
+        // One more doesn't move the edge again.
+        s.view()
+            .recv(|buffer| {
+                assert_eq!(&buffer[..1], b"d");
+                (1, ())
+            })
+            .unwrap();
+        recv_nothing!(s, time 5);
     }
 
     #[test]
@@ -9068,9 +9372,7 @@ mod test {
 
     #[test]
     fn test_announce_window_after_read() {
-        let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
-        s.assembler = Assembler::new();
+        let mut s = socket_established_with_buffer_sizes(64, 6);
         send!(
             s,
             TcpRepr {
@@ -9089,8 +9391,8 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        // Test that `dispatch` updates `recv_window_sent`
-        assert_eq!(s.recv_window_sent, s.rx_buffer.window() as u16);
+        // Test that `dispatch` records the edge it advertised.
+        assert_eq!(s.recv_adv, s.recv_next() + s.rx_buffer.window());
         s.view().recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
         recv!(
@@ -9102,8 +9404,8 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        assert_eq!(s.recv_window_sent, s.rx_buffer.window() as u16);
-        // Provoke immediate ACK to test that `process` updates `recv_window_sent`
+        assert_eq!(s.recv_adv, s.recv_next() + s.rx_buffer.window());
+        // Provoke an immediate ACK, which keeps the edge.
         send!(
             s,
             TcpRepr {
@@ -9140,7 +9442,7 @@ mod test {
                 ..RECV_TEMPL
             })
         );
-        assert_eq!(s.recv_window_sent, s.rx_buffer.window() as u16);
+        assert_eq!(s.recv_adv, s.recv_next() + s.rx_buffer.window());
         s.view().recv(|buffer| (buffer.len(), ())).unwrap();
         assert!(s.window_to_update());
     }
@@ -10206,9 +10508,7 @@ mod test {
 
     #[test]
     fn test_buffer_wraparound_rx() {
-        let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
-        s.assembler = Assembler::new();
+        let mut s = socket_established_with_buffer_sizes(64, 6);
         send!(
             s,
             TcpRepr {
@@ -10224,6 +10524,16 @@ mod test {
                 (buffer.len(), ())
             })
             .unwrap();
+        // The remote may only fill the whole buffer once it is told it is free.
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 3),
+                window_len: 6,
+                ..RECV_TEMPL
+            }]
+        );
         send!(
             s,
             TcpRepr {
@@ -10575,7 +10885,8 @@ mod test {
             }
         );
 
-        // Reading the data off the buffer should cause a window update.
+        // Reading 3 octets off the buffer doesn't move the window edge (receiver
+        // SWS avoidance).
         s.view()
             .recv(|data| {
                 assert_eq!(data, b"abc");
@@ -10583,13 +10894,14 @@ mod test {
             })
             .unwrap();
 
-        // However, no ACK or window update is immediately sent.
+        // No ACK is immediately sent.
         recv_nothing!(s);
 
         // After 10ms, it is sent.
         recv!(s, time 11, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 3),
+            window_len: 61,
             ..RECV_TEMPL
         }));
     }
@@ -10624,6 +10936,7 @@ mod test {
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
+                window_len: 61,
                 payload: &b"xyz"[..],
                 ..RECV_TEMPL
             })
@@ -10904,9 +11217,7 @@ mod test {
 
     #[test]
     fn test_doesnt_accept_wrong_port() {
-        let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
-        s.assembler = Assembler::new();
+        let s = socket_established_with_buffer_sizes(64, 6);
 
         let tcp_repr = TcpRepr {
             seq_number: REMOTE_SEQ + 1,
@@ -11249,6 +11560,9 @@ mod test {
     fn setup_rfc2018_cases_with_rx_buffer(rx_len: usize) -> (TestSocket, Vec<u8>) {
         let mut s = socket_established_with_buffer_sizes(4000, rx_len);
         s.send_sack = true;
+        // The segments are the remote's MSS, so each one read moves the window
+        // edge (receiver SWS avoidance).
+        s.send_mss = 500;
 
         // The window advertised while one 500 byte segment sits undrained.
         let win = (rx_len - 500) as u16;
@@ -11287,7 +11601,7 @@ mod test {
                 })
                 .unwrap();
         }
-        assert_eq!(s.recv_window_sent, win);
+        assert_eq!(s.recv_window_left(), win as usize);
         (s, segment)
     }
 
@@ -12871,5 +13185,78 @@ mod stack_test {
         let mut data = [0; 9];
         assert_eq!(stack.tcp_socket(h).recv_slice(&mut data), Ok(9));
         assert_eq!(&data, b"abcxyzxyz");
+    }
+
+    /// The remote's SYN arrives while our SYN is still held back by a device
+    /// with no room: a simultaneous open before anything was advertised. Nothing
+    /// panics, and the SYN|ACK goes out once the device has room.
+    #[test]
+    fn test_stack_simultaneous_open_syn_held_back() {
+        let (mut stack, driver) = stack();
+        driver.room.set(Some(0));
+        let h = stack
+            .add_tcp_socket_with_bufs(vec![0; 1024].leak(), vec![0; 1024].leak())
+            .unwrap();
+        stack
+            .tcp_socket(h)
+            .connect((REMOTE_ADDR, REMOTE_PORT), LOCAL_PORT)
+            .unwrap();
+        stack.poll(Instant::from_millis(0));
+        assert!(driver.tx.borrow().is_empty());
+        assert_eq!(stack.tcp_socket(h).state(), State::SynSent);
+
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ..SEND_TEMPL
+        }));
+        stack.poll(Instant::from_millis(1));
+        assert_eq!(stack.tcp_socket(h).state(), State::SynReceived);
+        assert!(driver.tx.borrow().is_empty());
+
+        driver.room.set(None);
+        stack.poll(Instant::from_millis(2));
+        let mut frame = driver.tx.borrow_mut().remove(0);
+        parse_tx(&mut frame, |tcp| {
+            assert!(tcp.syn() && tcp.ack());
+            assert_eq!(tcp.seq_number(), LOCAL_SEQ);
+            assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1);
+            assert_eq!(tcp.window_len(), 1024);
+        });
+    }
+
+    /// A socket with no receive buffer: its SYN advertises a zero window, and the
+    /// handshake completes with nothing ever fitting.
+    #[test]
+    fn test_stack_zero_rx_buffer() {
+        let (mut stack, driver) = stack();
+        let h = stack
+            .add_tcp_socket_with_bufs(vec![0; 0].leak(), vec![0; 1024].leak())
+            .unwrap();
+        stack
+            .tcp_socket(h)
+            .connect((REMOTE_ADDR, REMOTE_PORT), LOCAL_PORT)
+            .unwrap();
+        stack.poll(Instant::from_millis(0));
+        let mut frame = driver.tx.borrow_mut().remove(0);
+        parse_tx(&mut frame, |tcp| {
+            assert!(tcp.syn() && !tcp.ack());
+            assert_eq!(tcp.window_len(), 0);
+        });
+
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        }));
+        stack.poll(Instant::from_millis(1));
+        assert_eq!(stack.tcp_socket(h).state(), State::Established);
+        let mut frame = driver.tx.borrow_mut().remove(0);
+        parse_tx(&mut frame, |tcp| {
+            assert!(tcp.ack() && !tcp.syn());
+            assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1);
+            assert_eq!(tcp.window_len(), 0);
+        });
     }
 }

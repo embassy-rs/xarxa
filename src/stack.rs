@@ -925,6 +925,11 @@ impl<'d> Stack<'d> {
     /// Without it, or to use your own buffers, see
     /// [`add_tcp_socket_with_bufs`](Self::add_tcp_socket_with_bufs).
     ///
+    /// The remote only learns about free room in the receive buffer in steps of
+    /// half the buffer, or of one MSS if that is smaller. So read data as it
+    /// arrives. An application that waits for more than half the receive buffer
+    /// to fill before reading any of it can stall the connection.
+    ///
     /// # Panics
     /// Panics if the receive buffer is larger than 1 GiB.
     ///

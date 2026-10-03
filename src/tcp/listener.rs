@@ -238,6 +238,8 @@ impl AcceptToken {
         s.binding = self.binding;
         s.send_unack = TcpSocketState::random_seq_no(rand);
         s.recv_read = syn.recv_next;
+        // No window advertised yet: the SYN|ACK does that.
+        s.recv_adv = syn.recv_next;
         s.send_next = s.send_unack;
         #[cfg(feature = "tcp-sack")]
         {

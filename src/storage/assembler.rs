@@ -282,6 +282,31 @@ impl Assembler {
         Ok(self.remove_front())
     }
 
+    /// Remove all data at or past `offset`.
+    pub fn truncate(&mut self, offset: usize) {
+        let mut start = 0;
+        for i in 0..self.contigs.len() {
+            let contig = self.contigs[i];
+            if !contig.has_data() {
+                return;
+            }
+            let data_start = start + contig.hole_size;
+            if data_start >= offset {
+                // This contig and all after it are past `offset`.
+                self.contigs[i..].fill(Contig::empty());
+                return;
+            }
+            let data_end = data_start + contig.data_size;
+            if data_end > offset {
+                // The contig straddles `offset`: keep its front.
+                self.contigs[i].data_size = offset - data_start;
+                self.contigs[i + 1..].fill(Contig::empty());
+                return;
+            }
+            start = data_end;
+        }
+    }
+
     /// Iterate over all of the contiguous data ranges.
     ///
     /// Returns `(offset, offset + size)` tuples for each contiguous data range, where
@@ -610,6 +635,72 @@ mod test {
     }
 
     // Test against an obviously-correct but inefficient bitmap impl.
+    #[test]
+    fn test_truncate() {
+        let mut assr = contigs![(4, 8)];
+        assr.truncate(100);
+        assert_eq!(assr, contigs![(4, 8)]);
+        assr.truncate(6);
+        assert_eq!(assr, contigs![(4, 2)]);
+        assr.truncate(4);
+        assert_eq!(assr, contigs![]);
+
+        let mut assr = contigs![(0, 4), (4, 4)];
+        assr.truncate(10);
+        assert_eq!(assr, contigs![(0, 4), (4, 2)]);
+        assr.truncate(8);
+        assert_eq!(assr, contigs![(0, 4)]);
+        assr.truncate(6);
+        assert_eq!(assr, contigs![(0, 4)]);
+        assr.truncate(2);
+        assert_eq!(assr, contigs![(0, 2)]);
+        assr.truncate(0);
+        assert_eq!(assr, contigs![]);
+    }
+
+    #[test]
+    fn test_truncate_random() {
+        use rand::Rng;
+
+        const MAX_INDEX: usize = 64;
+
+        for _ in 0..1000 {
+            let mut assr = Assembler::new();
+            let mut map = [false; MAX_INDEX];
+            for _ in 0..ASSEMBLER_MAX_SEGMENT_COUNT {
+                let offset = rand::thread_rng().gen_range(0..MAX_INDEX - 8);
+                let size = rand::thread_rng().gen_range(1..=8);
+                if assr.add(offset, size).is_ok() {
+                    map[offset..][..size].fill(true);
+                }
+            }
+
+            let offset = rand::thread_rng().gen_range(0..MAX_INDEX);
+            assr.truncate(offset);
+            map[offset..].fill(false);
+
+            let mut contigs = vec![];
+            let mut hole = 0;
+            let mut data = 0;
+            for b in map {
+                if b {
+                    data += 1;
+                } else {
+                    if data != 0 {
+                        contigs.push((hole, data));
+                        hole = 0;
+                        data = 0;
+                    }
+                    hole += 1;
+                }
+            }
+            if data != 0 {
+                contigs.push((hole, data));
+            }
+            assert_eq!(assr, Assembler::from(contigs));
+        }
+    }
+
     #[test]
     fn test_random() {
         use rand::Rng;

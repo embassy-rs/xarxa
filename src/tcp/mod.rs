@@ -492,7 +492,10 @@ pub(crate) struct TcpSocketState<'d> {
     rtte: RttEstimator,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'d>,
-    rx_fin_received: bool,
+    /// The sequence number of the remote's FIN, once one arrived in the window,
+    /// in order or not. The stream ends there: nothing past it is kept. It is
+    /// taken once the data before it is all in, which moves RCV.NXT past it.
+    rx_fin_seq: Option<TcpSeqNumber>,
     tx_buffer: SocketBuffer<'d>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
@@ -653,7 +656,7 @@ impl<'d> TcpSocketState<'d> {
             assembler: Assembler::new(),
             tx_buffer,
             rx_buffer,
-            rx_fin_received: false,
+            rx_fin_seq: None,
             timeout: None,
             keep_alive: None,
             hop_limit: None,
@@ -755,7 +758,11 @@ impl<'d> TcpSocketState<'d> {
     fn recv_fin(&mut self) {
         self.recv_read += 1;
         self.recv_adv += 1;
-        self.rx_fin_received = true;
+    }
+
+    /// Whether the remote's FIN was taken: the receive half is closed.
+    fn rx_fin_received(&self) -> bool {
+        self.rx_fin_seq.is_some_and(|fin_seq| fin_seq < self.recv_next())
     }
 
     /// Whether the socket is open: it processes incoming and dispatches
@@ -781,7 +788,7 @@ impl<'d> TcpSocketState<'d> {
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
         self.rx_buffer.clear();
-        self.rx_fin_received = false;
+        self.rx_fin_seq = None;
         self.tuple = None;
         #[cfg(feature = "icmp-errors")]
         {
@@ -1120,14 +1127,21 @@ impl<'d> TcpSocketState<'d> {
 
         let window_start = self.recv_next();
         let window_end = self.recv_adv.max(window_start);
+        // The segment's sequence space counts its SYN and FIN (SEG.LEN). The FIN
+        // comes after the payload.
         let segment_start = repr.seq_number;
-        let segment_end = repr.seq_number + repr.payload.len();
+        let segment_end = repr.seq_number + repr.segment_len();
+        let payload_end = repr.seq_number + repr.payload.len();
 
         let (payload, payload_offset) = match self.state {
             // In the SYN-SENT state, we have not yet synchronized with the remote end.
             State::SynSent => (&[][..], 0),
             _ => {
                 // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
+                //
+                // A FIN takes no buffer space, so it may sit right at the right edge
+                // of the window, also when the window is zero.
+                let fin_at_edge = repr.control == TcpControl::Fin && segment_end - 1 == window_end;
                 let segment_in_window = match (segment_start == segment_end, window_start == window_end) {
                     (true, _) if segment_end == window_start - 1 => {
                         debug!("received a keep-alive or window probe packet, will send an ACK");
@@ -1150,12 +1164,16 @@ impl<'d> TcpSocketState<'d> {
                         }
                     }
                     (false, true) => {
-                        debug!("non-zero-length segment with zero receive window, will only send an ACK");
-                        false
+                        if fin_at_edge && repr.payload.is_empty() {
+                            true
+                        } else {
+                            debug!("non-zero-length segment with zero receive window, will only send an ACK");
+                            false
+                        }
                     }
                     (false, false) => {
                         if (window_start <= segment_start && segment_start < window_end)
-                            || (window_start < segment_end && segment_end <= window_end)
+                            || (window_start < segment_end && (segment_end <= window_end || fin_at_edge))
                         {
                             true
                         } else {
@@ -1169,11 +1187,27 @@ impl<'d> TcpSocketState<'d> {
                 };
 
                 if segment_in_window {
-                    let overlap_start = window_start.max(segment_start);
-                    let overlap_end = window_end.min(segment_end);
+                    // Record the remote's FIN, unless it is old or was cut off at the
+                    // right edge of the window. One past an earlier FIN is ignored,
+                    // and one before it moves the end of the stream there.
+                    if repr.control == TcpControl::Fin
+                        && window_start <= payload_end
+                        && payload_end <= window_end
+                        && self.rx_fin_seq.is_none_or(|fin_seq| payload_end < fin_seq)
+                    {
+                        trace!("received FIN at {}", payload_end);
+                        self.rx_fin_seq = Some(payload_end);
+                        // Out-of-order data past the FIN is not part of the stream.
+                        self.assembler.truncate(payload_end - window_start);
+                    }
 
-                    // the checks done above imply this.
-                    debug_assert!(overlap_start <= overlap_end);
+                    // Trim the payload to the window, and to the end of the stream.
+                    let mut data_end = window_end.min(payload_end);
+                    if let Some(fin_seq) = self.rx_fin_seq {
+                        data_end = data_end.min(fin_seq);
+                    }
+                    let overlap_start = window_start.max(segment_start);
+                    let overlap_end = data_end.max(overlap_start);
 
                     (
                         &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
@@ -1215,7 +1249,7 @@ impl<'d> TcpSocketState<'d> {
                     // One per second is ample for a restarted peer to complete
                     // the challenge exchange, since it retransmits its SYN on
                     // its own timer.
-                    if !repr.payload.is_empty()
+                    if repr.segment_len() != 0
                         && matches!(repr.control, TcpControl::None | TcpControl::Psh | TcpControl::Fin)
                     {
                         self.owe_ack();
@@ -1256,17 +1290,10 @@ impl<'d> TcpSocketState<'d> {
             }
         }
 
-        // Disregard control flags we don't care about or shouldn't act on yet.
-        let mut control = repr.control;
-        control = control.quash_psh();
-
-        // If a FIN is received at the end of the current segment, but
-        // we have a hole in the assembler before the current segment, disregard this FIN.
-        if control == TcpControl::Fin && window_start < segment_start {
-            trace!(
-                "ignoring FIN because we don't have full data yet. window_start={} segment_start={}",
-                window_start, segment_start
-            );
+        // Disregard control flags we don't care about or shouldn't act on yet. The
+        // FIN was recorded above, and is taken below, once the data before it is in.
+        let mut control = repr.control.quash_psh();
+        if control == TcpControl::Fin {
             control = TcpControl::None;
         }
 
@@ -1283,14 +1310,6 @@ impl<'d> TcpSocketState<'d> {
             // ACK packets in the SYN-RECEIVED state change it to ESTABLISHED.
             (State::SynReceived, TcpControl::None) => {
                 self.set_state(State::Established);
-            }
-
-            // FIN packets in the SYN-RECEIVED state change it to CLOSE-WAIT.
-            // It's not obvious from RFC 793 that this is permitted, but
-            // 7th and 8th steps in the "SEGMENT ARRIVES" event describe this behavior.
-            (State::SynReceived, TcpControl::Fin) => {
-                self.recv_fin();
-                self.set_state(State::CloseWait);
             }
 
             // SYN|ACK packets in the SYN-SENT state change it to ESTABLISHED.
@@ -1345,12 +1364,6 @@ impl<'d> TcpSocketState<'d> {
 
             (State::Established, TcpControl::None) => {}
 
-            // FIN packets in ESTABLISHED state indicate the remote side has closed.
-            (State::Established, TcpControl::Fin) => {
-                self.recv_fin();
-                self.set_state(State::CloseWait);
-            }
-
             // ACK packets in FIN-WAIT-1 state change it to FIN-WAIT-2, if we've already
             // sent everything in the transmit buffer. If not, they reset the retransmit timer.
             (State::FinWait1, TcpControl::None) => {
@@ -1359,26 +1372,7 @@ impl<'d> TcpSocketState<'d> {
                 }
             }
 
-            // FIN packets in FIN-WAIT-1 state change it to CLOSING, or to TIME-WAIT
-            // if they also acknowledge our FIN.
-            (State::FinWait1, TcpControl::Fin) => {
-                self.recv_fin();
-                if ack_of_fin {
-                    self.set_state(State::TimeWait);
-                    self.timer.set_for_close(now);
-                } else {
-                    self.set_state(State::Closing);
-                }
-            }
-
             (State::FinWait2, TcpControl::None) => {}
-
-            // FIN packets in FIN-WAIT-2 state change it to TIME-WAIT.
-            (State::FinWait2, TcpControl::Fin) => {
-                self.recv_fin();
-                self.set_state(State::TimeWait);
-                self.timer.set_for_close(now);
-            }
 
             // ACK packets in CLOSING state change it to TIME-WAIT.
             (State::Closing, TcpControl::None) => {
@@ -1462,10 +1456,11 @@ impl<'d> TcpSocketState<'d> {
             // TODO: When flow control is implemented,
             // refractor the following block within that implementation
 
-            // Duplicate ACK if payload empty and ACK doesn't move send window ->
-            // Increment duplicate ACK count, notify congestion controller and
-            // set for retransmit if we just received the third duplicate ACK
-            if repr.payload.is_empty()
+            // Duplicate ACK if it takes no sequence space (no payload, SYN or FIN)
+            // and doesn't move the send window (RFC 5681 2) -> Increment duplicate
+            // ACK count, notify congestion controller and set for retransmit if we
+            // just received the third duplicate ACK
+            if repr.segment_len() == 0
                 && ack_number == self.send_unack
                 && ack_number < self.send_next
                 && !is_window_update
@@ -1554,11 +1549,34 @@ impl<'d> TcpSocketState<'d> {
             self.timer.set_for_idle(now, self.keep_alive);
         }
 
-        let payload_len = payload.len();
-        if payload_len == 0 {
-            return ProcessResult::None;
+        if !payload.is_empty() {
+            self.process_payload(now, repr.seq_number, payload, payload_offset);
         }
 
+        // The remote's FIN, once the data before it is all in.
+        if self.rx_fin_seq == Some(self.recv_next()) {
+            self.recv_fin();
+            match self.state {
+                State::Established => self.set_state(State::CloseWait),
+                // Our FIN is not acknowledged yet. If it was, the ACK moved us to
+                // FIN-WAIT-2 above.
+                State::FinWait1 => self.set_state(State::Closing),
+                State::FinWait2 => {
+                    self.set_state(State::TimeWait);
+                    self.timer.set_for_close(now);
+                }
+                _ => {}
+            }
+        }
+        ProcessResult::None
+    }
+
+    /// Place an in-window payload, at `payload_offset` from RCV.NXT, into the
+    /// receive buffer, and ask for the ACKs it calls for.
+    fn process_payload(&mut self, now: Instant, seq_number: TcpSeqNumber, payload: &[u8], payload_offset: usize) {
+        #[cfg(not(feature = "tcp-sack"))]
+        let _ = seq_number;
+        let payload_len = payload.len();
         let assembler_was_empty = self.assembler.is_empty();
 
         // Try adding payload octets to the assembler.
@@ -1572,13 +1590,13 @@ impl<'d> TcpSocketState<'d> {
             // It restates the current ACK and the held SACK ranges, giving the
             // sender its loss signal instead of leaving it to the RTO.
             self.owe_ack();
-            return ProcessResult::None;
+            return;
         };
 
         // assembler accepted segment, track sequence number for SACK generation
         #[cfg(feature = "tcp-sack")]
         {
-            self.local_rx_last_seq = Some(repr.seq_number);
+            self.local_rx_last_seq = Some(seq_number);
         }
 
         // Place payload octets into the buffer.
@@ -1648,7 +1666,6 @@ impl<'d> TcpSocketState<'d> {
         } else {
             self.acks_owed = self.acks_owed.min(1);
         }
-        ProcessResult::None
     }
 
     /// Whether the connection timeout applies right now: while a handshake is in
@@ -2951,7 +2968,7 @@ impl<'d> TcpSocket<'_, 'd> {
         // is fully open we must not dequeue any data, as it may be overwritten by e.g.
         // another (stale) SYN. (We do not support TCP Fast Open.)
         if !self.may_recv() {
-            if self.inner_mut().rx_fin_received {
+            if self.inner().rx_fin_received() {
                 return Err(RecvError::Finished);
             }
             return Err(RecvError::InvalidState);
@@ -3443,6 +3460,7 @@ mod test {
         s.send_max = LOCAL_SEQ + 1 + 1;
         s.recv_read = REMOTE_SEQ + 1 + 1;
         s.recv_adv += 1;
+        s.rx_fin_seq = Some(REMOTE_SEQ + 1);
         s.timer = Timer::Retransmit {
             expires_at: Instant::from_millis(1000),
         };
@@ -3454,6 +3472,7 @@ mod test {
         s.state = State::TimeWait;
         s.recv_read = REMOTE_SEQ + 1 + 1;
         s.recv_adv += 1;
+        s.rx_fin_seq = Some(REMOTE_SEQ + 1);
         if from_closing {
             s.recv_ack_sent = Some(REMOTE_SEQ + 1 + 1);
         }
@@ -3469,6 +3488,7 @@ mod test {
         s.recv_read = REMOTE_SEQ + 1 + 1;
         s.recv_ack_sent = Some(REMOTE_SEQ + 1 + 1);
         s.recv_adv += 1;
+        s.rx_fin_seq = Some(REMOTE_SEQ + 1);
         s
     }
 
@@ -6609,6 +6629,7 @@ mod test {
             })
         );
         assert_eq!(s.state, State::Established);
+        // Filling the hole brings the data up to the FIN, which is taken then.
         send!(
             s,
             TcpRepr {
@@ -6622,12 +6643,198 @@ mod test {
             s,
             Ok(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1 + 6 + 6),
+                ack_number: Some(REMOTE_SEQ + 1 + 6 + 6 + 1),
                 window_len: 52,
                 ..RECV_TEMPL
             })
         );
+        assert_eq!(s.state, State::CloseWait);
+    }
+
+    #[test]
+    fn test_established_fin_trimmed_at_window_edge() {
+        // The remote sends past the window, and the FIN at the end is cut off
+        // with the data: it is not taken, and the stream doesn't end there.
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0x55; 70],
+                ..SEND_TEMPL
+            }
+        );
         assert_eq!(s.state, State::Established);
+        assert_eq!(s.rx_buffer.len(), 64);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 64),
+                window_len: 0,
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.view().recv_slice(&mut [0; 128]), Ok(64));
+        assert_eq!(s.view().recv_slice(&mut [0; 128]), Ok(0));
+    }
+
+    #[test]
+    fn test_established_fin_out_of_order() {
+        // The last segment, with the FIN, arrives before the one before it. The
+        // FIN is remembered, and taken once the hole is filled.
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1 + 4,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"efgh"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcd"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::CloseWait);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 8 + 1),
+                window_len: 56,
+                ..RECV_TEMPL
+            }]
+        );
+        let mut buf = [0; 64];
+        assert_eq!(s.view().recv_slice(&mut buf), Ok(8));
+        assert_eq!(&buf[..8], b"abcdefgh");
+        assert_eq!(s.view().recv_slice(&mut buf), Err(RecvError::Finished));
+    }
+
+    #[test]
+    fn test_established_fin_with_old_data() {
+        // A retransmission of data already received, with a new FIN after it. It
+        // is acceptable, because of the FIN (RFC 9293 3.10.7.4, SEG.LEN counts it).
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abc"[..],
+                ..SEND_TEMPL
+            }
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abc"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::CloseWait);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 3 + 1),
+                window_len: 61,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_established_fin_before_ooo_data() {
+        // Out-of-order data with a FIN at its end, then the start of the stream
+        // with a FIN before that. The stream ends at the earlier FIN, and the data
+        // past it is dropped, not delivered or acknowledged.
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1 + 4,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"EFGHIJKLMNOP"[..],
+                ..SEND_TEMPL
+            }
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdefghijkl"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::CloseWait);
+        assert!(s.assembler.is_empty());
+        recv(&mut s, Instant::ZERO, 1, |_, repr| {
+            assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 1 + 12 + 1));
+        });
+        let mut buf = [0; 64];
+        assert_eq!(s.view().recv_slice(&mut buf), Ok(12));
+        assert_eq!(&buf[..12], b"abcdefghijkl");
+        assert_eq!(s.view().recv_slice(&mut buf), Err(RecvError::Finished));
+    }
+
+    #[test]
+    fn test_established_fin_is_not_a_duplicate_ack() {
+        // A segment with a FIN is not a duplicate ACK (RFC 5681 2), even with the
+        // same ACK and window as the two duplicates before it.
+        let mut s = socket_established();
+        s.view().send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..RECV_TEMPL
+            }]
+        );
+        for t in [20, 21] {
+            send!(
+                s,
+                time t,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    ..SEND_TEMPL
+                }
+            );
+        }
+        assert_eq!(s.dup_acks, 2);
+        send!(
+            s,
+            time 30,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::CloseWait);
+        assert_eq!(s.dup_acks, 0);
+        assert_ne!(s.timer, Timer::FastRetransmit);
     }
 
     #[test]
@@ -7170,6 +7377,84 @@ mod test {
         s.view().close();
         assert_eq!(s.state, State::LastAck);
         sanity!(s, socket_last_ack());
+    }
+
+    #[test]
+    fn test_retransmitted_fin_not_rate_limited() {
+        // The remote retransmits its FIN because our ACK of it was lost. Like a
+        // retransmission of data, it gets an ACK each time, outside the challenge
+        // ACK rate limit.
+        let mut s = socket_close_wait();
+        for t in [0, 100, 200] {
+            send!(
+                s,
+                time t,
+                TcpRepr {
+                    control: TcpControl::Fin,
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                time t,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 1),
+                    ..RECV_TEMPL
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn test_data_after_fin_is_dropped() {
+        // Data past the remote's FIN is not part of the stream: it is not stored,
+        // in CLOSE-WAIT, CLOSING or LAST-ACK (RFC 9293 3.10.7.4, seventh step).
+        let mut s = socket_close_wait();
+        let mut buf = [0; 16];
+        assert_eq!(s.view().recv_slice(&mut buf), Err(RecvError::Finished));
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"evil"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.rx_buffer.len(), 0);
+        assert_eq!(s.view().recv_slice(&mut buf), Err(RecvError::Finished));
+
+        let mut s = socket_closing();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"evil"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.rx_buffer.len(), 0);
+
+        // In LAST-ACK, with an ACK of data sent before our FIN.
+        let mut s = socket_last_ack();
+        let _ = s.tx_buffer.enqueue_slice(b"x");
+        s.send_next = LOCAL_SEQ + 1 + 1 + 1;
+        s.send_max = s.send_next;
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 1),
+                payload: &b"evil"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1 + 1);
+        assert_eq!(s.rx_buffer.len(), 0);
     }
 
     // =========================================================================================//

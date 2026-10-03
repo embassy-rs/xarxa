@@ -1,7 +1,7 @@
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{Align, Pool, Slot, ValidAlign, check_buf_capacity};
 use crate::driver::{PacketBuf, PacketMeta, RawPacketBuf};
@@ -40,6 +40,10 @@ where
 {
     /// `used[i]` is set while slot `i` is owned by a `PacketBuf`.
     used: [AtomicBool; COUNT],
+    /// Perf optimization:
+    /// - On free, store index in `next`.
+    /// - start scanning at `next` insfead of 0.
+    next: AtomicUsize,
     slots: [UnsafeCell<Slot<SIZE, ALIGN>>; COUNT],
 }
 
@@ -62,6 +66,7 @@ where
 
         Self {
             used: [const { AtomicBool::new(false) }; COUNT],
+            next: AtomicUsize::new(0),
             slots: [const {
                 UnsafeCell::new(Slot {
                     raw: MaybeUninit::zeroed(),
@@ -72,12 +77,12 @@ where
         }
     }
 
-    /// Claim a free slot: the first clear flag, set with a CAS.
+    /// Claim a free slot: the first clear flag from `next` on, set with a CAS.
     #[cfg(target_has_atomic = "8")]
     fn claim(&self) -> Option<usize> {
         // Acquire pairs with the Release in `free`: the previous owner's writes to
         // the slot are done before ours start.
-        self.used.iter().position(|used| {
+        self.scan(|used| {
             !used.load(Ordering::Relaxed)
                 && used
                     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -85,7 +90,7 @@ where
         })
     }
 
-    /// Claim a free slot: the first clear flag.
+    /// Claim a free slot: the first clear flag from `next` on.
     ///
     /// For targets with atomic load/store but no atomic read-modify-write (e.g.
     /// thumbv6m): the whole scan runs inside a critical section, so a plain load
@@ -95,10 +100,33 @@ where
     fn claim(&self) -> Option<usize> {
         critical_section::with(|_| {
             // Acquire pairs with the Release in `free`, as in the atomic version.
-            let index = self.used.iter().position(|used| !used.load(Ordering::Acquire))?;
+            let index = self.scan(|used| !used.load(Ordering::Acquire))?;
             self.used[index].store(true, Ordering::Relaxed);
             Some(index)
         })
+    }
+
+    /// The first slot from `next` on, wrapping around, whose flag `f` accepts.
+    #[inline(always)]
+    fn scan(&self, mut f: impl FnMut(&AtomicBool) -> bool) -> Option<usize> {
+        if COUNT == 0 {
+            return None;
+        }
+        // Relaxed: `next` is only a hint, the flags decide.
+        let start = self.next.load(Ordering::Relaxed);
+        let mut i = start;
+        loop {
+            if f(&self.used[i]) {
+                return Some(i);
+            }
+            i += 1;
+            if i == COUNT {
+                i = 0;
+            }
+            if i == start {
+                return None;
+            }
+        }
     }
 
     /// Give a buffer back to its pool. Called when it is dropped.
@@ -117,6 +145,7 @@ where
         // Release pairs with the Acquire in `claim`: our writes to the slot are
         // done before the next owner's start.
         pool.used[index].store(false, Ordering::Release);
+        pool.next.store(index, Ordering::Relaxed);
     }
 }
 

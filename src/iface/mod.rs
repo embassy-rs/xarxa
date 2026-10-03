@@ -855,7 +855,7 @@ impl IfaceState<'_> {
             return Err(Blocked::DeviceBusy);
         }
         #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
-        if !self.fragmenter.is_empty() {
+        if !self.fragmenter.is_idle() {
             return Err(Blocked::NoBuffer);
         }
         Ok(())

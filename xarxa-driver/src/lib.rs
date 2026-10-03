@@ -296,8 +296,9 @@ pub trait Driver {
     /// The driver holds the buffer until the hardware is done with it, then drops it.
     ///
     /// The buffer's [`PacketMeta`] is whatever the sending socket attached to the
-    /// packet (default for packets the stack generates itself). A driver that
-    /// supports transmit timestamping timestamps the frame if
+    /// packet (default for packets the stack generates itself). A packet sent in
+    /// fragments has it on its first fragment, and the default on the others. A
+    /// driver that supports transmit timestamping timestamps the frame if
     /// [`request_timestamp`](PacketMeta::request_timestamp) is set, and reports
     /// the result from [`poll_tx_timestamp`](Self::poll_tx_timestamp) tagged with the
     /// packet's [`id`](PacketMeta::id).

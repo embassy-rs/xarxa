@@ -14,23 +14,38 @@ use crate::rand::Rand;
 use crate::stack::{Blocked, StackInner};
 use crate::wire::*;
 
-pub(crate) struct Fragmenter {
-    /// The packet being fragmented: the IP packet, header included, or the
-    /// compressed 6LoWPAN packet. `None` when there is nothing to transmit.
-    pub buffer: Option<PacketBuf>,
-    /// The size of the packet.
-    pub packet_len: usize,
-    /// The amount of bytes that already have been transmitted.
-    pub sent_bytes: usize,
-
+/// The packet an interface is sending in fragments, if any.
+pub(crate) enum Fragmenter {
+    /// No packet.
+    Idle,
+    /// An IPv4 packet larger than the interface's IP MTU.
     #[cfg(feature = "ipv4-fragmentation")]
-    pub ipv4: Ipv4Fragmenter,
+    Ipv4(Ipv4Fragmenter),
+    /// A compressed 6LoWPAN packet larger than an IEEE 802.15.4 frame.
     #[cfg(feature = "sixlowpan-fragmentation")]
-    pub sixlowpan: SixlowpanFragmenter,
+    Sixlowpan(SixlowpanFragmenter),
+}
+
+#[cfg(feature = "ipv4-fragmentation")]
+pub(crate) struct Ipv4Fragmenter {
+    /// The IP packet, header included.
+    pub buffer: PacketBuf,
+    /// The destination address.
+    pub dst_addr: IpAddr,
+    /// The next hop the packet was routed to.
+    pub next_hop: IpAddr,
+    /// The identification every fragment carries.
+    pub ident: u16,
+    /// The offset of the next fragment in the packet's payload.
+    pub frag_offset: u16,
 }
 
 #[cfg(feature = "sixlowpan-fragmentation")]
 pub(crate) struct SixlowpanFragmenter {
+    /// The compressed packet, from the IPHC header on.
+    pub buffer: PacketBuf,
+    /// How much of it was sent.
+    pub sent_bytes: usize,
     /// The size of the whole IPv6 datagram.
     pub datagram_size: u16,
     /// The tag every fragment of the datagram carries.
@@ -49,106 +64,49 @@ pub(crate) struct SixlowpanFragmenter {
     pub ll_src_addr: Ieee802154Address,
 }
 
-#[cfg(feature = "sixlowpan-fragmentation")]
-impl SixlowpanFragmenter {
-    const fn new() -> Self {
-        Self {
-            datagram_size: 0,
-            datagram_tag: 0,
-            datagram_offset: 0,
-            frag1_size: 0,
-            fragn_size: 0,
-            header_diff: 0,
-            ll_dst_addr: Ieee802154Address::Absent,
-            ll_src_addr: Ieee802154Address::Absent,
-        }
-    }
-}
-
-#[cfg(feature = "ipv4-fragmentation")]
-pub(crate) struct Ipv4Fragmenter {
-    /// The destination address.
-    pub dst_addr: IpAddr,
-    /// The next hop the packet was routed to.
-    pub next_hop: IpAddr,
-    /// The offset of the next fragment.
-    pub frag_offset: u16,
-    /// The identifier of the stream.
-    pub ident: u16,
-}
-
 impl Fragmenter {
-    pub(crate) fn new() -> Self {
-        Self {
-            buffer: None,
-            packet_len: 0,
-            sent_bytes: 0,
-
-            #[cfg(feature = "ipv4-fragmentation")]
-            ipv4: Ipv4Fragmenter {
-                dst_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                frag_offset: 0,
-                ident: 0,
-            },
-            #[cfg(feature = "sixlowpan-fragmentation")]
-            sixlowpan: SixlowpanFragmenter::new(),
-        }
-    }
-
-    /// Return `true` when everything is transmitted.
+    /// Whether no packet is being sent in fragments.
     #[inline]
-    pub(crate) fn finished(&self) -> bool {
-        self.packet_len == self.sent_bytes
-    }
-
-    /// Returns `true` when there is nothing to transmit.
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.packet_len == 0
-    }
-
-    // Reset the buffer.
-    pub(crate) fn reset(&mut self) {
-        self.buffer = None;
-        self.packet_len = 0;
-        self.sent_bytes = 0;
-
-        #[cfg(feature = "ipv4-fragmentation")]
-        {
-            self.ipv4.dst_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-            self.ipv4.next_hop = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-            self.ipv4.frag_offset = 0;
-            self.ipv4.ident = 0;
-        }
-        #[cfg(feature = "sixlowpan-fragmentation")]
-        {
-            self.sixlowpan = SixlowpanFragmenter::new();
-        }
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self, Fragmenter::Idle)
     }
 }
 
 impl StackInner {
     /// Transmit the fragments still waiting in the interface's fragmenter.
     ///
-    /// An IEEE 802.15.4 interface's fragmenter holds a 6LoWPAN packet, any
-    /// other's an IPv4 packet.
-    ///
-    /// The error says why the rest of the fragments have to wait.
+    /// Fragments go out while the device has room for them and the pool has
+    /// buffers. The rest wait in the fragmenter for the next poll, and the error
+    /// says which of the two ran out.
     pub(crate) fn fragment_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
-        match iface.medium() {
-            #[cfg(feature = "medium-ieee802154")]
-            crate::iface::Medium::Ieee802154 => {
-                #[cfg(feature = "sixlowpan-fragmentation")]
-                self.sixlowpan_egress(iface)?;
-            }
-            #[allow(unreachable_patterns)]
-            _ => {
+        loop {
+            // The packet's metadata rides on its first fragment.
+            let first_meta = match &iface.fragmenter {
+                Fragmenter::Idle => return Ok(()),
                 #[cfg(feature = "ipv4-fragmentation")]
-                self.ipv4_egress(iface)?;
+                Fragmenter::Ipv4(frag) => (frag.frag_offset == 0).then(|| frag.buffer.meta()),
+                #[cfg(feature = "sixlowpan-fragmentation")]
+                Fragmenter::Sixlowpan(frag) => (frag.sent_bytes == 0).then(|| frag.buffer.meta()),
+            };
+            if !iface.can_transmit() {
+                trace!("fragmenter: device has no room, fragments wait");
+                return Err(Blocked::DeviceBusy);
+            }
+            let Some(mut tx_buffer) = self.pool.alloc() else {
+                trace!("fragmenter: no packet buffer, fragments wait");
+                return Err(Blocked::NoBuffer);
+            };
+            if let Some(meta) = first_meta {
+                tx_buffer.set_meta(meta);
+            }
+            match iface.fragmenter {
+                Fragmenter::Idle => {}
+                #[cfg(feature = "ipv4-fragmentation")]
+                Fragmenter::Ipv4(_) => self.dispatch_ipv4_frag(iface, tx_buffer),
+                #[cfg(feature = "sixlowpan-fragmentation")]
+                Fragmenter::Sixlowpan(_) => self.dispatch_ieee802154_frag(iface, tx_buffer),
             }
         }
-        Ok(())
     }
 }
 
@@ -183,126 +141,86 @@ impl StackInner {
     ) {
         debug!("start fragmentation");
 
-        let total_ip_len = buf.len();
-
-        let frag = &mut iface.fragmenter;
-        if !frag.is_empty() {
+        if !iface.fragmenter.is_idle() {
             debug!("Fragmentation buffer is busy. Dropping");
             return;
         }
 
-        let ipv4_id = self.next_ipv4_frag_ident();
         let ip_header_len = Ipv4Packet::new_unchecked(&mut buf).header_len() as usize;
         if iface.max_ipv4_fragment_size(ip_header_len) == 0 {
             debug!("MTU too small to fragment. Dropping");
             return;
         }
 
-        let frag = &mut iface.fragmenter;
-
-        // Save the routing decision for the other fragments.
-        frag.ipv4.dst_addr = dst_addr;
-        frag.ipv4.next_hop = next_hop;
-
-        // Save the total packet len (with the IP header).
-        frag.packet_len = total_ip_len;
-
-        // Only the header counts as sent: the fragments carry the payload.
-        frag.sent_bytes = ip_header_len;
-
-        frag.ipv4.ident = ipv4_id;
-        frag.ipv4.frag_offset = 0;
-
-        // Save the packet for the fragments to be copied out of.
-        frag.buffer = Some(buf);
+        // Keep the packet, and the routing decision for its fragments.
+        iface.fragmenter = Fragmenter::Ipv4(Ipv4Fragmenter {
+            buffer: buf,
+            dst_addr,
+            next_hop,
+            ident: self.next_ipv4_frag_ident(),
+            frag_offset: 0,
+        });
 
         // Transmit as many fragments as the device takes now. The rest go
         // out on the next polls, which also schedule the retry if the pool ran out.
-        let _ = self.ipv4_egress(iface);
+        let _ = self.fragment_egress(iface);
     }
 
-    /// Process fragments that still need to be sent for IPv4 packets.
-    ///
-    /// Fragments go out while the device has room for them and the pool has
-    /// buffers. The rest wait in the fragmenter for the next poll, and the error
-    /// says which of the two ran out.
-    pub(crate) fn ipv4_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
-        if iface.fragmenter.is_empty() {
-            return Ok(());
-        }
-
-        while !iface.fragmenter.finished() {
-            if !iface.can_transmit() {
-                trace!("fragmenter: device has no room, fragments wait");
-                return Err(Blocked::DeviceBusy);
-            }
-            if !self.dispatch_ipv4_frag(iface) {
-                return Err(Blocked::NoBuffer);
-            }
-        }
-
-        // Reset the buffer when we transmitted everything.
-        iface.fragmenter.reset();
-        Ok(())
-    }
-
-    /// Transmit the next fragment of the packet in the interface's fragmenter.
-    ///
-    /// Returns `false` if no packet buffer is free, leaving the fragmenter as it was.
-    fn dispatch_ipv4_frag(&mut self, iface: &mut IfaceState<'_>) -> bool {
-        // NOTE(unwrap): the fragmenter is not empty, checked by the caller.
-        let ip_header_len = Ipv4Packet::new_unchecked(unwrap!(iface.fragmenter.buffer.as_mut())).header_len() as usize;
-        let max_fragment_size = iface.max_ipv4_fragment_size(ip_header_len);
+    /// Fill `tx_buffer` with the next fragment of the IPv4 packet in the
+    /// interface's fragmenter, and transmit it.
+    fn dispatch_ipv4_frag(&mut self, iface: &mut IfaceState<'_>, mut tx_buffer: PacketBuf) {
+        let ip_mtu = iface.ip_mtu;
         let checksum_caps = iface.checksum_caps();
-
-        let frag = &mut iface.fragmenter;
-        let payload_len = (frag.packet_len - frag.sent_bytes).min(max_fragment_size);
-        let ip_len = payload_len + ip_header_len;
-
-        let more_frags = (frag.packet_len - frag.sent_bytes) != payload_len;
-
-        let Some(mut tx_buffer) = self.pool.alloc() else {
-            trace!("fragmenter: no packet buffer, fragments wait");
-            return false;
-        };
         tx_buffer.reserve(iface.ip_headroom);
-        tx_buffer.set_len(ip_len);
+        let Fragmenter::Ipv4(frag) = &mut iface.fragmenter else {
+            return;
+        };
 
-        // NOTE(unwrap): checked above.
-        let buffer = unwrap!(frag.buffer.as_ref());
+        let ip_header_len = Ipv4Packet::new_unchecked(&mut frag.buffer).header_len() as usize;
+        let remaining = frag.buffer.len() - ip_header_len - frag.frag_offset as usize;
+        let payload_len = remaining.min(max_ipv4_fragment_size(ip_mtu, ip_header_len));
+        let more_frags = remaining != payload_len;
+        let ip_len = ip_header_len + payload_len;
+
+        tx_buffer.set_len(ip_len);
         // Copy the IP header and the payload.
-        tx_buffer[..ip_header_len].copy_from_slice(&buffer[..ip_header_len]);
+        tx_buffer[..ip_header_len].copy_from_slice(&frag.buffer[..ip_header_len]);
         tx_buffer[ip_header_len..]
-            .copy_from_slice(&buffer[frag.ipv4.frag_offset as usize + ip_header_len..][..payload_len]);
+            .copy_from_slice(&frag.buffer[ip_header_len + frag.frag_offset as usize..][..payload_len]);
 
         let mut packet = Ipv4Packet::new_unchecked(&mut tx_buffer);
         packet.set_total_len(ip_len as u16);
-        packet.set_ident(frag.ipv4.ident);
+        packet.set_ident(frag.ident);
         packet.set_more_frags(more_frags);
         packet.set_dont_frag(false);
-        packet.set_frag_offset(frag.ipv4.frag_offset);
+        packet.set_frag_offset(frag.frag_offset);
         if !checksum_caps.ipv4.tx {
             packet.fill_checksum();
         } else {
             packet.set_checksum(0);
         }
 
-        frag.sent_bytes += payload_len;
-
-        // Update the frag offset for the next fragment.
-        frag.ipv4.frag_offset += payload_len as u16;
-
-        let (dst_addr, next_hop) = (frag.ipv4.dst_addr, frag.ipv4.next_hop);
+        frag.frag_offset += payload_len as u16;
+        let (dst_addr, next_hop) = (frag.dst_addr, frag.next_hop);
+        if !more_frags {
+            iface.fragmenter = Fragmenter::Idle;
+        }
         self.dispatch_ip(iface, dst_addr, next_hop, tx_buffer, EthernetProtocol::Ipv4);
-        true
     }
+}
+
+/// The largest IPv4 fragment payload for an interface of IP MTU `ip_mtu`, a
+/// multiple of 8 as the offset field requires.
+#[cfg(feature = "ipv4-fragmentation")]
+fn max_ipv4_fragment_size(ip_mtu: usize, ip_header_len: usize) -> usize {
+    let payload_mtu = ip_mtu.saturating_sub(ip_header_len);
+    payload_mtu - (payload_mtu % IPV4_FRAGMENT_PAYLOAD_ALIGNMENT)
 }
 
 #[cfg(feature = "ipv4-fragmentation")]
 impl IfaceState<'_> {
     /// The maximum IPv4 payload fragment size, aligned per spec.
     pub(crate) fn max_ipv4_fragment_size(&self, ip_header_len: usize) -> usize {
-        let payload_mtu = self.ip_mtu.saturating_sub(ip_header_len);
-        payload_mtu - (payload_mtu % IPV4_FRAGMENT_PAYLOAD_ALIGNMENT)
+        max_ipv4_fragment_size(self.ip_mtu, ip_header_len)
     }
 }

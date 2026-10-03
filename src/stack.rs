@@ -733,7 +733,7 @@ impl<'d> Stack<'d> {
             #[cfg(feature = "multicast")]
             multicast: crate::multicast::State::new(),
             #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
-            fragmenter: Fragmenter::new(),
+            fragmenter: Fragmenter::Idle,
             #[cfg(feature = "medium-ieee802154")]
             sixlowpan,
         })?;
@@ -2797,6 +2797,14 @@ impl StackInner {
         buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) {
+        // The medium is IPv6-only. This comes first, so an IPv4 packet is never
+        // fragmented for it.
+        #[cfg(all(feature = "medium-ieee802154", feature = "ipv4"))]
+        if iface.medium() == Medium::Ieee802154 && matches!(dst_addr, IpAddr::V4(_)) {
+            debug!("dropping IPv4 packet routed to an IEEE 802.15.4 interface");
+            return;
+        }
+
         let total_ip_len = buf.len();
 
         if total_ip_len > iface.ip_mtu {
@@ -2848,12 +2856,7 @@ impl StackInner {
             },
             #[cfg(feature = "medium-ieee802154")]
             Medium::Ieee802154 => {
-                // The medium is IPv6-only.
-                #[cfg(feature = "ipv4")]
-                if let IpAddr::V4(_) = dst_addr {
-                    debug!("dropping IPv4 packet routed to an IEEE 802.15.4 interface");
-                    return;
-                }
+                // IPv4 was dropped by `transmit_ip`, which every packet passes.
                 match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
                     NeighborLookup::Found(hardware_addr) => {
                         self.dispatch_ieee802154(iface, hardware_addr.ieee802154_or_panic(), buf)
@@ -6349,7 +6352,7 @@ pub(crate) mod test {
 
                 // Perform payload size checks if fragmentation is required.
                 if packet_size <= ip_mtu {
-                    assert!(stack.ifaces.get(0).fragmenter.is_empty());
+                    assert!(stack.ifaces.get(0).fragmenter.is_idle());
                     assert_eq!(tx.borrow()[0].len(), link_header_len(medium) + packet_size);
                     continue;
                 }
@@ -6357,7 +6360,10 @@ pub(crate) mod test {
                 // Verify that the fragment offset is correct.
                 let remainder = unaligned_length % IPV4_FRAGMENT_PAYLOAD_ALIGNMENT;
                 let expected_fragment_offset = ip_mtu - IPV4_HEADER_LEN - remainder;
-                let frag_offset = stack.ifaces.get(0).fragmenter.ipv4.frag_offset;
+                let crate::fragmentation::Fragmenter::Ipv4(frag) = &stack.ifaces.get(0).fragmenter else {
+                    panic!("no IPv4 packet in the fragmenter");
+                };
+                let frag_offset = frag.frag_offset;
                 assert_eq!(frag_offset as usize, expected_fragment_offset);
 
                 // The remaining fragments have first claim on the device: a socket
@@ -6374,12 +6380,12 @@ pub(crate) mod test {
                     // Two fragments are left. The intermediate fragment must be aligned.
                     stack.poll(Instant::ZERO);
                     assert_eq!(tx.borrow().len(), 2);
-                    assert!(!stack.ifaces.get(0).fragmenter.is_empty());
+                    assert!(!stack.ifaces.get(0).fragmenter.is_idle());
                     room.set(Some(1));
                 }
                 // Process the final fragment. It is the remainder of the data and does not have to be aligned.
                 stack.poll(Instant::ZERO);
-                assert!(stack.ifaces.get(0).fragmenter.is_empty());
+                assert!(stack.ifaces.get(0).fragmenter.is_idle());
                 assert_eq!(tx.borrow().len(), packet_size.div_ceil(ip_mtu));
 
                 let frames = tx.borrow();
@@ -6693,6 +6699,71 @@ pub(crate) mod test {
         rx.borrow_mut().push_back(frag2);
         assert_eq!(stack.poll(Instant::from_secs(2)), idle_deadline(Instant::from_secs(2)));
         assert_eq!(stack.raw_socket(handle).recv().unwrap().len(), IPV4_HEADER_LEN + 30);
+    }
+
+    /// An IPv4 packet routed to an IEEE 802.15.4 interface is dropped before it
+    /// is fragmented: the medium is IPv6-only. So the fragmenter never holds an
+    /// IPv4 packet there, even when the pool runs out while it is cut up.
+    #[test]
+    #[cfg(all(feature = "medium-ieee802154", feature = "ipv4-fragmentation"))]
+    fn test_ipv4_not_fragmented_on_ieee802154() {
+        // A pool of its own, so the test can take every buffer.
+        static POOL: crate::StaticPool<{ crate::pool::TEST_POOL_SIZE }, 8> = crate::StaticPool::new();
+        let driver = TestDevice::new(Medium::Ieee802154);
+        let (tx, room) = (driver.tx.clone(), driver.room.clone());
+        let mut stack = Stack::new(&POOL, 0x1234_5678_dead_beef);
+        let iface = driver.install(
+            &mut stack,
+            HardwareAddress::Ieee802154(Ieee802154Address::Extended([0x02; 8])),
+        );
+        stack
+            .iface(iface)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)])
+            .unwrap();
+        stack.poll(Instant::ZERO);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(5555, ListenSocketAddr::UNSPECIFIED).unwrap();
+
+        // The datagram takes the last free buffer: none is left for fragments.
+        let mut held = Vec::new();
+        while let Some(buf) = POOL.alloc() {
+            held.push(buf);
+        }
+        drop(held.pop());
+        let remote = SocketAddr::new(REMOTE_V4.into(), 1000);
+        assert_eq!(stack.udp_socket(udp).send_slice(&[0xab; 1400], remote), Ok(()));
+        drop(held);
+        assert!(stack.ifaces.get(0).fragmenter.is_idle());
+
+        // Nothing goes out for it, and the interface isn't busy. The room bounds
+        // the frames sent, should the fragmenter be left with the packet.
+        tx.borrow_mut().clear();
+        room.set(Some(20));
+        stack.poll(Instant::from_millis(10));
+        assert!(tx.borrow().is_empty());
+        assert!(stack.ifaces.get_mut(0).can_transmit_new_packet().is_ok());
+    }
+
+    /// The metadata of a packet sent in IPv4 fragments rides on the first one,
+    /// as with 6LoWPAN fragments.
+    #[test]
+    #[cfg(all(feature = "packetmeta-id", feature = "ipv4-fragmentation"))]
+    fn test_ipv4_fragments_carry_meta() {
+        let driver = TestDevice::new(Medium::Ip).with_mtu(576);
+        let sent = driver.tx_meta.clone();
+        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let iface = driver.install(&mut stack, HardwareAddress::Ip);
+        stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(5555, ListenSocketAddr::UNSPECIFIED).unwrap();
+
+        let mut meta: crate::udp::UdpMetadata = SocketAddr::new(REMOTE_V4.into(), 1000).into();
+        meta.meta.id = 7;
+        stack.udp_socket(udp).send_slice(&[0xab; 1000], meta).unwrap();
+        let sent = sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].id, 7);
+        assert_eq!(sent[1], crate::driver::PacketMeta::default());
     }
 
     #[test]

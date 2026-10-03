@@ -10,10 +10,10 @@
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::driver::PacketBuf;
 use crate::error::{Full, Malformed};
+#[cfg(feature = "sixlowpan-fragmentation")]
+use crate::fragmentation::{Fragmenter, SixlowpanFragmenter};
 use crate::iface::{Iface, IfaceHandle, IfaceState};
 use crate::rand::Rand;
-#[cfg(feature = "sixlowpan-fragmentation")]
-use crate::stack::Blocked;
 use crate::stack::{Stack, StackInner};
 use crate::storage::Vec;
 use crate::time::Instant;
@@ -741,7 +741,7 @@ impl StackInner {
         ieee_repr: Ieee802154Repr,
         header_diff: usize,
     ) {
-        if !iface.fragmenter.is_empty() {
+        if !iface.fragmenter.is_idle() {
             debug!("Fragmentation buffer is busy. Dropping");
             return;
         }
@@ -770,58 +770,34 @@ impl StackInner {
             return;
         }
 
-        let tag = iface.sixlowpan.get_sixlowpan_fragment_tag();
-
-        let frag = &mut iface.fragmenter;
-        frag.sixlowpan.ll_dst_addr = unwrap!(ieee_repr.dst_addr);
-        frag.sixlowpan.ll_src_addr = unwrap!(ieee_repr.src_addr);
-        frag.packet_len = total_size;
-
-        // The datagram size that we need to set in the first fragment header is equal to the
-        // IPv6 payload length + 40.
-        frag.sixlowpan.datagram_size = (total_size + header_diff) as u16;
-        frag.sixlowpan.datagram_tag = tag;
-        frag.sixlowpan.frag1_size = frag1_size;
-        frag.sixlowpan.fragn_size = fragn_size;
-        frag.sixlowpan.header_diff = header_diff;
-        frag.sixlowpan.datagram_offset = 0;
-        frag.sent_bytes = 0;
-        frag.buffer = Some(buf);
+        iface.fragmenter = Fragmenter::Sixlowpan(SixlowpanFragmenter {
+            buffer: buf,
+            sent_bytes: 0,
+            // The datagram size that we need to set in the first fragment header is equal to the
+            // IPv6 payload length + 40.
+            datagram_size: (total_size + header_diff) as u16,
+            datagram_tag: iface.sixlowpan.get_sixlowpan_fragment_tag(),
+            datagram_offset: 0,
+            frag1_size,
+            fragn_size,
+            header_diff,
+            ll_dst_addr: unwrap!(ieee_repr.dst_addr),
+            ll_src_addr: unwrap!(ieee_repr.src_addr),
+        });
 
         // Transmit as many fragments as the device takes now. The rest go
         // out on the next polls, which also schedule the retry if the pool ran out.
-        let _ = self.sixlowpan_egress(iface);
+        let _ = self.fragment_egress(iface);
     }
 
-    /// Process fragments that still need to be sent for 6LoWPAN packets.
-    ///
-    /// Fragments go out while the device has room for them and the pool has
-    /// buffers. The rest wait in the fragmenter for the next poll, and the error
-    /// says which of the two ran out.
-    pub(crate) fn sixlowpan_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
-        if iface.fragmenter.is_empty() {
-            return Ok(());
-        }
+    /// Fill `tx_buffer` with the next fragment of the 6LoWPAN packet in the
+    /// interface's fragmenter, and transmit it.
+    pub(crate) fn dispatch_ieee802154_frag(&mut self, iface: &mut IfaceState<'_>, mut tx_buffer: PacketBuf) {
+        tx_buffer.reserve(iface.caps.tx_headroom);
+        let Fragmenter::Sixlowpan(frag) = &mut iface.fragmenter else {
+            return;
+        };
 
-        while !iface.fragmenter.finished() {
-            if !iface.can_transmit() {
-                trace!("fragmenter: device has no room, fragments wait");
-                return Err(Blocked::DeviceBusy);
-            }
-            if !self.dispatch_ieee802154_frag(iface) {
-                return Err(Blocked::NoBuffer);
-            }
-        }
-
-        // Reset the buffer when we transmitted everything.
-        iface.fragmenter.reset();
-        Ok(())
-    }
-
-    /// Transmit the next fragment of the packet in the interface's fragmenter.
-    ///
-    /// Returns `false` if no packet buffer is free, leaving the fragmenter as it was.
-    fn dispatch_ieee802154_frag(&mut self, iface: &mut IfaceState<'_>) -> bool {
         // Create the IEEE802.15.4 header.
         let ieee_repr = Ieee802154Repr {
             frame_type: Ieee802154FrameType::Data,
@@ -832,59 +808,48 @@ impl StackInner {
             pan_id_compression: true,
             frame_version: Ieee802154FrameVersion::Ieee802154_2003,
             dst_pan_id: iface.sixlowpan.pan_id,
-            dst_addr: Some(iface.fragmenter.sixlowpan.ll_dst_addr),
+            dst_addr: Some(frag.ll_dst_addr),
             src_pan_id: iface.sixlowpan.pan_id,
-            src_addr: Some(iface.fragmenter.sixlowpan.ll_src_addr),
+            src_addr: Some(frag.ll_src_addr),
         };
         let ieee_len = ieee_repr.buffer_len();
 
-        let frag = &mut iface.fragmenter;
         let first = frag.sent_bytes == 0;
-        let remaining = frag.packet_len - frag.sent_bytes;
+        let remaining = frag.buffer.len() - frag.sent_bytes;
         let (frag_repr, frag_size) = if first {
             (
                 SixlowpanFragRepr::FirstFragment {
-                    size: frag.sixlowpan.datagram_size,
-                    tag: frag.sixlowpan.datagram_tag,
+                    size: frag.datagram_size,
+                    tag: frag.datagram_tag,
                 },
-                remaining.min(frag.sixlowpan.frag1_size),
+                remaining.min(frag.frag1_size),
             )
         } else {
             (
                 SixlowpanFragRepr::Fragment {
-                    size: frag.sixlowpan.datagram_size,
-                    tag: frag.sixlowpan.datagram_tag,
-                    offset: (frag.sixlowpan.datagram_offset / 8) as u8,
+                    size: frag.datagram_size,
+                    tag: frag.datagram_tag,
+                    offset: (frag.datagram_offset / 8) as u8,
                 },
-                remaining.min(frag.sixlowpan.fragn_size),
+                remaining.min(frag.fragn_size),
             )
         };
         let frag_len = frag_repr.buffer_len();
 
-        let Some(mut tx_buffer) = self.pool.alloc() else {
-            trace!("fragmenter: no packet buffer, fragments wait");
-            return false;
-        };
-        tx_buffer.reserve(iface.caps.tx_headroom);
         tx_buffer.set_len(ieee_len + frag_len + frag_size);
         ieee_repr.emit(&mut tx_buffer[..ieee_len]);
         frag_repr.emit(&mut tx_buffer[ieee_len..ieee_len + frag_len]);
-
-        // NOTE(unwrap): the fragmenter is not empty, checked by the caller.
-        let buffer = unwrap!(frag.buffer.as_ref());
-        tx_buffer[ieee_len + frag_len..].copy_from_slice(&buffer[frag.sent_bytes..][..frag_size]);
-        // The packet's metadata rides on its first fragment.
-        if first {
-            tx_buffer.set_meta(buffer.meta());
-        }
+        tx_buffer[ieee_len + frag_len..].copy_from_slice(&frag.buffer[frag.sent_bytes..][..frag_size]);
 
         frag.sent_bytes += frag_size;
         // The offsets count uncompressed bytes: the first fragment carries the
         // whole header chain, which was `header_diff` bytes longer.
-        frag.sixlowpan.datagram_offset += frag_size + if first { frag.sixlowpan.header_diff } else { 0 };
+        frag.datagram_offset += frag_size + if first { frag.header_diff } else { 0 };
+        if frag.sent_bytes == frag.buffer.len() {
+            iface.fragmenter = Fragmenter::Idle;
+        }
 
         self.transmit_raw(iface, tx_buffer);
-        true
     }
 }
 

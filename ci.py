@@ -95,8 +95,6 @@ EXTRAS = [
     "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,tcp-sack,"
     "packet-log,dhcpv4,dhcpv4-options,dhcpv4-server,multicast,ipv4-fragmentation,ipv4-reassembly,"
     "medium-ieee802154,sixlowpan-fragmentation,sixlowpan-reassembly,slaac",
-    "packet-buf-driver-headroom-16",
-    "packet-buf-driver-headroom-32",
 ]
 
 # The whole API, minus the features that are mutually exclusive with another.
@@ -214,10 +212,6 @@ def collect():
     # the other. (Without either feature TCP does no congestion control at all,
     # and the tests that exercise a congestion window are gated on `tcp-reno`.)
     cmds.test(join("alloc", FULL, "tcp-reno"), lib=False)
-    # Once more with driver headroom: every packet handed to a driver must have
-    # it, and it comes out of the room left for headers and payload.
-    for headroom in ["packet-buf-driver-headroom-16", "packet-buf-driver-headroom-32"]:
-        cmds.test(join("alloc", FULL, headroom))
     cmds.raw(["build", "--examples"])
 
     return cmds.all()

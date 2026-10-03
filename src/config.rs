@@ -26,28 +26,6 @@ mod raw {
 #[allow(unused_imports)]
 pub(crate) use raw::{dns_query_index, iface_index, raw_index, tcp_index, tcp_listener_index, udp_index};
 
-// ======== Packet buffers
-
-/// Headroom the stack leaves in front of every packet it hands to a driver, in bytes.
-///
-/// For drivers that add headers of their own.
-///
-/// Can only be set with cargo features, not with an environment variable. If
-/// several are enabled, the highest wins.
-///
-/// Supported values: 0, 2, 4, 8, 16, 32, 64.
-///
-/// Default: 0.
-pub const PACKET_BUF_DRIVER_HEADROOM: usize = cfg_select! {
-    feature = "packet-buf-driver-headroom-64" => 64,
-    feature = "packet-buf-driver-headroom-32" => 32,
-    feature = "packet-buf-driver-headroom-16" => 16,
-    feature = "packet-buf-driver-headroom-8" => 8,
-    feature = "packet-buf-driver-headroom-4" => 4,
-    feature = "packet-buf-driver-headroom-2" => 2,
-    _ => 0,
-};
-
 // ======== Interfaces and their tables
 
 /// Max interfaces a [`Stack`](crate::Stack) can hold.

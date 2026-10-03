@@ -19,7 +19,6 @@
 //! [`Iface::dhcpv4_server_leases`]: super::Iface::dhcpv4_server_leases
 //! [`Iface::remove_dhcpv4_server_lease`]: super::Iface::remove_dhcpv4_server_lease
 
-use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 
@@ -32,7 +31,7 @@ use crate::time::{Duration, Instant};
 use crate::wire::{
     DHCP_CLIENT_PORT, DHCP_HEADER_LEN, DHCP_MAGIC_NUMBER, DHCP_SERVER_PORT, DhcpFlags, DhcpMessageType, DhcpOption,
     DhcpPacket, EthernetAddress, EthernetProtocol, IPV4_HEADER_LEN, IpAddr, IpCidr, IpProtocol, Ipv4Addr, Ipv4AddrExt,
-    Ipv4Cidr, LINK_HEADER_LEN, UDP_HEADER_LEN, UdpPacket, dhcpv4_field as field,
+    Ipv4Cidr, UDP_HEADER_LEN, UdpPacket, dhcpv4_field as field,
 };
 
 /// How long an offered address is held back for the client it was offered to.
@@ -383,12 +382,14 @@ impl Server {
 
     /// Handle one client message. Returns the reply to transmit, with its IP and
     /// Ethernet destination, or `None` when the message gets no reply.
+    #[allow(clippy::too_many_arguments)]
     fn handle(
         &mut self,
         pool: PoolRef,
         now: Instant,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
+        ip_headroom: usize,
         message_type: DhcpMessageType,
         packet: &DhcpPacket<'_>,
     ) -> Option<(PacketBuf, Ipv4Addr, EthernetAddress)> {
@@ -404,9 +405,11 @@ impl Server {
 
         match message_type {
             DhcpMessageType::Discover => {
-                self.handle_discover(pool, now, server_cidr, checksum_caps, packet, &id, chaddr)
+                self.handle_discover(pool, now, server_cidr, checksum_caps, ip_headroom, packet, &id, chaddr)
             }
-            DhcpMessageType::Request => self.handle_request(pool, now, server_cidr, checksum_caps, packet, &id, chaddr),
+            DhcpMessageType::Request => {
+                self.handle_request(pool, now, server_cidr, checksum_caps, ip_headroom, packet, &id, chaddr)
+            }
             DhcpMessageType::Decline => {
                 let Some(addr) = packet.option(field::OPT_REQUESTED_IP).and_then(parse_ipv4) else {
                     return None;
@@ -445,6 +448,7 @@ impl Server {
                     pool,
                     server_cidr,
                     checksum_caps,
+                    ip_headroom,
                     packet,
                     Reply {
                         message_type: DhcpMessageType::Ack,
@@ -469,6 +473,7 @@ impl Server {
         now: Instant,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
+        ip_headroom: usize,
         packet: &DhcpPacket<'_>,
         id: &ClientId<'_>,
         chaddr: EthernetAddress,
@@ -512,6 +517,7 @@ impl Server {
             pool,
             server_cidr,
             checksum_caps,
+            ip_headroom,
             packet,
             Reply {
                 message_type: DhcpMessageType::Offer,
@@ -530,6 +536,7 @@ impl Server {
         now: Instant,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
+        ip_headroom: usize,
         packet: &DhcpPacket<'_>,
         id: &ClientId<'_>,
         chaddr: EthernetAddress,
@@ -595,7 +602,7 @@ impl Server {
                 self.leases.retain(|l| l.address != addr || l.matches_client(id));
                 let Some(i) = self.entry_for(id, chaddr, now) else {
                     warn!("DHCP server: lease table full, cannot commit {}", addr);
-                    return self.nak(pool, server_cidr, checksum_caps, packet, "no free leases");
+                    return self.nak(pool, server_cidr, checksum_caps, ip_headroom, packet, "no free leases");
                 };
                 let lease = &mut self.leases[i];
                 lease.address = addr;
@@ -607,6 +614,7 @@ impl Server {
                     pool,
                     server_cidr,
                     checksum_caps,
+                    ip_headroom,
                     packet,
                     Reply {
                         message_type: DhcpMessageType::Ack,
@@ -619,7 +627,7 @@ impl Server {
             }
             Answer::Nak(reason) => {
                 debug!("DHCP server: NAK to {} for {}: {}", chaddr, addr, reason);
-                self.nak(pool, server_cidr, checksum_caps, packet, reason)
+                self.nak(pool, server_cidr, checksum_caps, ip_headroom, packet, reason)
             }
             Answer::Silent => None,
         }
@@ -630,6 +638,7 @@ impl Server {
         pool: PoolRef,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
+        ip_headroom: usize,
         packet: &DhcpPacket<'_>,
         reason: &'static str,
     ) -> Option<(PacketBuf, Ipv4Addr, EthernetAddress)> {
@@ -637,6 +646,7 @@ impl Server {
             pool,
             server_cidr,
             checksum_caps,
+            ip_headroom,
             packet,
             Reply {
                 message_type: DhcpMessageType::Nak,
@@ -649,7 +659,8 @@ impl Server {
     }
 
     /// Build one reply, UDP header included, and pick its destination
-    /// (RFC 2131 §4.1). `None` if the pool is empty: the client retransmits.
+    /// (RFC 2131 §4.1), with `ip_headroom` in front of the IP packet. `None` if
+    /// the pool is empty: the client retransmits.
     ///
     /// Panics if the message doesn't fit in a packet, which only an absurd
     /// `outgoing_options` can cause.
@@ -658,6 +669,7 @@ impl Server {
         pool: PoolRef,
         server_cidr: Ipv4Cidr,
         checksum_caps: &ChecksumCapabilities,
+        ip_headroom: usize,
         request: &DhcpPacket<'_>,
         reply: Reply,
     ) -> Option<(PacketBuf, Ipv4Addr, EthernetAddress)> {
@@ -679,7 +691,7 @@ impl Server {
         };
 
         let mut buf = pool.alloc()?;
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
+        buf.reserve(ip_headroom + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         buf.set_len(buf.tailroom());
 
         let mut packet = DhcpPacket::new_unchecked(&mut buf[..]);
@@ -798,6 +810,7 @@ impl IfaceState<'_> {
         now: Instant,
     ) {
         let checksum_caps = self.checksum_caps();
+        let ip_headroom = self.ip_headroom;
         let server_cidr = self.dhcpv4_server_cidr();
         let pool = inner.pool;
         let Some(server) = &mut self.dhcpv4_server else { return };
@@ -832,7 +845,15 @@ impl IfaceState<'_> {
         }
 
         debug!("DHCP server: recv {:?} from {}", message_type, src_ip);
-        let reply = server.handle(pool, now, server_cidr, &checksum_caps, message_type, &packet);
+        let reply = server.handle(
+            pool,
+            now,
+            server_cidr,
+            &checksum_caps,
+            ip_headroom,
+            message_type,
+            &packet,
+        );
 
         if let Some((mut buf, dst_addr, dst_hw)) = reply {
             push_ipv4_header(

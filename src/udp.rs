@@ -6,8 +6,6 @@
 //! - [`bind`](UdpSocket::bind) it to a local address and optionally also a remote address.
 //! - Send and receive packets.
 
-use crate::config::PACKET_BUF_DRIVER_HEADROOM;
-
 use crate::config::{UDP_RX_QUEUE_COUNT, UDP_SOCKET_COUNT};
 use crate::storage::BoundedDeque;
 use core::fmt;
@@ -27,23 +25,7 @@ use crate::waker::WakerRegistration;
 use crate::wire::{IPV4_HEADER_LEN, Icmpv4DstUnreachable, Icmpv4Message, Ipv4Packet};
 #[cfg(feature = "ipv6")]
 use crate::wire::{IPV6_HEADER_LEN, Icmpv6DstUnreachable, Icmpv6Message, Ipv6ExtHeader, Ipv6Packet};
-use crate::wire::{
-    IpAddr, IpProtocol, IpVersion, LINK_HEADER_LEN, ListenSocketAddr, SocketAddr, UDP_HEADER_LEN, UdpPacket,
-};
-
-/// Suggested reservation for driver headroom, UDP, the largest enabled base IP
-/// header, and the Ethernet header when enabled. Further encapsulation may need
-/// more space.
-pub const SEND_HEADROOM: usize = send_headroom({
-    #[cfg(feature = "ipv6")]
-    {
-        IpVersion::V6
-    }
-    #[cfg(not(feature = "ipv6"))]
-    {
-        IpVersion::V4
-    }
-});
+use crate::wire::{IpAddr, IpProtocol, IpVersion, ListenSocketAddr, SocketAddr, UDP_HEADER_LEN, UdpPacket};
 
 define_handle! {
     /// A handle to a UDP socket added to a [`Stack`].
@@ -839,11 +821,24 @@ impl UdpSocket<'_, '_> {
         Ok(())
     }
 
+    /// Headroom to reserve in a buffer for [`send_packet`](Self::send_packet), so
+    /// that the payload isn't moved.
+    pub fn send_headroom(&self) -> usize {
+        // A bind scoped to one IP version only sends over that version.
+        #[cfg(feature = "ipv6")]
+        let largest = IpVersion::V6;
+        #[cfg(not(feature = "ipv6"))]
+        let largest = IpVersion::V4;
+        let version = self.inner().local.version().unwrap_or(largest);
+        send_headroom(self.tx.max_ip_headroom(), version)
+    }
+
     /// Send an owned UDP payload, adding the UDP, IP, and link headers.
     ///
-    /// The buffer contains only the payload. Reserve [`SEND_HEADROOM`] to avoid
-    /// moving it. Addresses and packet metadata come from `meta`, as in
-    /// [`send_with`](Self::send_with), replacing the buffer's metadata.
+    /// The buffer contains only the payload. Reserve
+    /// [`send_headroom`](Self::send_headroom) to avoid moving it. Addresses and
+    /// packet metadata come from `meta`, as in [`send_with`](Self::send_with),
+    /// replacing the buffer's metadata.
     ///
     /// Errors return the buffer unchanged. Errors match [`send_with`](Self::send_with),
     /// except this method allocates no payload buffer and never returns [`SendError::NoBuffer`].
@@ -859,7 +854,7 @@ impl UdpSocket<'_, '_> {
             Ok(routed) => routed,
             Err(err) => return Err((err, buf)),
         };
-        if !buf.ensure_headroom(send_headroom(meta.remote_addr.addr.version())) {
+        if !buf.ensure_headroom(send_headroom(route.ip_headroom, meta.remote_addr.addr.version())) {
             return Err((SendError::BufferFull, buf));
         }
         buf.set_meta(meta.meta);
@@ -881,7 +876,7 @@ impl UdpSocket<'_, '_> {
         mut meta: UdpMetadata,
     ) -> Result<(PacketBuf, DatagramEgress), SendError> {
         let (route, src, hop_limit) = self.route_datagram(&mut meta)?;
-        let headroom = send_headroom(meta.remote_addr.addr.version());
+        let headroom = send_headroom(route.ip_headroom, meta.remote_addr.addr.version());
         let Some(mut buf) = self.tx.inner.pool.alloc() else {
             return Err(SendError::NoBuffer);
         };
@@ -1021,10 +1016,10 @@ struct DatagramEgress {
     hop_limit: u8,
 }
 
-/// Headroom for the headers below a UDP payload sent over `version`.
-const fn send_headroom(version: IpVersion) -> usize {
-    PACKET_BUF_DRIVER_HEADROOM
-        + LINK_HEADER_LEN
+/// Headroom for the headers below a UDP payload sent over `version`, on an
+/// interface where the IP packet needs `ip_headroom` in front of it.
+fn send_headroom(ip_headroom: usize, version: IpVersion) -> usize {
+    ip_headroom
         + UDP_HEADER_LEN
         + match version {
             #[cfg(feature = "ipv4")]
@@ -1955,11 +1950,12 @@ mod test {
         let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
+        let send_headroom = socket.send_headroom();
         for (src, dst, header_len) in [
             (LOCAL_ADDR.into(), REMOTE_ADDR.into(), IPV4_HEADER_LEN),
             (LOCAL_ADDR_V6.into(), REMOTE_ADDR_V6.into(), IPV6_HEADER_LEN),
         ] {
-            for headroom in [0, SEND_HEADROOM, SEND_HEADROOM + 2] {
+            for headroom in [0, send_headroom, send_headroom + 2] {
                 for payload in [b"".as_slice(), b"abcde".as_slice()] {
                     let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
                     buf.reserve(headroom);
@@ -2096,7 +2092,7 @@ mod test {
         let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
-        let max = crate::pool::TEST_POOL_SIZE - send_headroom(IpVersion::V4);
+        let max = crate::pool::TEST_POOL_SIZE - send_headroom(crate::test_device::TX_HEADROOM, IpVersion::V4);
         let remote = SocketAddr::new(REMOTE_ADDR.into(), REMOTE_PORT);
 
         // One byte too many: rejected, nothing transmitted.

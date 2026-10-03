@@ -125,29 +125,35 @@ mod sealed {
     align!(1 => A1, 2 => A2, 4 => A4, 8 => A8, 16 => A16, 32 => A32, 64 => A64);
 }
 
+/// The smallest buffers a pool can have, in bytes.
+pub(crate) const MIN_BUF_CAPACITY: usize = 128;
+
 /// Fail the build if the buffers of a pool don't fit the stack. The pools call it
 /// in a `const` block from their `new`.
+///
+/// The headroom a driver needs is only known when its interface is added, so
+/// this leaves it out. `Stack::add_iface` checks again with it.
 const fn check_buf_capacity(capacity: usize) {
     // Room for the largest headers the stack writes in front of a payload.
-    core::assert!(capacity >= 128, "Pool buffers must be at least 128 bytes");
-    // DHCP messages can be up to 576 bytes long, the IPv4 minimum MTU (RFC 2131 §2).
+    core::assert!(capacity >= MIN_BUF_CAPACITY, "Pool buffers must be at least 128 bytes");
+    // DHCP messages can be up to 576 bytes long, the IPv4 minimum MTU (RFC 2131 §2),
+    // and DHCP runs on Ethernet.
     #[cfg(any(feature = "dhcpv4", feature = "dhcpv4-server"))]
     core::assert!(
-        capacity
-            >= crate::config::PACKET_BUF_DRIVER_HEADROOM + crate::wire::LINK_HEADER_LEN + crate::wire::IPV4_MIN_MTU,
-        "DHCP needs Pool buffers of at least 590 bytes (576 with only `medium-ip`), plus the driver headroom"
+        capacity >= crate::wire::ETHERNET_HEADER_LEN + crate::wire::IPV4_MIN_MTU,
+        "DHCP needs Pool buffers of at least 590 bytes, plus the driver headroom"
     );
 }
 
 /// The pool type of the unit tests. They run in parallel threads of one process,
 /// all sharing one pool, so it is big. Its buffers hold an Ethernet frame plus
-/// the driver headroom.
+/// the test device's driver headroom.
 #[cfg(test)]
 pub(crate) type TestPool = StaticPool<TEST_POOL_SIZE, 1024>;
 
 /// The buffer size of [`TestPool`].
 #[cfg(test)]
-pub(crate) const TEST_POOL_SIZE: usize = 1514 + crate::config::PACKET_BUF_DRIVER_HEADROOM;
+pub(crate) const TEST_POOL_SIZE: usize = 1514 + crate::test_device::TX_HEADROOM;
 
 /// The pool the unit tests share.
 #[cfg(test)]

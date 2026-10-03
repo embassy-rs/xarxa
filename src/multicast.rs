@@ -498,11 +498,9 @@ impl IfaceState<'_> {
 
     #[cfg(feature = "ipv4")]
     fn igmp_report_packet(&self, pool: PoolRef, version: IgmpVersion, group_addr: Ipv4Addr) -> Option<PacketBuf> {
-        use crate::config::PACKET_BUF_DRIVER_HEADROOM;
-
         let iface_addr = self.ipv4_addr()?;
         let mut pkt = pool.alloc()?;
-        pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
+        pkt.reserve(self.ip_headroom + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
             let mut igmp_packet = IgmpPacket::new_unchecked(&mut pkt);
@@ -529,11 +527,9 @@ impl IfaceState<'_> {
 
     #[cfg(feature = "ipv4")]
     fn igmp_leave_packet(&self, pool: PoolRef, group_addr: Ipv4Addr) -> Option<PacketBuf> {
-        use crate::config::PACKET_BUF_DRIVER_HEADROOM;
-
         let iface_addr = self.ipv4_addr()?;
         let mut pkt = pool.alloc()?;
-        pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
+        pkt.reserve(self.ip_headroom + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
             let mut igmp_packet = IgmpPacket::new_unchecked(&mut pkt);
@@ -627,11 +623,9 @@ impl IfaceState<'_> {
     /// header. Returns the report and how many records fit in it.
     #[cfg(feature = "ipv6")]
     fn mldv2_report_start(&self, pool: PoolRef, record_count: usize) -> Option<(PacketBuf, usize)> {
-        use crate::config::PACKET_BUF_DRIVER_HEADROOM;
-
         // MLD report: the report header (8 bytes) plus one record per group.
         let mut pkt = pool.alloc()?;
-        pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
+        pkt.reserve(self.ip_headroom + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
         let max_records = (pkt.tailroom() - 8) / MLD_ADDRESS_RECORD_LEN;
         if record_count > max_records {
             warn!(

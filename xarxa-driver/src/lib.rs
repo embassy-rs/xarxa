@@ -176,6 +176,15 @@ pub struct Capabilities {
     /// Which checksums the device's hardware verifies or computes, so the
     /// stack skips them in software.
     pub checksum: ChecksumCapabilities,
+
+    /// Headroom the driver needs in front of each frame it transmits, in bytes.
+    ///
+    /// For drivers that put a header of their own in front of the frame. Every
+    /// buffer the stack hands to [`transmit`](Driver::transmit) has at least this
+    /// much headroom.
+    ///
+    /// Default: 0.
+    pub tx_headroom: usize,
 }
 
 impl Default for Capabilities {
@@ -184,6 +193,7 @@ impl Default for Capabilities {
             medium: Medium::Ethernet,
             max_transmission_unit: 1514,
             checksum: ChecksumCapabilities::default(),
+            tx_headroom: 0,
         }
     }
 }

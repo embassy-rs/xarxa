@@ -7,8 +7,6 @@
 use core::fmt::Display;
 use core::{fmt, mem};
 
-use crate::config::PACKET_BUF_DRIVER_HEADROOM;
-
 #[cfg(all(test, feature = "tcp-listener"))]
 use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
@@ -30,8 +28,7 @@ use crate::wire::IPV4_HEADER_LEN;
 #[cfg(feature = "ipv6")]
 use crate::wire::IPV6_HEADER_LEN;
 use crate::wire::{
-    IpAddr, IpProtocol, LINK_HEADER_LEN, ListenSocketAddr, SocketAddr, TCP_HEADER_LEN, TcpControl, TcpPacket,
-    TcpSeqNumber,
+    IpAddr, IpProtocol, ListenSocketAddr, SocketAddr, TCP_HEADER_LEN, TcpControl, TcpPacket, TcpSeqNumber,
 };
 
 mod congestion;
@@ -1913,7 +1910,7 @@ impl<'d> TcpSocketState<'d> {
             self.ip_mtu = route.ip_mtu;
         } else {
             // A routed MTU is capped by the interface already.
-            self.ip_mtu = self.ip_mtu.min(cx.inner.max_ip_mtu());
+            self.ip_mtu = self.ip_mtu.min(cx.max_ip_mtu());
         }
 
         let hop_limit = self.hop_limit.unwrap_or(64);
@@ -2222,10 +2219,11 @@ impl<'d> TcpSocketState<'d> {
 }
 
 /// Copy a TCP segment out of the socket state into a fresh packet buffer, with
-/// headroom reserved for the IP and Ethernet headers below it. `None` if the
-/// pool is empty.
+/// headroom reserved for the IP header and the `ip_headroom` below it (as in
+/// [`EgressRoute::ip_headroom`]). `None` if the pool is empty.
 pub(crate) fn build_tcp_packet(
     pool: PoolRef,
+    ip_headroom: usize,
     repr: &TcpRepr<'_>,
     src_addr: &IpAddr,
     dst_addr: &IpAddr,
@@ -2238,7 +2236,7 @@ pub(crate) fn build_tcp_packet(
         IpAddr::V6(_) => IPV6_HEADER_LEN,
     };
     let mut buf = pool.alloc()?;
-    buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + ip_header_len);
+    buf.reserve(ip_headroom + ip_header_len);
     buf.set_len(repr.buffer_len());
     let mut packet = TcpPacket::new_unchecked(&mut buf);
     repr.emit(&mut packet, src_addr, dst_addr, checksum_caps);
@@ -2291,6 +2289,7 @@ pub(crate) fn transmit(
     }
     let Some(buf) = build_tcp_packet(
         cx.inner.pool,
+        route.ip_headroom,
         &repr,
         &src_addr,
         &dst_addr,
@@ -12532,6 +12531,7 @@ mod stack_test {
     fn tcp_packet(repr: &TcpRepr) -> Vec<u8> {
         let mut buf = build_tcp_packet(
             crate::pool::test_pool_ref(),
+            0,
             repr,
             &REMOTE_ADDR.into(),
             &LOCAL_ADDR.into(),

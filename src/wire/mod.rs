@@ -92,22 +92,6 @@ pub use self::ethernet::{
     HEADER_LEN as ETHERNET_HEADER_LEN,
 };
 
-/// The headroom every egress packet reserves for the link-layer header below IP.
-///
-/// The Ethernet header in a build that drives Ethernet interfaces, since an IP
-/// packet may end up going out of one. Zero in a build that only drives
-/// [`Medium::Ip`] interfaces, which prepend nothing.
-#[cfg(feature = "medium-ethernet")]
-pub const LINK_HEADER_LEN: usize = ETHERNET_HEADER_LEN;
-
-/// The headroom every egress packet reserves for the link-layer header below IP.
-///
-/// The Ethernet header in a build that drives Ethernet interfaces, since an IP
-/// packet may end up going out of one. Zero in a build that only drives
-/// [`Medium::Ip`] interfaces, which prepend nothing.
-#[cfg(not(feature = "medium-ethernet"))]
-pub const LINK_HEADER_LEN: usize = 0;
-
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 pub use self::arp::{
     BUFFER_LEN as ARP_BUFFER_LEN, Hardware as ArpHardware, Operation as ArpOperation, Packet as ArpPacket,

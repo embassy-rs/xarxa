@@ -7,7 +7,6 @@
 //! written into the space the uncompressed one occupied, and the other way
 //! around, with the headroom taking up the difference.
 
-use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::driver::PacketBuf;
 use crate::error::{Full, Malformed};
@@ -631,7 +630,7 @@ impl StackInner {
             #[cfg(not(feature = "sixlowpan-fragmentation"))]
             debug!("Enable the `sixlowpan-fragmentation` feature for fragmentation support.");
         } else {
-            if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM + ieee_len) {
+            if !buf.ensure_headroom(iface.caps.tx_headroom + ieee_len) {
                 debug!("6LoWPAN: no room for the MAC header, dropping");
                 return;
             }
@@ -891,7 +890,7 @@ impl StackInner {
             trace!("fragmenter: no packet buffer, fragments wait");
             return false;
         };
-        tx_buffer.reserve(PACKET_BUF_DRIVER_HEADROOM);
+        tx_buffer.reserve(iface.caps.tx_headroom);
         tx_buffer.set_len(ieee_len + frag_len + frag_size);
         ieee_repr.emit(&mut tx_buffer[..ieee_len]);
         frag_repr.emit(&mut tx_buffer[ieee_len..ieee_len + frag_len]);
@@ -1023,7 +1022,7 @@ mod test {
     /// the header difference.
     fn compress(packet: &[u8], src: Ieee802154Address, dst: Ieee802154Address, headroom: usize) -> (Vec<u8>, usize) {
         let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
+        buf.reserve(headroom);
         buf.set_len(packet.len());
         buf.copy_from_slice(packet);
         let header_diff = ipv6_to_sixlowpan(&mut buf, &mac_repr(src, dst, None)).unwrap();
@@ -1041,7 +1040,7 @@ mod test {
         total_len: Option<usize>,
     ) -> Result<Vec<u8>, Malformed> {
         let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
+        buf.reserve(headroom);
         buf.set_len(payload.len());
         buf.copy_from_slice(payload);
         sixlowpan_to_ipv6(&mut buf, Some(src), Some(dst), context, total_len)?;

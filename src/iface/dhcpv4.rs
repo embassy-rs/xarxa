@@ -13,7 +13,6 @@
 //! [`Iface::config_generation`]: super::Iface::config_generation
 //! [`Stack::poll`]: crate::Stack::poll
 
-use crate::config::PACKET_BUF_DRIVER_HEADROOM;
 use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 
@@ -29,8 +28,8 @@ use crate::stack::StackInner;
 use crate::time::{Clock, Duration, Instant};
 use crate::wire::{
     DHCP_CLIENT_PORT, DHCP_HEADER_LEN, DHCP_MAGIC_NUMBER, DHCP_SERVER_PORT, DhcpFlags, DhcpMessageType, DhcpOption,
-    DhcpPacket, EthernetAddress, IPV4_HEADER_LEN, IpAddr, IpCidr, Ipv4Addr, Ipv4AddrExt, Ipv4Cidr, LINK_HEADER_LEN,
-    UDP_HEADER_LEN, UdpPacket, dhcpv4_field as field,
+    DhcpPacket, EthernetAddress, IPV4_HEADER_LEN, IpAddr, IpCidr, Ipv4Addr, Ipv4AddrExt, Ipv4Cidr, UDP_HEADER_LEN,
+    UdpPacket, dhcpv4_field as field,
 };
 
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(120);
@@ -479,6 +478,7 @@ impl Client {
         requested_ip: Option<Ipv4Addr>,
         server_identifier: Option<Ipv4Addr>,
         ip_mtu: usize,
+        ip_headroom: usize,
         src_addr: Ipv4Addr,
         dst_addr: Ipv4Addr,
         checksum_caps: &ChecksumCapabilities,
@@ -489,7 +489,7 @@ impl Client {
         let max_size = (ip_mtu - MAX_IPV4_HEADER_LEN - UDP_HEADER_LEN) as u16;
 
         let mut buf = pool.alloc()?;
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
+        buf.reserve(ip_headroom + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         let max_payload = buf.tailroom().min(ip_mtu - IPV4_HEADER_LEN - UDP_HEADER_LEN);
         buf.set_len(max_payload);
 
@@ -698,6 +698,7 @@ impl IfaceState<'_> {
     pub(crate) fn dhcpv4_poll(&mut self, inner: &mut StackInner, clock: &mut Clock) {
         let ethernet_addr = self.hardware_addr;
         let ip_mtu = self.ip_mtu;
+        let ip_headroom = self.ip_headroom;
         let checksum_caps = self.checksum_caps();
         let now = clock.now();
 
@@ -732,6 +733,7 @@ impl IfaceState<'_> {
                         None,
                         None,
                         ip_mtu,
+                        ip_headroom,
                         Ipv4Addr::UNSPECIFIED,
                         Ipv4Addr::BROADCAST,
                         &checksum_caps,
@@ -768,6 +770,7 @@ impl IfaceState<'_> {
                         Some(state.requested_ip),
                         Some(state.server.identifier),
                         ip_mtu,
+                        ip_headroom,
                         Ipv4Addr::UNSPECIFIED,
                         Ipv4Addr::BROADCAST,
                         &checksum_caps,
@@ -827,6 +830,7 @@ impl IfaceState<'_> {
                         None,
                         None,
                         ip_mtu,
+                        ip_headroom,
                         src_addr,
                         dst_addr,
                         &checksum_caps,

@@ -54,6 +54,13 @@ pub enum AddIfaceError {
     /// The hardware address the device reports is not of the kind its medium
     /// uses.
     HardwareAddrMismatch,
+    /// The pool's buffers are too small for the device. What is left of a buffer
+    /// after the device's [`tx_headroom`](Capabilities::tx_headroom) and the link
+    /// header must hold:
+    /// - 114 bytes, room for the largest headers the stack writes.
+    /// - 576 bytes on Ethernet, with the `dhcpv4` or `dhcpv4-server` feature.
+    ///   That is the largest DHCP message.
+    BufferTooSmall,
 }
 
 impl From<Full> for AddIfaceError {
@@ -68,6 +75,7 @@ impl core::fmt::Display for AddIfaceError {
             AddIfaceError::Full => f.write_str("full"),
             AddIfaceError::UnsupportedMedium => f.write_str("unsupported medium"),
             AddIfaceError::HardwareAddrMismatch => f.write_str("hardware address does not match the medium"),
+            AddIfaceError::BufferTooSmall => f.write_str("pool buffers too small for the device"),
         }
     }
 }
@@ -289,6 +297,38 @@ pub(crate) fn ip_mtu(medium: Medium, caps: &Capabilities) -> usize {
     }
 }
 
+/// The bytes the link layer puts in front of an IP packet on a medium.
+///
+/// Zero on IEEE 802.15.4: its MAC header has no fixed length, and the 6LoWPAN
+/// compression in front of it usually frees more room than it takes, so it is
+/// made room for when the packet is compressed.
+pub(crate) fn link_header_len(medium: Medium) -> usize {
+    match medium {
+        #[cfg(feature = "medium-ethernet")]
+        Medium::Ethernet => ETHERNET_HEADER_LEN,
+        #[cfg(feature = "medium-ip")]
+        Medium::Ip => 0,
+        #[cfg(feature = "medium-ieee802154")]
+        Medium::Ieee802154 => 0,
+    }
+}
+
+/// The least room a packet buffer must leave for an IP packet on a medium, after
+/// the headroom in front of it. See [`AddIfaceError::BufferTooSmall`].
+pub(crate) fn min_ip_room(medium: Medium) -> usize {
+    // The largest headers the stack writes in front of a payload fit the smallest
+    // buffers a pool can have, after an Ethernet header.
+    let min = crate::pool::MIN_BUF_CAPACITY - ETHERNET_HEADER_LEN;
+    // DHCP messages can be up to 576 bytes long, the IPv4 minimum MTU (RFC 2131 §2).
+    // DHCP only runs on Ethernet.
+    #[cfg(any(feature = "dhcpv4", feature = "dhcpv4-server"))]
+    if medium == Medium::Ethernet {
+        return min.max(IPV4_MIN_MTU);
+    }
+    let _ = medium;
+    min
+}
+
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState<'d> {
     pub(crate) handle: IfaceHandle,
@@ -299,8 +339,11 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) caps: Capabilities,
     /// The interface's IP-layer MTU, worked out when the interface is added: the
     /// device MTU minus the link-layer header, capped by what a packet buffer can
-    /// carry.
+    /// carry after `ip_headroom`.
     pub(crate) ip_mtu: usize,
+    /// The headroom an IP packet needs to go out of this interface: the driver's
+    /// `tx_headroom` plus the link-layer header.
+    pub(crate) ip_headroom: usize,
     pub(crate) hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
@@ -362,7 +405,9 @@ impl<'d> Iface<'_, 'd> {
     }
 
     /// The interface's IP-layer MTU: the device MTU minus the link-layer header,
-    /// clamped to what a [`PacketBuf`](crate::driver::PacketBuf) can carry.
+    /// clamped to what a [`PacketBuf`](crate::driver::PacketBuf) can carry after
+    /// the device's [`tx_headroom`](Capabilities::tx_headroom) and the link-layer
+    /// header.
     pub fn ip_mtu(&self) -> usize {
         self.state().ip_mtu
     }

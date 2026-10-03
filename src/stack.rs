@@ -1,7 +1,5 @@
 //! The network stack.
 
-use crate::config::PACKET_BUF_DRIVER_HEADROOM;
-
 use crate::Pool;
 use crate::config::IFACE_COUNT;
 #[cfg(feature = "_raw")]
@@ -135,12 +133,6 @@ impl TxTimestampQueue {
 }
 
 impl StackInner {
-    /// The largest IP packet a buffer can hold, with room for the headers egress
-    /// puts in front of it.
-    pub(crate) fn max_ip_mtu(&self) -> usize {
-        self.buf_capacity - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN
-    }
-
     /// The hostname to send in outgoing DHCP messages. `None` when unset.
     #[cfg(all(feature = "dhcpv4", feature = "hostname"))]
     pub(crate) fn hostname(&self) -> Option<&str> {
@@ -269,6 +261,9 @@ pub(crate) struct EgressRoute {
     /// The egress interface's IP-layer MTU.
     #[cfg_attr(not(feature = "tcp"), allow(dead_code))]
     pub(crate) ip_mtu: usize,
+    /// The headroom the IP packet needs on the egress interface: the driver's
+    /// plus the link-layer header.
+    pub(crate) ip_headroom: usize,
 }
 
 impl TxContext<'_, '_> {
@@ -337,6 +332,33 @@ impl TxContext<'_, '_> {
         self.ifaces.get(iface.index()).checksum_caps()
     }
 
+    /// The headroom the driver of the interface needs in front of a frame.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the interface was removed).
+    #[cfg(feature = "raw-ethernet")]
+    pub(crate) fn tx_headroom(&self, iface: IfaceHandle) -> usize {
+        self.ifaces.get(iface.index()).caps.tx_headroom
+    }
+
+    /// The most headroom an IP packet needs on any interface. For packets built
+    /// before they are routed, so they fit whichever interface they go out of.
+    #[cfg(any(feature = "udp", feature = "tcp", feature = "raw-ip"))]
+    pub(crate) fn max_ip_headroom(&self) -> usize {
+        self.ifaces
+            .iter()
+            .map(|(_, iface)| iface.ip_headroom)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The largest IP packet a buffer can hold, with room for the headers in
+    /// front of it on any interface.
+    #[cfg(feature = "tcp")]
+    pub(crate) fn max_ip_mtu(&self) -> usize {
+        self.inner.buf_capacity - self.max_ip_headroom()
+    }
+
     /// Make the egress routing decision for a destination: the interface the
     /// destination is on-link for (next hop: the destination itself), else the
     /// interface and gateway named by the matching route.
@@ -360,6 +382,7 @@ impl TxContext<'_, '_> {
                 iface: iface.handle,
                 next_hop: *dst_addr,
                 ip_mtu: iface.ip_mtu,
+                ip_headroom: iface.ip_headroom,
             });
         }
 
@@ -368,14 +391,17 @@ impl TxContext<'_, '_> {
                 iface: iface.handle,
                 next_hop: *dst_addr,
                 ip_mtu: iface.ip_mtu,
+                ip_headroom: iface.ip_headroom,
             });
         }
 
         let route = self.inner.routes.lookup(binding, dst_addr)?;
+        let iface = self.ifaces.get(route.iface.index());
         Some(EgressRoute {
             iface: route.iface,
             next_hop: route.via_router,
-            ip_mtu: self.ifaces.get(route.iface.index()).ip_mtu,
+            ip_mtu: iface.ip_mtu,
+            ip_headroom: iface.ip_headroom,
         })
     }
 
@@ -405,10 +431,12 @@ impl TxContext<'_, '_> {
         if let IpAddr::V6(dst) = dst_addr
             && dst.is_link_local()
         {
+            let iface = self.ifaces.get(arrival.index());
             return Some(EgressRoute {
                 iface: arrival,
                 next_hop: *dst_addr,
-                ip_mtu: self.ifaces.get(arrival.index()).ip_mtu,
+                ip_mtu: iface.ip_mtu,
+                ip_headroom: iface.ip_headroom,
             });
         }
 
@@ -673,13 +701,23 @@ impl<'d> Stack<'d> {
             // Can't fail: the table is empty and holds at least one address.
             let _ = ip_addrs.push(ll);
         }
-        let ip_mtu = crate::iface::ip_mtu(medium, &caps).min(self.inner.max_ip_mtu());
+        // What is left of a buffer for the IP packet after the headroom in front of
+        // it caps the MTU.
+        let ip_headroom = caps.tx_headroom + crate::iface::link_header_len(medium);
+        let ip_room = self
+            .inner
+            .buf_capacity
+            .checked_sub(ip_headroom)
+            .filter(|&room| room >= crate::iface::min_ip_room(medium))
+            .ok_or(AddIfaceError::BufferTooSmall)?;
+        let ip_mtu = crate::iface::ip_mtu(medium, &caps).min(ip_room);
         let index = self.ifaces.add_with(|index| IfaceState {
             handle: IfaceHandle::new(index),
             driver,
             medium,
             caps,
             ip_mtu,
+            ip_headroom,
             hardware_addr,
             ip_addrs,
             config_generation: 0,
@@ -1588,8 +1626,14 @@ impl<'d> Stack<'d> {
         let Some((route, checksum_caps)) = self.route_reply(arrival, &dst_addr) else {
             return;
         };
-        let Some(buf) = crate::tcp::build_tcp_packet(self.inner.pool, repr, &src_addr, &dst_addr, &checksum_caps)
-        else {
+        let Some(buf) = crate::tcp::build_tcp_packet(
+            self.inner.pool,
+            route.ip_headroom,
+            repr,
+            &src_addr,
+            &dst_addr,
+            &checksum_caps,
+        ) else {
             return;
         };
         self.transmit_reply(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, 64);
@@ -1642,7 +1686,7 @@ impl<'d> Stack<'d> {
                 // The reply is the request with the message type changed: ident, seq
                 // and payload stay put. Reuse the incoming buffer instead of
                 // allocating one and copying the payload over.
-                if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN) {
+                if !buf.ensure_headroom(route.ip_headroom + IPV4_HEADER_LEN) {
                     trace!("icmpv4: not enough headroom for echo reply");
                     return;
                 }
@@ -1884,7 +1928,7 @@ impl<'d> Stack<'d> {
                 // The reply is the request with the message type changed: ident, seq
                 // and payload stay put. Reuse the incoming buffer instead of
                 // allocating one and copying the payload over.
-                if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN) {
+                if !buf.ensure_headroom(route.ip_headroom + IPV6_HEADER_LEN) {
                     trace!("icmpv6: not enough headroom for echo reply");
                     return;
                 }
@@ -2031,9 +2075,11 @@ impl<'d> Stack<'d> {
                 };
                 // The error is fed back through local ingress processing rather
                 // than transmitted, so no device is going to fill its checksums in.
+                // No link layer either, so no headroom beyond the IP header.
                 let checksum_caps = ChecksumCapabilities::default();
                 let Some(mut reply) = build_icmpv4_error(
                     self.inner.pool,
+                    0,
                     &orig,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::HostUnreachable.into(),
@@ -2064,8 +2110,10 @@ impl<'d> Stack<'d> {
                 let reply_src = self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr);
                 // The error is fed back through local ingress processing rather
                 // than transmitted, so no device is going to fill its checksums in.
+                // No link layer either, so no headroom beyond the IP header.
                 let Some(mut reply) = build_icmpv6_error(
                     self.inner.pool,
+                    0,
                     &orig,
                     &reply_src,
                     &src_addr,
@@ -2110,7 +2158,14 @@ impl<'d> Stack<'d> {
         let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddr::V4(src_addr)) else {
             return;
         };
-        let Some(reply) = build_icmpv4_error(self.inner.pool, orig, msg_type, msg_code, &checksum_caps) else {
+        let Some(reply) = build_icmpv4_error(
+            self.inner.pool,
+            route.ip_headroom,
+            orig,
+            msg_type,
+            msg_code,
+            &checksum_caps,
+        ) else {
             return;
         };
         self.transmit_reply(
@@ -2159,6 +2214,7 @@ impl<'d> Stack<'d> {
         };
         let Some(reply) = build_icmpv6_error(
             self.inner.pool,
+            route.ip_headroom,
             orig,
             &reply_src,
             &src_addr,
@@ -2278,7 +2334,7 @@ impl StackInner {
                 trace!("arp: no packet buffer for reply");
                 return;
             };
-            reply.reserve(PACKET_BUF_DRIVER_HEADROOM + ETHERNET_HEADER_LEN);
+            reply.reserve(iface.caps.tx_headroom + ETHERNET_HEADER_LEN);
             reply.set_len(ARP_BUFFER_LEN);
             {
                 let mut arp_reply = ArpPacket::new_unchecked(&mut reply);
@@ -2333,7 +2389,7 @@ impl StackInner {
                 return;
             };
             let opt_len = lladdr_option_len(iface.hardware_addr);
-            reply.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN);
+            reply.reserve(iface.ip_headroom + IPV6_HEADER_LEN);
             reply.set_len(24 + opt_len);
             {
                 let mut na = Icmpv6Packet::new_unchecked(&mut reply);
@@ -2600,7 +2656,7 @@ impl StackInner {
             trace!("arp: no packet buffer for request");
             return;
         };
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + ETHERNET_HEADER_LEN);
+        buf.reserve(iface.caps.tx_headroom + ETHERNET_HEADER_LEN);
         buf.set_len(ARP_BUFFER_LEN);
         {
             let mut arp_packet = ArpPacket::new_unchecked(&mut buf);
@@ -2630,7 +2686,7 @@ impl StackInner {
             return;
         };
         let opt_len = lladdr_option_len(iface.hardware_addr);
-        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN);
+        buf.reserve(iface.ip_headroom + IPV6_HEADER_LEN);
         buf.set_len(24 + opt_len);
         {
             let mut ns = Icmpv6Packet::new_unchecked(&mut buf);
@@ -2815,7 +2871,7 @@ impl StackInner {
     }
 
     pub(crate) fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
-        debug_assert!(buf.headroom() >= PACKET_BUF_DRIVER_HEADROOM);
+        debug_assert!(buf.headroom() >= iface.caps.tx_headroom);
 
         #[cfg(feature = "packet-log")]
         {
@@ -2907,17 +2963,19 @@ pub(crate) fn push_ipv6_header(
 const ICMP_ERROR_HEADER_LEN: usize = 8;
 
 /// Build an ICMPv4 error message, quoting as much of `orig` (a whole IP packet)
-/// as fits within the minimum MTU (RFC 1812 §4.3.2.3).
+/// as fits within the minimum MTU (RFC 1812 §4.3.2.3). `ip_headroom` is what the
+/// IP packet needs in front of it, as in [`EgressRoute::ip_headroom`].
 #[cfg(feature = "ipv4")]
 fn build_icmpv4_error(
     pool: PoolRef,
+    ip_headroom: usize,
     orig: &[u8],
     msg_type: Icmpv4Message,
     msg_code: u8,
     checksum_caps: &ChecksumCapabilities,
 ) -> Option<PacketBuf> {
     let mut reply = pool.alloc()?;
-    reply.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
+    reply.reserve(ip_headroom + IPV4_HEADER_LEN);
     // A buffer smaller than the minimum MTU quotes less.
     let quote_len = orig
         .len()
@@ -2942,11 +3000,13 @@ fn build_icmpv4_error(
 /// Build an ICMPv6 error message, quoting as much of `orig` (a whole IP packet)
 /// as fits within the minimum MTU (RFC 4443 §2.4). `src_addr` and `dst_addr` are
 /// the addresses the error will be sent between, for the checksum. `pointer` is
-/// written for parameter problem messages.
+/// written for parameter problem messages. `ip_headroom` is what the IP packet
+/// needs in front of it, as in [`EgressRoute::ip_headroom`].
 #[cfg(feature = "ipv6")]
 #[allow(clippy::too_many_arguments)]
 fn build_icmpv6_error(
     pool: PoolRef,
+    ip_headroom: usize,
     orig: &[u8],
     src_addr: &Ipv6Addr,
     dst_addr: &Ipv6Addr,
@@ -2956,7 +3016,7 @@ fn build_icmpv6_error(
     checksum_caps: &ChecksumCapabilities,
 ) -> Option<PacketBuf> {
     let mut reply = pool.alloc()?;
-    reply.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN);
+    reply.reserve(ip_headroom + IPV6_HEADER_LEN);
     // A buffer smaller than the minimum MTU quotes less.
     let quote_len = orig
         .len()
@@ -5277,6 +5337,198 @@ pub(crate) mod test {
         assert_eq!(stack.add_iface_borrowed(driver), Err(AddIfaceError::Full));
     }
 
+    /// A stack with an IP interface whose driver needs no headroom, owning
+    /// [`OUR_V4_B`]/24, and an Ethernet interface whose driver needs
+    /// `big_headroom`, owning [`OUR_V4`]/24 and knowing [`REMOTE_HW`] for
+    /// [`REMOTE_V4`]. Both devices take whole buffers.
+    fn test_stack_headrooms(big_headroom: usize) -> (Stack<'static>, [TestDevice; 2]) {
+        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let mtu = crate::pool::TEST_POOL_SIZE;
+        let small = TestDevice::new(Medium::Ip).with_mtu(mtu).with_tx_headroom(0);
+        let big = TestDevice::new(Medium::Ethernet)
+            .with_mtu(mtu)
+            .with_tx_headroom(big_headroom);
+        let small_if = small.install(&mut stack, HardwareAddress::Ip);
+        let big_if = big.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
+        stack
+            .iface(small_if)
+            .set_ip_addrs([IpCidr::new(OUR_V4_B.into(), 24)])
+            .unwrap();
+        stack
+            .iface(big_if)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)])
+            .unwrap();
+        inject(&mut stack, &big.rx, arp_request_from(REMOTE_HW, REMOTE_V4));
+        small.tx.borrow_mut().clear();
+        big.tx.borrow_mut().clear();
+        (stack, [small, big])
+    }
+
+    /// Each interface leaves the headroom its own driver asks for: the test device
+    /// checks every frame it gets. The IP MTU of each is what a buffer holds after
+    /// its own headroom, and a datagram that fills it goes out.
+    #[test]
+    fn test_tx_headroom_per_iface() {
+        let (mut stack, [small, big]) = test_stack_headrooms(100);
+        let mtu = crate::pool::TEST_POOL_SIZE;
+        let small_mtu = stack.iface(IfaceHandle::new(0)).ip_mtu();
+        let big_mtu = stack.iface(IfaceHandle::new(1)).ip_mtu();
+        assert_eq!(small_mtu, mtu);
+        assert_eq!(big_mtu, mtu - 100 - ETHERNET_HEADER_LEN);
+
+        let handle = stack.add_udp_socket().unwrap();
+        let mut socket = stack.udp_socket(handle);
+        socket.bind(5000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        // The headroom for a buffer built before routing is the most any
+        // interface needs, with the larger IP header for a dual-stack bind.
+        assert_eq!(
+            socket.send_headroom(),
+            100 + ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + UDP_HEADER_LEN
+        );
+        // A bind scoped to one IP version gets that version's header.
+        for (addr, ip_header_len) in [
+            (IpAddr::from(Ipv4Addr::UNSPECIFIED), IPV4_HEADER_LEN),
+            (IpAddr::from(Ipv6Addr::UNSPECIFIED), IPV6_HEADER_LEN),
+        ] {
+            let scoped = stack.add_udp_socket().unwrap();
+            let mut scoped = stack.udp_socket(scoped);
+            scoped.bind((addr, 5001), ListenSocketAddr::UNSPECIFIED).unwrap();
+            assert_eq!(
+                scoped.send_headroom(),
+                100 + ETHERNET_HEADER_LEN + ip_header_len + UDP_HEADER_LEN
+            );
+        }
+
+        let mut socket = stack.udp_socket(handle);
+        let payload = vec![0x5a; small_mtu - IPV4_HEADER_LEN - UDP_HEADER_LEN];
+        socket.send_slice(&payload, (REMOTE_V4_B, 53)).unwrap();
+        let payload = vec![0xa5; big_mtu - IPV4_HEADER_LEN - UDP_HEADER_LEN];
+        socket.send_slice(&payload, (REMOTE_V4, 53)).unwrap();
+        assert_eq!(
+            socket.send_slice(&[0; 1], (REMOTE_V4, 53)).map(|_| ()),
+            Ok(()),
+            "a small datagram goes out of the big interface too"
+        );
+
+        assert_eq!(small.tx.borrow().len(), 1);
+        assert_eq!(small.tx.borrow()[0].len(), small_mtu);
+        assert_eq!(big.tx.borrow().len(), 2);
+        assert_eq!(big.tx.borrow()[0].len(), ETHERNET_HEADER_LEN + big_mtu);
+
+        // A segment the stack builds itself, on each interface.
+        for remote in [REMOTE_V4, REMOTE_V4_B] {
+            let tcp = stack
+                .add_tcp_socket_with_bufs(vec![0; 1024].leak(), vec![0; 1024].leak())
+                .unwrap();
+            stack.tcp_socket(tcp).connect((remote, 80), 0).unwrap();
+        }
+        stack.poll(Instant::ZERO);
+        assert_eq!(small.tx.borrow().len(), 2);
+        assert_eq!(big.tx.borrow().len(), 3);
+    }
+
+    /// An interface whose driver needs so much headroom that a buffer can't hold
+    /// the stack's headers after it is refused.
+    #[test]
+    fn test_add_iface_buffer_too_small() {
+        use crate::iface::AddIfaceError;
+
+        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let room = crate::iface::min_ip_room(Medium::Ip);
+        let headroom = crate::pool::TEST_POOL_SIZE - room;
+        let driver = Box::leak(Box::new(TestDevice::new(Medium::Ip).with_tx_headroom(headroom + 1)));
+        assert_eq!(stack.add_iface_borrowed(driver), Err(AddIfaceError::BufferTooSmall));
+        let driver = Box::leak(Box::new(TestDevice::new(Medium::Ip).with_tx_headroom(usize::MAX)));
+        assert_eq!(stack.add_iface_borrowed(driver), Err(AddIfaceError::BufferTooSmall));
+        assert!(stack.ifaces().next().is_none());
+
+        // Exactly enough is fine, and caps the IP MTU.
+        let driver = Box::leak(Box::new(TestDevice::new(Medium::Ip).with_tx_headroom(headroom)));
+        let iface = stack.add_iface_borrowed(driver).unwrap();
+        assert_eq!(stack.iface(iface).ip_mtu(), room);
+    }
+
+    /// With DHCP, an Ethernet interface must leave room for a whole DHCP message,
+    /// an IP one doesn't.
+    #[test]
+    #[cfg(feature = "dhcpv4")]
+    fn test_add_iface_buffer_too_small_for_dhcp() {
+        use crate::iface::AddIfaceError;
+
+        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let headroom = crate::pool::TEST_POOL_SIZE - ETHERNET_HEADER_LEN - IPV4_MIN_MTU + 1;
+        let driver = Box::leak(Box::new(TestDevice::new(Medium::Ethernet).with_tx_headroom(headroom)));
+        assert_eq!(stack.add_iface_borrowed(driver), Err(AddIfaceError::BufferTooSmall));
+        let driver = Box::leak(Box::new(
+            TestDevice::new(Medium::Ethernet).with_tx_headroom(headroom - 1),
+        ));
+        stack.add_iface_borrowed(driver).unwrap();
+        let driver = Box::leak(Box::new(TestDevice::new(Medium::Ip).with_tx_headroom(headroom)));
+        stack.add_iface_borrowed(driver).unwrap();
+    }
+
+    /// A raw IP packet is built before it is routed, so it gets the most headroom
+    /// any interface needs, and goes out of either.
+    #[test]
+    fn test_tx_headroom_raw_ip() {
+        let (mut stack, [small, big]) = test_stack_headrooms(100);
+        let handle = stack.add_raw_socket().unwrap();
+        stack
+            .raw_socket(handle)
+            .bind(RawMode::Ip {
+                version: None,
+                protocol: None,
+            })
+            .unwrap();
+        assert_eq!(stack.raw_socket(handle).send_headroom(), 100 + ETHERNET_HEADER_LEN);
+        let max = crate::pool::TEST_POOL_SIZE - 100 - ETHERNET_HEADER_LEN;
+        assert_eq!(
+            stack.raw_socket(handle).send_with(max + 1, |_| unreachable!()),
+            Err(crate::raw::SendError::BufferFull)
+        );
+
+        let packet = ipv4_packet(OUR_V4_B, REMOTE_V4_B, IpProtocol(99), b"small");
+        stack.raw_socket(handle).send_slice(&packet).unwrap();
+        let packet = ipv4_packet(OUR_V4, REMOTE_V4, IpProtocol(99), b"big");
+        stack.raw_socket(handle).send_slice(&packet).unwrap();
+        assert_eq!(small.tx.borrow().len(), 1);
+        assert_eq!(big.tx.borrow().len(), 1);
+
+        // An owned buffer with too little headroom is moved, not refused.
+        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
+        buf.set_len(packet.len());
+        buf.copy_from_slice(&packet);
+        stack
+            .raw_socket(handle)
+            .send_packet(buf)
+            .map_err(|(err, _)| err)
+            .unwrap();
+        assert_eq!(big.tx.borrow().len(), 2);
+    }
+
+    /// The echo reply is built in the request's buffer. The request arrived with
+    /// less headroom than the reply needs out of an interface whose driver asks
+    /// for some, so it is moved to make room.
+    #[test]
+    #[cfg(feature = "icmp-ping-reply")]
+    fn test_tx_headroom_echo_reply() {
+        let (mut stack, [_small, big]) = test_stack_headrooms(100);
+        let ip_mtu = stack.iface(IfaceHandle::new(1)).ip_mtu();
+        let payload: Vec<u8> = (0..ip_mtu - IPV4_HEADER_LEN - 8).map(|i| i as u8).collect();
+        let request = icmpv4_echo(Icmpv4Message::EchoRequest, 0x1234, 7, &payload);
+        let mut frame = arp_request_from(REMOTE_HW, REMOTE_V4)[..ETHERNET_HEADER_LEN].to_vec();
+        EthernetFrame::new_unchecked(&mut frame[..]).set_dst_addr(OUR_HW);
+        EthernetFrame::new_unchecked(&mut frame[..]).set_ethertype(EthernetProtocol::Ipv4);
+        frame.extend_from_slice(&ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request));
+        inject(&mut stack, &big.rx, frame);
+
+        let tx = big.tx.borrow();
+        assert_eq!(tx.len(), 1);
+        let (msg_type, _, data) = parse_icmpv4_reply(&tx[0][ETHERNET_HEADER_LEN..], OUR_V4, REMOTE_V4);
+        assert_eq!(msg_type, Icmpv4Message::EchoReply);
+        assert_eq!(data, payload);
+    }
+
     #[test]
     #[cfg(feature = "hostname")]
     fn test_set_hostname_too_long() {
@@ -5897,7 +6149,6 @@ pub(crate) mod test {
     #[cfg(feature = "ipv4-fragmentation")]
     use crate::wire::IPV4_FRAGMENT_PAYLOAD_ALIGNMENT;
 
-    #[cfg(any(feature = "ipv4-fragmentation", feature = "ipv4-reassembly"))]
     const REMOTE_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
 
     /// The link-layer header an interface of this medium puts in front of an IP packet.
@@ -6008,7 +6259,7 @@ pub(crate) mod test {
                 100,
                 ip_mtu,
                 ip_mtu + 1,
-                crate::pool::TEST_POOL_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN,
+                crate::pool::TEST_POOL_SIZE - crate::test_device::TX_HEADROOM - link_header_len(medium),
             ] {
                 tx.borrow_mut().clear();
 
@@ -6019,7 +6270,7 @@ pub(crate) mod test {
                 let datagram = udp_datagram(OUR_V4.into(), 12345, REMOTE_V4.into(), 54321, &udp_packet_payload);
 
                 let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
-                buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
+                buf.reserve(crate::test_device::TX_HEADROOM + link_header_len(medium) + IPV4_HEADER_LEN);
                 buf.set_len(datagram.len());
                 buf.copy_from_slice(&datagram);
 

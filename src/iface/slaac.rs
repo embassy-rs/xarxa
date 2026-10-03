@@ -8,8 +8,6 @@
 //!
 //! Needs the `slaac` feature.
 
-use crate::config::PACKET_BUF_DRIVER_HEADROOM;
-
 use crate::config::{SLAAC_PREFIX_COUNT, SLAAC_ROUTER_COUNT};
 use crate::storage::Vec;
 
@@ -20,8 +18,8 @@ use crate::stack::StackInner;
 use crate::time::{Clock, Duration, Instant};
 use crate::wire::{
     HardwareAddress, IPV6_HEADER_LEN, IPV6_LINK_LOCAL_ALL_ROUTERS, Icmpv6Message, Icmpv6Packet, IpCidr, Ipv6Addr,
-    Ipv6Cidr, LINK_HEADER_LEN, NdiscOption, NdiscOptionType, NdiscPrefixInfoFlags, NdiscRouterFlags,
-    RawHardwareAddress, ipv6::AddressExt,
+    Ipv6Cidr, NdiscOption, NdiscOptionType, NdiscPrefixInfoFlags, NdiscRouterFlags, RawHardwareAddress,
+    ipv6::AddressExt,
 };
 
 const MAX_RTR_SOLICITATIONS: u8 = 3;
@@ -571,7 +569,7 @@ impl IfaceState<'_> {
         // next one.
         if let Some(mut buf) = inner.pool.alloc() {
             let opt_len = crate::stack::lladdr_option_len(self.hardware_addr);
-            buf.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN);
+            buf.reserve(self.ip_headroom + IPV6_HEADER_LEN);
             buf.set_len(8 + opt_len);
             {
                 let mut rs = Icmpv6Packet::new_unchecked(&mut buf);

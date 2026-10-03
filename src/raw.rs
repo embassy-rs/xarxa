@@ -10,8 +10,6 @@
 //!   interfaces. The socket may be bound to an IP version and/or an IP protocol,
 //!   both optional.
 
-use crate::config::PACKET_BUF_DRIVER_HEADROOM;
-
 use crate::config::RAW_RX_QUEUE_COUNT;
 use crate::storage::BoundedDeque;
 use core::fmt;
@@ -32,7 +30,7 @@ use crate::wire::Ipv6Packet;
 #[cfg(feature = "raw-ethernet")]
 use crate::wire::{EthernetFrame, EthernetProtocol};
 #[cfg(feature = "raw-ip")]
-use crate::wire::{IpAddr, IpProtocol, IpVersion, LINK_HEADER_LEN};
+use crate::wire::{IpAddr, IpProtocol, IpVersion};
 
 define_handle! {
     /// A handle to a raw socket added to a [`Stack`].
@@ -523,26 +521,24 @@ impl RawSocket<'_, '_> {
             return Err(SendError::InvalidState);
         };
 
-        // Ethernet frames go out as-is. IP packets get an Ethernet header prepended
-        // on Ethernet mediums, so they need headroom for it.
-        let headroom = PACKET_BUF_DRIVER_HEADROOM
-            + match mode {
-                #[cfg(feature = "raw-ethernet")]
-                RawMode::Ethernet { .. } => 0,
-                #[cfg(feature = "raw-ip")]
-                RawMode::Ip { .. } => LINK_HEADER_LEN,
-            };
-
         // Ethernet frames carry no routing information: a bound socket sends on
         // its interface, an unbound one on the first Ethernet interface. The
-        // interface is known up front, so ask it for room before building. An
-        // IP-mode packet names its destination inside, so it is built first and
-        // routed after.
+        // interface is known up front, so ask it for room before building, and
+        // leave the headroom its driver needs. An IP-mode packet names its
+        // destination inside, so it is built first and routed after. It gets the
+        // most headroom any interface needs, so it fits the one it goes out of.
         #[cfg(feature = "raw-ethernet")]
-        let ethernet = match mode {
-            RawMode::Ethernet { ethertype } => Some((self.prepare_ethernet_send()?, ethertype)),
+        let (ethernet, headroom) = match mode {
+            RawMode::Ethernet { ethertype } => {
+                let iface = self.prepare_ethernet_send()?;
+                (Some((iface, ethertype)), self.tx.tx_headroom(iface))
+            }
             #[cfg(feature = "raw-ip")]
-            RawMode::Ip { .. } => None,
+            RawMode::Ip { .. } => (None, self.tx.max_ip_headroom()),
+        };
+        #[cfg(not(feature = "raw-ethernet"))]
+        let headroom = match mode {
+            RawMode::Ip { .. } => self.tx.max_ip_headroom(),
         };
 
         let Some(mut buf) = self.tx.inner.pool.alloc() else {
@@ -568,12 +564,16 @@ impl RawSocket<'_, '_> {
         self.send_packet(buf).map_err(|(err, _)| err)
     }
 
+    /// The interface an Ethernet-mode socket sends on: its bound interface, else
+    /// the first Ethernet interface.
+    #[cfg(feature = "raw-ethernet")]
+    fn ethernet_iface(&self) -> Option<IfaceHandle> {
+        self.state.binding.iface().or_else(|| self.tx.first_ethernet_iface())
+    }
+
     #[cfg(feature = "raw-ethernet")]
     fn prepare_ethernet_send(&mut self) -> Result<IfaceHandle, SendError> {
-        let iface = match self.state.binding.iface() {
-            Some(iface) => iface,
-            None => self.tx.first_ethernet_iface().ok_or(SendError::Unaddressable)?,
-        };
+        let iface = self.ethernet_iface().ok_or(SendError::Unaddressable)?;
         self.check_send_ready(iface)?;
         Ok(iface)
     }
@@ -590,12 +590,33 @@ impl RawSocket<'_, '_> {
         Ok(())
     }
 
+    /// Headroom to reserve in a buffer for [`send_packet`](Self::send_packet), so
+    /// that the packet isn't moved.
+    ///
+    /// - In Ethernet mode, what the driver of the interface the socket sends on
+    ///   needs.
+    /// - In IP mode, what any interface needs in front of an IP packet. It grows
+    ///   if an interface that needs more is added.
+    ///
+    /// Zero if the socket isn't bound, or has no interface to send on.
+    ///
+    /// # Panics
+    /// Panics if the socket is bound to an interface that has been removed.
+    pub fn send_headroom(&self) -> usize {
+        match self.state.mode {
+            None => 0,
+            #[cfg(feature = "raw-ethernet")]
+            Some(RawMode::Ethernet { .. }) => self.ethernet_iface().map_or(0, |iface| self.tx.tx_headroom(iface)),
+            #[cfg(feature = "raw-ip")]
+            Some(RawMode::Ip { .. }) => self.tx.max_ip_headroom(),
+        }
+    }
+
     /// Send an owned packet, preserving its packet metadata.
     ///
     /// The buffer contains a complete Ethernet frame or IP packet, as in
-    /// [`send_with`](Self::send_with). Reserve [`PACKET_BUF_DRIVER_HEADROOM`], plus
-    /// [`crate::wire::LINK_HEADER_LEN`] in IP mode, to avoid moving it.
-    /// Further encapsulation may need more space.
+    /// [`send_with`](Self::send_with). Reserve
+    /// [`send_headroom`](Self::send_headroom) to avoid moving it.
     ///
     /// Errors return the buffer unchanged. Errors match [`send_with`](Self::send_with),
     /// except this method allocates no payload buffer and never returns [`SendError::NoBuffer`].
@@ -614,7 +635,7 @@ impl RawSocket<'_, '_> {
                     Ok(iface) => iface,
                     Err(err) => return Err((err, buf)),
                 };
-                if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM) {
+                if !buf.ensure_headroom(self.tx.tx_headroom(iface)) {
                     return Err((SendError::BufferFull, buf));
                 }
                 trace!("raw: sending {} octet frame", buf.len());
@@ -640,7 +661,7 @@ impl RawSocket<'_, '_> {
                 if let Err(err) = self.check_send_ready(route.iface) {
                     return Err((err, buf));
                 }
-                if !buf.ensure_headroom(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN) {
+                if !buf.ensure_headroom(route.ip_headroom) {
                     return Err((SendError::BufferFull, buf));
                 }
                 trace!("raw: sending {} octets to {}", buf.len(), dst_addr);
@@ -1388,12 +1409,11 @@ mod test {
         // Version filter mismatch: an IPv6 packet on an IPv4-bound socket.
         let v6 = ipv6_packet(IP_PROTO, b"abcd");
         assert_eq!(stack.raw_socket(handle).send_slice(&v6), Err(SendError::Malformed));
-        // Too big for a packet buffer (IP mode leaves room for the Ethernet header).
+        // Too big for a packet buffer (IP mode leaves the headroom the interface
+        // needs in front of an IP packet).
+        let max = crate::pool::TEST_POOL_SIZE - stack.raw_socket(handle).send_headroom();
         assert_eq!(
-            stack.raw_socket(handle).send_with(
-                crate::pool::TEST_POOL_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN + 1,
-                |_| unreachable!()
-            ),
+            stack.raw_socket(handle).send_with(max + 1, |_| unreachable!()),
             Err(SendError::BufferFull)
         );
         assert_eq!(tx.borrow().len(), 1);
@@ -1523,9 +1543,9 @@ mod test {
                 .send_slice(&ipv6_packet(IpProtocol::Tcp, b"abcd")),
             Err(SendError::Malformed)
         );
-        // Too big for a packet buffer: IP mode leaves room for the link header,
-        // whatever medium the packet ends up going out of.
-        let max = crate::pool::TEST_POOL_SIZE - PACKET_BUF_DRIVER_HEADROOM - LINK_HEADER_LEN;
+        // Too big for a packet buffer: IP mode leaves the most headroom any
+        // interface needs, whichever one the packet ends up going out of.
+        let max = crate::pool::TEST_POOL_SIZE - stack.raw_socket(handle).send_headroom();
         assert_eq!(
             stack.raw_socket(handle).send_with(max + 1, |_| unreachable!()),
             Err(SendError::BufferFull)

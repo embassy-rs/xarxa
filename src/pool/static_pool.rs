@@ -14,6 +14,9 @@ use crate::driver::{PacketBuf, PacketMeta, RawPacketBuf};
 /// - 128 or 256 for IEEE 802.15.4 without 6LoWPAN fragmentation. 256 leaves
 ///   room for the headers to grow when they are decompressed.
 ///
+/// Add the largest [`tx_headroom`](crate::driver::Capabilities::tx_headroom) of
+/// your drivers. A frame and the headroom in front of it share one buffer.
+///
 /// `SIZE` also caps the MTU of every interface. Going below the protocol minimums
 /// works, but breaks interoperability:
 /// - IPv6 needs 1280 bytes plus the link header (RFC 8200).

@@ -48,6 +48,10 @@ pub type Link = Rc<Cell<LinkState>>;
 /// The multicast filter updates reported so far, oldest first. `true` is add.
 pub type McastFilter = Rc<RefCell<Vec<Vec<[u8; 6]>>>>;
 
+/// The [`tx_headroom`](Capabilities::tx_headroom) a [`TestDevice`] reports by
+/// default. Not zero, so that every test checks that the stack leaves it.
+pub const TX_HEADROOM: usize = 16;
+
 /// A mock network device.
 ///
 /// Build one with [`TestDevice::new`] plus the `with_*` setters, then give it to
@@ -62,6 +66,9 @@ pub struct TestDevice {
     pub mtu: usize,
     /// The checksums it claims to compute and verify itself.
     pub checksum: ChecksumCapabilities,
+    /// The headroom it asks for in front of transmitted frames. It checks that
+    /// every frame has it.
+    pub tx_headroom: usize,
     /// Frames to hand to the stack, oldest first.
     pub rx: Queue,
     /// Frames the stack transmitted, oldest first.
@@ -91,13 +98,14 @@ pub struct TestDevice {
 }
 
 impl TestDevice {
-    /// A device of the given medium, with a 1500-byte MTU and unlimited
-    /// transmit room, receiving nothing.
+    /// A device of the given medium, with a 1500-byte MTU, [`TX_HEADROOM`] and
+    /// unlimited transmit room, receiving nothing.
     pub fn new(medium: Medium) -> Self {
         Self {
             medium,
             mtu: 1500,
             checksum: ChecksumCapabilities::default(),
+            tx_headroom: TX_HEADROOM,
             rx: Rc::new(RefCell::new(VecDeque::new())),
             tx: Rc::new(RefCell::new(Vec::new())),
             #[cfg(feature = "packetmeta-id")]
@@ -139,6 +147,12 @@ impl TestDevice {
         self
     }
 
+    /// Sets the headroom it asks for in front of transmitted frames.
+    pub fn with_tx_headroom(mut self, tx_headroom: usize) -> Self {
+        self.tx_headroom = tx_headroom;
+        self
+    }
+
     /// Stamps every received packet with this metadata.
     #[cfg(feature = "packetmeta-id")]
     pub fn with_rx_meta(mut self, meta: PacketMeta) -> Self {
@@ -170,6 +184,7 @@ impl Driver for TestDevice {
         caps.medium = self.medium.into();
         caps.max_transmission_unit = self.mtu;
         caps.checksum = self.checksum;
+        caps.tx_headroom = self.tx_headroom;
         caps
     }
 
@@ -212,6 +227,12 @@ impl Driver for TestDevice {
     }
 
     fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+        assert!(
+            buf.headroom() >= self.tx_headroom,
+            "frame with {} bytes of headroom, the device asked for {}",
+            buf.headroom(),
+            self.tx_headroom
+        );
         if !self.can_transmit() {
             return Err(buf);
         }

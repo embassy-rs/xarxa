@@ -84,6 +84,26 @@ fn static_limit() {
     check_limit(&A, &B, 4);
 }
 
+/// `StaticPool` looks for a free slot from the last one freed on, and wraps
+/// around to find the ones before it.
+#[test]
+fn static_claim_wraps() {
+    static POOL: StaticPool<1514, 4> = StaticPool::new();
+    let mut held: Vec<PacketBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
+    assert_eq!(held.len(), 4);
+    let mut ptrs: Vec<*const u8> = held.iter_mut().map(|b| b.storage_mut().as_ptr()).collect();
+
+    // Free the first slot, then the last: the search starts at the last one.
+    drop(held.remove(0));
+    drop(held.pop());
+    let mut last = POOL.alloc().unwrap();
+    assert_eq!(last.storage_mut().as_ptr(), ptrs.pop().unwrap());
+    // The first slot is only found by wrapping around.
+    let mut first = POOL.alloc().unwrap();
+    assert_eq!(first.storage_mut().as_ptr(), ptrs.remove(0));
+    assert!(POOL.alloc().is_none());
+}
+
 #[cfg(feature = "alloc")]
 #[test]
 fn alloc_limit() {

@@ -84,7 +84,7 @@ pub(crate) struct StackInner {
     /// The pool the stack allocates its packet buffers from.
     pub(crate) pool: PoolRef,
     /// Size of the storage of each buffer of `pool`.
-    buf_capacity: usize,
+    pub(crate) buf_capacity: usize,
     #[cfg(feature = "packetmeta-timestamp")]
     pub(crate) tx_timestamps: TxTimestampQueue,
     #[cfg_attr(not(any(feature = "udp", feature = "tcp")), allow(dead_code))]
@@ -1394,6 +1394,17 @@ impl<'d> Stack<'d> {
         }
         #[cfg(feature = "ipv4-reassembly")]
         let mut buf = if ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0 {
+            // A fragment not for us would take a reassembly slot for nothing. With
+            // the DHCP client on, the packet may be for the address being leased,
+            // which isn't ours yet, so it is reassembled anyway.
+            let iface_state = self.ifaces.get(iface.index());
+            let for_us = iface_state.accepts_v4_dst(ipv4_packet.dst_addr());
+            #[cfg(feature = "dhcpv4")]
+            let for_us = for_us || iface_state.dhcpv4.is_some();
+            if !for_us {
+                trace!("Rejecting IPv4 fragment; not for us");
+                return;
+            }
             let Some(buf) = self.reassemble_ipv4(buf, now) else {
                 return;
             };
@@ -1470,10 +1481,7 @@ impl<'d> Stack<'d> {
                 return;
             }
 
-            if !iface.has_ip_addr(dst_addr.into())
-                && !iface.has_multicast_group(dst_addr.into())
-                && !iface.is_broadcast_v4(dst_addr)
-            {
+            if !iface.accepts_v4_dst(dst_addr) {
                 // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
                 trace!("Rejecting IPv4 packet; not for us");
                 return;
@@ -6563,6 +6571,95 @@ pub(crate) mod test {
         );
         assert!(stack.raw_socket(handle).can_recv());
         assert_eq!(stack.raw_socket(handle).recv().unwrap().len(), IPV4_HEADER_LEN + 30);
+    }
+
+    /// A raw socket for protocol 99, and the two fragments of a 30-octet packet
+    /// of it from the remote, ident 0x1234.
+    #[cfg(all(feature = "raw-ip", feature = "ipv4-reassembly"))]
+    fn reassembly_test_stack() -> (Stack<'static>, Queue, RawHandle, [Vec<u8>; 2]) {
+        let (mut stack, rx, _tx) = test_stack(Medium::Ip);
+        let handle = stack.add_raw_socket().unwrap();
+        stack
+            .raw_socket(handle)
+            .bind(RawMode::Ip {
+                version: Some(IpVersion::V4),
+                protocol: Some(IpProtocol(99)),
+            })
+            .unwrap();
+        let proto = IpProtocol(99);
+        let frags = [
+            ipv4_fragment(REMOTE_V4, OUR_V4, proto, 0x1234, true, 0, &[0xAA; 24]),
+            ipv4_fragment(REMOTE_V4, OUR_V4, proto, 0x1234, false, 24, &[0xBB; 6]),
+        ];
+        (stack, rx, handle, frags)
+    }
+
+    /// A fragment not for us takes no reassembly slot.
+    #[test]
+    #[cfg(all(feature = "raw-ip", feature = "ipv4-reassembly"))]
+    fn test_ipv4_reassembly_fragment_not_for_us() {
+        let (mut stack, rx, handle, frags) = reassembly_test_stack();
+        for ident in 0..crate::config::REASSEMBLY_BUFFER_COUNT as u16 {
+            let stray = ipv4_fragment(
+                Ipv4Addr::new(1, 2, 3, 4),
+                Ipv4Addr::new(10, 9, 9, 9),
+                IpProtocol(99),
+                0x7777 + ident,
+                true,
+                0,
+                &[0; 8],
+            );
+            inject(&mut stack, &rx, stray);
+        }
+        for frag in frags {
+            inject(&mut stack, &rx, frag);
+        }
+        assert!(stack.raw_socket(handle).can_recv());
+    }
+
+    /// A packet too large for a packet buffer frees its reassembly slot once a
+    /// fragment shows it, instead of holding it until the timeout.
+    #[test]
+    #[cfg(all(feature = "raw-ip", feature = "ipv4-reassembly"))]
+    fn test_ipv4_reassembly_too_large() {
+        let (mut stack, rx, handle, frags) = reassembly_test_stack();
+        let proto = IpProtocol(99);
+        inject(
+            &mut stack,
+            &rx,
+            ipv4_fragment(REMOTE_V4, OUR_V4, proto, 0x5555, true, 0, &[0; 1000]),
+        );
+        inject(
+            &mut stack,
+            &rx,
+            ipv4_fragment(REMOTE_V4, OUR_V4, proto, 0x5555, false, 2000, &[0; 1000]),
+        );
+        for frag in frags {
+            inject(&mut stack, &rx, frag);
+        }
+        assert!(stack.raw_socket(handle).can_recv());
+    }
+
+    /// A packet that never completes gives its reassembly slot to another one
+    /// after a second, not after the whole reassembly timeout.
+    #[test]
+    #[cfg(all(feature = "raw-ip", feature = "ipv4-reassembly"))]
+    fn test_ipv4_reassembly_stale_slot_evicted() {
+        let (mut stack, rx, handle, frags) = reassembly_test_stack();
+        for ident in 0..crate::config::REASSEMBLY_BUFFER_COUNT as u16 {
+            let stray = ipv4_fragment(REMOTE_V4, OUR_V4, IpProtocol(99), 0x7777 + ident, true, 0, &[0; 8]);
+            inject(&mut stack, &rx, stray);
+        }
+        for frag in &frags {
+            rx.borrow_mut().push_back(frag.clone());
+        }
+        stack.poll(Instant::from_millis(999));
+        assert!(!stack.raw_socket(handle).can_recv());
+        for frag in frags {
+            rx.borrow_mut().push_back(frag);
+        }
+        stack.poll(Instant::from_secs(1));
+        assert!(stack.raw_socket(handle).can_recv());
     }
 
     /// With a zero reassembly timeout, the fragments of a packet must all arrive in

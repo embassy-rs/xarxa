@@ -150,7 +150,9 @@ pub const ASSEMBLER_MAX_SEGMENT_COUNT: usize = raw::ASSEMBLER_MAX_SEGMENT_COUNT;
 /// Max datagrams reassembled, IPv4 and 6LoWPAN together.
 ///
 /// Each one holds a packet buffer until it is complete or its reassembly
-/// timeout expires. Fragments of further datagrams are dropped.
+/// timeout expires. When all are in use, the fragments of another datagram take
+/// the place of the one closest to expiring, once that one has had a second.
+/// Before that, they are dropped.
 ///
 /// This is a limit with and without `alloc`. Default: 1.
 pub const REASSEMBLY_BUFFER_COUNT: usize = raw::REASSEMBLY_BUFFER_COUNT;

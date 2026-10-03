@@ -656,7 +656,7 @@ impl Stack<'_> {
         mut buf: PacketBuf,
         now: Instant,
     ) -> Option<PacketBuf> {
-        use crate::reassembly::FragKey;
+        use crate::reassembly::{FragKey, Fragment};
 
         // The key needs both link-layer addresses.
         if ieee802154_repr.src_addr.is_none() || ieee802154_repr.dst_addr.is_none() {
@@ -678,44 +678,22 @@ impl Stack<'_> {
         }
 
         let datagram_size = frag.size() as usize;
-        let is_first_fragment = frag.is_first_fragment();
-        // The offset of this fragment in increments of 8 octets.
-        let offset = frag.offset() as usize * 8;
+        // The offset of this fragment in increments of 8 octets. The first one's
+        // is zero: it starts with the headers, decompressed below.
+        let offset = if frag.is_first_fragment() {
+            0
+        } else {
+            frag.offset() as usize * 8
+        };
         // The key specifies to which 6LoWPAN fragment it belongs too.
         // It is based on the link layer addresses, the tag and the size.
         let key = FragKey::Sixlowpan(frag.key(ieee802154_repr));
-        let header_len = frag.buffer_len();
 
-        // We reserve a spot in the packet assembler set and add the required
-        // information to the packet assembler.
-        let frag_slot = match self
-            .fragments
-            .assembler
-            .get(&key, now + self.fragments.reassembly_timeout)
-        {
-            Ok(frag) => frag,
-            Err(_) => {
-                debug!("No available packet assembler for fragmented packet");
-                return None;
-            }
-        };
+        buf.pull_front(frag.buffer_len());
 
-        buf.pull_front(header_len);
-
-        if is_first_fragment {
-            // The first fragment contains the total size of the IPv6 packet.
-            // However, we received a packet that is compressed following the 6LoWPAN
-            // standard. This means we need to convert the IPv6 packet size to a 6LoWPAN
-            // packet size. The packet size can be different because of first the
-            // compression of the IP header and when UDP is used (because the UDP header
-            // can also be compressed). Other headers are not compressed by 6LoWPAN.
-            if frag_slot.set_total_size(datagram_size).is_err() {
-                debug!("No available packet assembler for fragmented packet");
-                return None;
-            }
-
-            // Decompress the headers in the fragment's own buffer, then copy
-            // them into the assembler.
+        // Decompress the first fragment's headers in its own buffer, before a
+        // reassembly slot is taken for it.
+        if frag.is_first_fragment() {
             let address_context = &self.ifaces.get(iface.index()).sixlowpan.sixlowpan_address_context;
             if sixlowpan_to_ipv6(
                 &mut buf,
@@ -729,25 +707,22 @@ impl Stack<'_> {
                 debug!("sixlowpan decompress failed");
                 return None;
             }
-            if let Err(e) = frag_slot.add(self.inner.pool, &buf, 0) {
-                debug!("fragmentation error: {:?}", e);
-                return None;
-            }
-        } else {
-            // Add the fragment to the packet assembler.
-            if let Err(e) = frag_slot.add(self.inner.pool, &buf, offset) {
-                debug!("fragmentation error: {:?}", e);
-                return None;
-            }
         }
 
-        match frag_slot.assemble(self.inner.pool) {
-            Some(payload) => {
-                trace!("6LoWPAN: fragmented packet now complete");
-                Some(payload)
-            }
-            None => None,
-        }
+        let frag = Fragment {
+            key,
+            offset,
+            data: &buf,
+            total_size: Some(datagram_size),
+            max_size: self.inner.buf_capacity,
+            restart_on_overlap: true,
+        };
+        let packet = self
+            .fragments
+            .assembler
+            .add(self.inner.pool, frag, now, self.fragments.reassembly_timeout)?;
+        trace!("6LoWPAN: fragmented packet now complete");
+        Some(packet)
     }
 }
 
@@ -1901,9 +1876,89 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         }
         inject(&mut stack, &rx, frames[3].clone());
         check_received(&mut stack, udp);
-        // Late duplicates start a new, never completed, reassembly.
+        // A late duplicate doesn't make the datagram again.
         inject(&mut stack, &rx, frames[3].clone());
         assert_eq!(stack.udp_socket(udp).recv().err(), Some(RecvError::Exhausted));
+    }
+
+    #[cfg(feature = "sixlowpan-reassembly")]
+    fn inject_at(stack: &mut Stack, rx: &Queue, frame: Vec<u8>, now: Instant) {
+        rx.borrow_mut().push_back(frame);
+        stack.poll(now);
+    }
+
+    /// A late duplicate of the last fragment, like the MAC retransmission of a
+    /// frame whose ACK was lost, takes no reassembly slot: the next datagram is
+    /// reassembled right away.
+    #[test]
+    #[cfg(feature = "sixlowpan-reassembly")]
+    fn test_reassembly_late_duplicate_takes_no_slot() {
+        let (mut stack, _iface, rx, _tx, _room, udp) = reassembly_stack();
+        let frames = big_datagram(1);
+        for frame in &frames {
+            inject(&mut stack, &rx, frame.clone());
+        }
+        check_received(&mut stack, udp);
+        inject(&mut stack, &rx, frames[3].clone());
+        for frame in &big_datagram(2) {
+            inject(&mut stack, &rx, frame.clone());
+        }
+        check_received(&mut stack, udp);
+    }
+
+    /// A first fragment that can't be decompressed takes no reassembly slot.
+    #[test]
+    #[cfg(feature = "sixlowpan-reassembly")]
+    fn test_reassembly_bad_first_fragment() {
+        let (mut stack, _iface, rx, _tx, _room, udp) = reassembly_stack();
+        let mut bad = big_datagram(7)[0].clone();
+        let mac_len = mac_repr(PEER_LL, OUR_LL, Some(PAN)).buffer_len();
+        // SAC=1: the source address is compressed against context 0, which the
+        // interface doesn't have.
+        bad[mac_len + 4 + 1] |= 0x40;
+        inject(&mut stack, &rx, bad);
+        for frame in &big_datagram(1) {
+            inject(&mut stack, &rx, frame.clone());
+        }
+        check_received(&mut stack, udp);
+    }
+
+    /// A fragment past the datagram size makes the datagram impossible to
+    /// complete. It frees the slot instead of pinning it.
+    #[test]
+    #[cfg(feature = "sixlowpan-reassembly")]
+    fn test_reassembly_fragment_past_datagram_size() {
+        let (mut stack, _iface, rx, _tx, _room, udp) = reassembly_stack();
+        let mut bad = big_datagram(7)[3].clone();
+        let mac_len = mac_repr(PEER_LL, OUR_LL, Some(PAN)).buffer_len();
+        // The FRAGN offset, in 8-octet units: past the 348-octet datagram.
+        bad[mac_len + 4] = 50;
+        inject(&mut stack, &rx, bad);
+        for frame in &big_datagram(1) {
+            inject(&mut stack, &rx, frame.clone());
+        }
+        check_received(&mut stack, udp);
+    }
+
+    /// A datagram that never completes gives its slot to another one after a
+    /// second, not after the whole reassembly timeout.
+    #[test]
+    #[cfg(feature = "sixlowpan-reassembly")]
+    fn test_reassembly_stale_slot_evicted() {
+        use crate::config::REASSEMBLY_BUFFER_COUNT;
+        let (mut stack, _iface, rx, _tx, _room, udp) = reassembly_stack();
+        for tag in 0..REASSEMBLY_BUFFER_COUNT as u16 {
+            inject(&mut stack, &rx, big_datagram(100 + tag)[0].clone());
+        }
+        let frames = big_datagram(1);
+        for frame in &frames {
+            inject_at(&mut stack, &rx, frame.clone(), Instant::from_millis(999));
+        }
+        assert_eq!(stack.udp_socket(udp).recv().err(), Some(RecvError::Exhausted));
+        for frame in &frames {
+            inject_at(&mut stack, &rx, frame.clone(), Instant::from_secs(1));
+        }
+        check_received(&mut stack, udp);
     }
 
     /// A fragment whose datagram size disagrees belongs to another datagram,

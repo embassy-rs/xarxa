@@ -971,6 +971,14 @@ impl IfaceState<'_> {
             .any(|broadcast_address| address == broadcast_address)
     }
 
+    /// Whether an IPv4 packet to `dst_addr` is for this interface: to one of its
+    /// addresses, to a multicast group it listens to, or to broadcast.
+    #[cfg(feature = "ipv4")]
+    #[cfg_attr(not(any(feature = "medium-ethernet", feature = "medium-ip")), allow(dead_code))]
+    pub(crate) fn accepts_v4_dst(&self, dst_addr: Ipv4Addr) -> bool {
+        self.has_ip_addr(dst_addr.into()) || self.has_multicast_group(dst_addr.into()) || self.is_broadcast_v4(dst_addr)
+    }
+
     /// Checks if an ipv4 address is unicast, taking into account subnet broadcast addresses
     #[cfg(feature = "ipv4")]
     #[inline(never)] // helps code size

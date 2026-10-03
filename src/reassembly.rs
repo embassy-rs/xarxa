@@ -30,18 +30,29 @@ impl fmt::Display for AssemblerError {
 
 impl core::error::Error for AssemblerError {}
 
-/// Packet assembler is full
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct AssemblerFullError;
+/// How long a reassembly has to be in progress before the fragments of another
+/// datagram may take its slot, when none is free. Long enough that datagrams
+/// whose fragments arrive interleaved don't push each other out, and short
+/// next to the reassembly timeout, so that one that never completes doesn't
+/// block the others for long.
+const REASSEMBLY_MIN_AGE: Duration = Duration::from_secs(1);
 
-impl fmt::Display for AssemblerFullError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "AssemblerFullError")
-    }
+/// A fragment of a datagram, for [`PacketAssemblerSet::add`].
+pub(crate) struct Fragment<'a, K> {
+    /// The datagram it belongs to.
+    pub key: K,
+    /// Where its data goes in the datagram.
+    pub offset: usize,
+    pub data: &'a [u8],
+    /// The size of the whole datagram, if the fragment tells.
+    pub total_size: Option<usize>,
+    /// The largest datagram the packet buffer it is reassembled in can take.
+    pub max_size: usize,
+    /// Whether a fragment that partly overlaps the data received so far
+    /// discards it, and starts the reassembly over (RFC 4944 5.3). Without it,
+    /// the fragment is merged in, over what was there (IPv4).
+    pub restart_on_overlap: bool,
 }
-
-impl core::error::Error for AssemblerFullError {}
 
 /// Holds different fragments of one packet, used for assembling fragmented packets.
 ///
@@ -87,48 +98,67 @@ impl<K> PacketAssembler<K> {
         Ok(unwrap!(self.buffer.as_mut()))
     }
 
-    /// Set the total size of the packet assembler.
-    pub(crate) fn set_total_size(&mut self, size: usize) -> Result<(), AssemblerError> {
-        if let Some(old_size) = self.total_size
-            && old_size != size
-        {
-            return Err(AssemblerError);
-        }
-
-        self.total_size = Some(size);
-        Ok(())
-    }
-
     /// Add a fragment into the packet that is being reassembled.
     ///
     /// # Errors
-    /// - `AssemblerError`: if the data goes at a place that does not exist, if
-    ///   the fragments leave more holes than can be tracked, or if no packet
-    ///   buffer is free.
-    pub(crate) fn add(&mut self, pool: PoolRef, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
-        let len = data.len();
+    /// - `AssemblerError`: if the packet can't be completed anymore: the
+    ///   fragment disagrees on its total size, or puts data past it, or leaves
+    ///   more holes than can be tracked, or no packet buffer is free.
+    fn add(&mut self, pool: PoolRef, frag: &Fragment<'_, K>) -> Result<(), AssemblerError> {
+        let len = frag.data.len();
+        let end = frag.offset + len;
+        if let Some(total_size) = frag.total_size {
+            if self.total_size.is_some_and(|old_size| old_size != total_size) {
+                return Err(AssemblerError);
+            }
+            self.total_size = Some(total_size);
+        }
+        if let Some(total_size) = self.total_size {
+            let data_end = self.assembler.iter_data().last().map_or(0, |(_, data_end)| data_end);
+            if end.max(data_end) > total_size {
+                return Err(AssemblerError);
+            }
+        }
+
+        if frag.restart_on_overlap {
+            let overlap: usize = self
+                .assembler
+                .iter_data()
+                .map(|(start, data_end)| data_end.min(end).saturating_sub(start.max(frag.offset)))
+                .sum();
+            if overlap == len {
+                // All of it is in already: a duplicate. One cut differently looks
+                // the same, and is dropped too.
+                return Ok(());
+            }
+            if overlap != 0 {
+                debug!("frag assembler: overlapping fragment, starting over");
+                self.assembler.clear();
+            }
+        }
+
         let buffer = self.buffer(pool)?;
-        if buffer.capacity() < offset + len {
+        if buffer.capacity() < end {
             return Err(AssemblerError);
         }
 
-        self.assembler.add(offset, len).map_err(|_| AssemblerError)?;
+        self.assembler.add(frag.offset, len).map_err(|_| AssemblerError)?;
 
         // NOTE(unwrap): allocated just above.
         let buffer = unwrap!(self.buffer.as_mut());
-        if buffer.len() < offset + len {
-            buffer.set_len(offset + len);
+        if buffer.len() < end {
+            buffer.set_len(end);
         }
-        buffer[offset..][..len].copy_from_slice(data);
+        buffer[frag.offset..][..len].copy_from_slice(frag.data);
 
-        debug!("frag assembler: receiving {} octets at offset {}", len, offset);
+        debug!("frag assembler: receiving {} octets at offset {}", len, frag.offset);
 
         Ok(())
     }
 
     /// Get the reassembled packet, if reassembly is complete.
     /// This will mark the assembler as empty, so that it can be reused.
-    pub(crate) fn assemble(&mut self, pool: PoolRef) -> Option<PacketBuf> {
+    fn assemble(&mut self, pool: PoolRef) -> Option<PacketBuf> {
         if !self.is_complete() {
             return None;
         }
@@ -142,7 +172,7 @@ impl<K> PacketAssembler<K> {
     }
 
     /// Returns `true` when all fragments have been received, otherwise `false`.
-    pub(crate) fn is_complete(&self) -> bool {
+    fn is_complete(&self) -> bool {
         self.total_size == Some(self.assembler.peek_front())
     }
 
@@ -156,6 +186,9 @@ impl<K> PacketAssembler<K> {
 #[derive(Debug)]
 pub struct PacketAssemblerSet<K: Eq + Copy> {
     assemblers: [PacketAssembler<K>; REASSEMBLY_BUFFER_COUNT],
+    /// The datagram reassembled last. A late duplicate of one of its fragments
+    /// would start a reassembly that can't complete, so it is dropped.
+    last_completed: Option<K>,
 }
 
 impl<K: Eq + Copy> PacketAssemblerSet<K> {
@@ -163,30 +196,81 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
     pub fn new() -> Self {
         Self {
             assemblers: [const { PacketAssembler::new() }; REASSEMBLY_BUFFER_COUNT],
+            last_completed: None,
         }
     }
 
-    /// Get a [`PacketAssembler`] for a specific key.
+    /// Add a fragment to the datagram it belongs to, at `now`. The datagram's
+    /// first fragment takes a slot for it, which `timeout` later expires.
     ///
-    /// If it doesn't exist, it is created, with the `expires_at` timestamp.
-    ///
-    /// # Errors
-    /// - `AssemblerFullError`: if the assembler set is full.
-    pub(crate) fn get(&mut self, key: &K, expires_at: Instant) -> Result<&mut PacketAssembler<K>, AssemblerFullError> {
-        let mut empty_slot = None;
-        for slot in &mut self.assemblers {
-            if slot.key.as_ref() == Some(key) {
-                return Ok(slot);
+    /// Returns the whole datagram, in a buffer from `pool`, once its last
+    /// fragment is in. A fragment that makes its datagram impossible to
+    /// complete is dropped, along with the datagram's slot, if it has one.
+    pub(crate) fn add(
+        &mut self,
+        pool: PoolRef,
+        frag: Fragment<'_, K>,
+        now: Instant,
+        timeout: Duration,
+    ) -> Option<PacketBuf> {
+        let end = frag.offset + frag.data.len();
+        if end > frag.max_size || frag.total_size.is_some_and(|total_size| total_size > frag.max_size) {
+            debug!("fragmented packet too large for a packet buffer");
+            if let Some(slot) = self.assemblers.iter_mut().find(|slot| slot.key == Some(frag.key)) {
+                slot.reset();
             }
-            if slot.is_free() {
-                empty_slot = Some(slot)
-            }
+            return None;
+        }
+        if self.last_completed == Some(frag.key) {
+            debug!("fragment of a packet already reassembled");
+            return None;
         }
 
-        let slot = empty_slot.ok_or(AssemblerFullError)?;
-        slot.key = Some(*key);
-        slot.expires_at = expires_at;
-        Ok(slot)
+        let Some(slot) = self.slot(frag.key, now, timeout) else {
+            debug!("No available packet assembler for fragmented packet");
+            return None;
+        };
+        if let Err(e) = slot.add(pool, &frag) {
+            debug!("fragmentation error: {:?}", e);
+            slot.reset();
+            return None;
+        }
+        let packet = slot.assemble(pool)?;
+        self.last_completed = Some(frag.key);
+        Some(packet)
+    }
+
+    /// The slot of the datagram `key`. A new datagram takes a free slot, or else
+    /// the one closest to expiring, once that one is `REASSEMBLY_MIN_AGE` old.
+    fn slot(&mut self, key: K, now: Instant, timeout: Duration) -> Option<&mut PacketAssembler<K>> {
+        if let Some(i) = self.assemblers.iter().position(|slot| slot.key == Some(key)) {
+            return Some(&mut self.assemblers[i]);
+        }
+
+        let i = match self.assemblers.iter().position(|slot| slot.is_free()) {
+            Some(i) => i,
+            None => {
+                let mut oldest: Option<usize> = None;
+                for (i, slot) in self.assemblers.iter().enumerate() {
+                    if oldest.is_none_or(|oldest| slot.expires_at < self.assemblers[oldest].expires_at) {
+                        oldest = Some(i);
+                    }
+                }
+                let oldest = oldest?;
+                // Taken at `expires_at - timeout`, with the timeout set now.
+                if now + timeout.saturating_sub(REASSEMBLY_MIN_AGE) < self.assemblers[oldest].expires_at {
+                    return None;
+                }
+                debug!("frag assembler: dropping an incomplete packet for a new one");
+                oldest
+            }
+        };
+
+        let slot = &mut self.assemblers[i];
+        slot.reset();
+        slot.key = Some(key);
+        slot.expires_at = now + timeout;
+        Some(slot)
     }
 
     /// Remove all [`PacketAssembler`]s that are expired.
@@ -272,43 +356,26 @@ impl Stack<'_> {
     #[cfg(feature = "ipv4-reassembly")]
     pub(crate) fn reassemble_ipv4(&mut self, mut buf: PacketBuf, now: Instant) -> Option<PacketBuf> {
         let ipv4_packet = Ipv4Packet::new_unchecked(&mut buf);
-
-        let key = FragKey::Ipv4(Ipv4FragKey::of(&ipv4_packet));
-
-        let f = match self
-            .fragments
-            .assembler
-            .get(&key, now + self.fragments.reassembly_timeout)
-        {
-            Ok(f) => f,
-            Err(_) => {
-                debug!("No available packet assembler for fragmented packet");
-                return None;
-            }
+        let header_len = ipv4_packet.header_len() as usize;
+        let offset = ipv4_packet.frag_offset() as usize;
+        let data = ipv4_packet.payload();
+        let frag = Fragment {
+            key: FragKey::Ipv4(Ipv4FragKey::of(&ipv4_packet)),
+            offset,
+            data,
+            // The last fragment tells the size of the whole datagram.
+            total_size: (!ipv4_packet.more_frags()).then_some(offset + data.len()),
+            // The reassembled packet gets an IP header in front.
+            max_size: self.inner.buf_capacity - header_len,
+            restart_on_overlap: false,
         };
-
-        if !ipv4_packet.more_frags() {
-            // This is the last fragment, so we know the total size
-            check!(f.set_total_size(
-                ipv4_packet.total_len() as usize - ipv4_packet.header_len() as usize
-                    + ipv4_packet.frag_offset() as usize,
-            ));
-        }
-
-        if let Err(e) = f.add(
-            self.inner.pool,
-            ipv4_packet.payload(),
-            ipv4_packet.frag_offset() as usize,
-        ) {
-            debug!("fragmentation error: {:?}", e);
-            return None;
-        }
-
-        let mut payload = f.assemble(self.inner.pool)?;
+        let mut payload =
+            self.fragments
+                .assembler
+                .add(self.inner.pool, frag, now, self.fragments.reassembly_timeout)?;
 
         // The reassembled packet is this fragment's IP header, patched to
         // describe the whole datagram, in front of the reassembled payload.
-        let header_len = ipv4_packet.header_len() as usize;
         let payload_len = payload.len();
         if !payload.ensure_headroom(header_len) {
             debug!("reassembled packet does not fit in a packet buffer");
@@ -333,116 +400,179 @@ mod tests {
     use super::*;
     use crate::time::idle_deadline;
 
-    #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
     struct Key {
         id: usize,
     }
 
+    const TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// A fragment of datagram `id`, merged over what was there on overlap.
+    fn frag(id: usize, offset: usize, data: &[u8], total_size: Option<usize>) -> Fragment<'_, Key> {
+        Fragment {
+            key: Key { id },
+            offset,
+            data,
+            total_size,
+            max_size: crate::pool::TEST_POOL_SIZE,
+            restart_on_overlap: false,
+        }
+    }
+
+    fn add(set: &mut PacketAssemblerSet<Key>, now: Instant, frag: Fragment<Key>) -> Option<std::vec::Vec<u8>> {
+        set.add(crate::pool::test_pool_ref(), frag, now, TIMEOUT)
+            .map(|buf| buf.to_vec())
+    }
+
     #[test]
     fn packet_assembler_overlap() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
-
-        p_assembler.set_total_size(5).unwrap();
-
-        let data = b"Rust";
-        p_assembler.add(crate::pool::test_pool_ref(), &data[..], 0).unwrap();
-        p_assembler.add(crate::pool::test_pool_ref(), &data[..], 1).unwrap();
-
+        let mut set = PacketAssemblerSet::new();
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 0, b"Rust", Some(5))), None);
         assert_eq!(
-            p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(),
+            add(&mut set, Instant::ZERO, frag(0, 1, b"Rust", Some(5))).as_deref(),
             Some(&b"RRust"[..])
-        )
+        );
     }
 
     #[test]
     fn packet_assembler_assemble() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
-
-        let data = b"Hello World!";
-
-        p_assembler.set_total_size(data.len()).unwrap();
-
-        p_assembler.add(crate::pool::test_pool_ref(), b"Hello ", 0).unwrap();
-        assert_eq!(p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(), None);
-
-        p_assembler
-            .add(crate::pool::test_pool_ref(), b"World!", b"Hello ".len())
-            .unwrap();
-
+        let mut set = PacketAssemblerSet::new();
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 0, b"Hello ", None)), None);
         assert_eq!(
-            p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(),
+            add(&mut set, Instant::ZERO, frag(0, 6, b"World!", Some(12))).as_deref(),
             Some(&b"Hello World!"[..])
         );
     }
 
     #[test]
     fn packet_assembler_out_of_order_assemble() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
-
-        let data = b"Hello World!";
-
-        p_assembler.set_total_size(data.len()).unwrap();
-
-        p_assembler
-            .add(crate::pool::test_pool_ref(), b"World!", b"Hello ".len())
-            .unwrap();
-        assert_eq!(p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(), None);
-
-        p_assembler.add(crate::pool::test_pool_ref(), b"Hello ", 0).unwrap();
-
+        let mut set = PacketAssemblerSet::new();
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 6, b"World!", Some(12))), None);
         assert_eq!(
-            p_assembler.assemble(crate::pool::test_pool_ref()).as_deref(),
+            add(&mut set, Instant::ZERO, frag(0, 0, b"Hello ", None)).as_deref(),
             Some(&b"Hello World!"[..])
         );
     }
 
+    /// The fragments of a datagram larger than a packet buffer are dropped
+    /// without taking a slot, and free the one the datagram had.
     #[test]
     fn packet_assembler_too_large() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
-
-        assert_eq!(p_assembler.set_total_size(crate::pool::TEST_POOL_SIZE), Ok(()));
-        assert_eq!(p_assembler.set_total_size(crate::pool::TEST_POOL_SIZE), Ok(()));
+        let size = crate::pool::TEST_POOL_SIZE;
+        let mut set = PacketAssemblerSet::new();
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 0, &[0; 8], Some(size + 1))), None);
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, size - 7, &[0; 8], None)), None);
+        assert!(set.assemblers.iter().all(|slot| slot.is_free()));
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 0, &[0; 8], None)), None);
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 16, &[0; 8], Some(size + 1))), None);
+        assert!(set.assemblers.iter().all(|slot| slot.is_free()));
         assert_eq!(
-            p_assembler.add(crate::pool::test_pool_ref(), &[0; 8], crate::pool::TEST_POOL_SIZE - 8),
-            Ok(())
-        );
-        assert_eq!(
-            p_assembler.add(crate::pool::test_pool_ref(), &[0; 8], crate::pool::TEST_POOL_SIZE - 7),
-            Err(AssemblerError)
+            add(&mut set, Instant::ZERO, frag(1, 0, &[1; 8], Some(8))).as_deref(),
+            Some(&[1; 8][..])
         );
     }
 
+    /// A fragment that makes its datagram impossible to complete frees the slot.
     #[test]
-    fn packet_assembler_set() {
-        let key = Key { id: 1 };
-
+    fn packet_assembler_error_frees_slot() {
         let mut set = PacketAssemblerSet::new();
+        // Data past the total size, in either order.
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 0, b"ab", None)), None);
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 2, b"cdef", Some(4))), None);
+        assert!(set.assemblers.iter().all(|slot| slot.is_free()));
+        assert_eq!(add(&mut set, Instant::ZERO, frag(1, 4, b"ef", None)), None);
+        assert_eq!(add(&mut set, Instant::ZERO, frag(1, 0, b"ab", Some(2))), None);
+        assert!(set.assemblers.iter().all(|slot| slot.is_free()));
+        // Two different total sizes.
+        assert_eq!(add(&mut set, Instant::ZERO, frag(2, 0, b"ab", Some(4))), None);
+        assert_eq!(add(&mut set, Instant::ZERO, frag(2, 2, b"cd", Some(6))), None);
+        assert!(set.assemblers.iter().all(|slot| slot.is_free()));
+    }
 
-        assert!(set.get(&key, Instant::ZERO).is_ok());
+    /// A late duplicate of a fragment of the datagram just completed doesn't
+    /// start a reassembly that could never complete.
+    #[test]
+    fn packet_assembler_late_duplicate() {
+        let mut set = PacketAssemblerSet::new();
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 0, b"ab", None)), None);
+        assert!(add(&mut set, Instant::ZERO, frag(0, 2, b"cd", Some(4))).is_some());
+        assert_eq!(add(&mut set, Instant::ZERO, frag(0, 2, b"cd", Some(4))), None);
+        assert!(set.assemblers.iter().all(|slot| slot.is_free()));
+    }
+
+    /// With every slot taken, a new datagram takes the place of the one closest
+    /// to expiring, once that one has had `REASSEMBLY_MIN_AGE`.
+    #[test]
+    fn packet_assembler_eviction() {
+        let mut set = PacketAssemblerSet::new();
+        for id in 0..REASSEMBLY_BUFFER_COUNT {
+            assert_eq!(
+                add(&mut set, Instant::from_millis(id as u32), frag(id, 0, b"ab", None)),
+                None
+            );
+        }
+        let new = REASSEMBLY_BUFFER_COUNT;
+        assert_eq!(
+            add(&mut set, Instant::from_millis(999), frag(new, 0, b"ab", Some(2))),
+            None
+        );
+        assert!(set.assemblers.iter().all(|slot| slot.key != Some(Key { id: new })));
+        assert_eq!(
+            add(&mut set, Instant::from_millis(1000), frag(new, 0, b"ab", Some(2))).as_deref(),
+            Some(&b"ab"[..])
+        );
+        // The oldest one was dropped, the others are still there.
+        assert!(set.assemblers.iter().all(|slot| slot.key != Some(Key { id: 0 })));
+        for id in (0..REASSEMBLY_BUFFER_COUNT).skip(1) {
+            assert!(set.assemblers.iter().any(|slot| slot.key == Some(Key { id })));
+        }
+    }
+
+    /// With `restart_on_overlap` (6LoWPAN), a fragment that overlaps the data so
+    /// far, other than as a duplicate, starts the reassembly over.
+    #[test]
+    fn packet_assembler_restart_on_overlap() {
+        let restart = |offset, data, total_size| Fragment {
+            restart_on_overlap: true,
+            ..frag(0, offset, data, total_size)
+        };
+        let mut set = PacketAssemblerSet::new();
+        assert_eq!(add(&mut set, Instant::ZERO, restart(0, b"abcd", Some(8))), None);
+        // A duplicate is dropped.
+        assert_eq!(add(&mut set, Instant::ZERO, restart(2, b"XX", Some(8))), None);
+        // One that overlaps differently discards "abcd".
+        assert_eq!(add(&mut set, Instant::ZERO, restart(2, b"cdef", Some(8))), None);
+        assert_eq!(add(&mut set, Instant::ZERO, restart(6, b"gh", Some(8))), None);
+        assert_eq!(
+            add(&mut set, Instant::ZERO, restart(0, b"AB", Some(8))).as_deref(),
+            Some(&b"ABcdefgh"[..])
+        );
     }
 
     #[test]
     fn packet_assembler_set_full() {
         let mut set = PacketAssemblerSet::new();
-        for i in 0..REASSEMBLY_BUFFER_COUNT {
-            set.get(&Key { id: i }, Instant::ZERO).unwrap();
+        for id in 0..REASSEMBLY_BUFFER_COUNT {
+            assert_eq!(add(&mut set, Instant::ZERO, frag(id, 0, b"ab", None)), None);
         }
-        assert!(
-            set.get(
-                &Key {
-                    id: REASSEMBLY_BUFFER_COUNT
-                },
-                Instant::ZERO
-            )
-            .is_err()
-        );
+        let new = REASSEMBLY_BUFFER_COUNT;
+        assert_eq!(add(&mut set, Instant::ZERO, frag(new, 0, b"ab", Some(2))), None);
+        assert!(set.assemblers.iter().all(|slot| slot.key != Some(Key { id: new })));
     }
 
     #[test]
     fn packet_assembler_set_expiry() {
         let mut set = PacketAssemblerSet::new();
-        let key = Key { id: 0 };
-        set.get(&key, Instant::from_secs(10)).unwrap();
+        assert_eq!(
+            set.add(
+                crate::pool::test_pool_ref(),
+                frag(0, 0, b"ab", None),
+                Instant::ZERO,
+                Duration::from_secs(10)
+            )
+            .map(|buf| buf.len()),
+            None
+        );
         let mut clock = Clock::new(Instant::from_secs(9));
         set.remove_expired(&mut clock);
         assert_eq!(clock.next(), Instant::from_secs(10));
@@ -451,44 +581,6 @@ mod tests {
         let mut clock = Clock::new(Instant::from_secs(10));
         set.remove_expired(&mut clock);
         assert_eq!(clock.next(), idle_deadline(clock.now()));
-    }
-
-    #[test]
-    fn packet_assembler_set_assembling_many() {
-        let mut set = PacketAssemblerSet::new();
-
-        let key = Key { id: 0 };
-        let assr = set.get(&key, Instant::ZERO).unwrap();
-        assert!(assr.assemble(crate::pool::test_pool_ref()).is_none());
-        assr.set_total_size(0).unwrap();
-        assr.assemble(crate::pool::test_pool_ref()).unwrap();
-
-        // Test that `.assemble()` effectively deletes it.
-        let assr = set.get(&key, Instant::ZERO).unwrap();
-        assert!(assr.assemble(crate::pool::test_pool_ref()).is_none());
-        assr.set_total_size(0).unwrap();
-        assr.assemble(crate::pool::test_pool_ref()).unwrap();
-
-        let key = Key { id: 1 };
-        let assr = set.get(&key, Instant::ZERO).unwrap();
-        assr.set_total_size(0).unwrap();
-        assr.assemble(crate::pool::test_pool_ref()).unwrap();
-
-        let key = Key { id: 2 };
-        let assr = set.get(&key, Instant::ZERO).unwrap();
-        assr.set_total_size(0).unwrap();
-        assr.assemble(crate::pool::test_pool_ref()).unwrap();
-
-        let key = Key { id: 2 };
-        let assr = set.get(&key, Instant::ZERO).unwrap();
-        assr.set_total_size(2).unwrap();
-        assr.add(crate::pool::test_pool_ref(), &[0x00], 0).unwrap();
-        assert!(assr.assemble(crate::pool::test_pool_ref()).is_none());
-        let assr = set.get(&key, Instant::ZERO).unwrap();
-        assr.add(crate::pool::test_pool_ref(), &[0x01], 1).unwrap();
-        assert_eq!(
-            assr.assemble(crate::pool::test_pool_ref()).as_deref(),
-            Some(&[0x00, 0x01][..])
-        );
+        assert!(set.assemblers.iter().all(|slot| slot.is_free()));
     }
 }

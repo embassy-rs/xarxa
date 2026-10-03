@@ -241,6 +241,7 @@ impl AcceptToken {
         // No window advertised yet: the SYN|ACK does that.
         s.recv_adv = syn.recv_next;
         s.send_next = s.send_unack;
+        s.send_max = s.send_unack;
         #[cfg(feature = "tcp-sack")]
         {
             s.send_sack = syn.send_sack;
@@ -252,6 +253,9 @@ impl AcceptToken {
         }
         s.send_window = syn.send_window;
         s.send_window_max = syn.send_window;
+        // The window came from the SYN, at IRS.
+        s.send_wl1 = syn.recv_next - 1;
+        s.send_wl2 = s.send_unack;
         s.send_mss = syn.send_mss;
         s.congestion_controller.set_mss(syn.send_mss);
         // Answer with timestamps only if the SYN offered them.

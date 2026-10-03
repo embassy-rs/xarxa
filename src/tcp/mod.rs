@@ -262,8 +262,6 @@ struct RttEstimator {
     /// Retransmission Time-Out
     rto: Duration,
     timestamp: Option<(Instant, TcpSeqNumber)>,
-    /// The highest sequence number sent, like BSD's `snd_max`.
-    send_max: Option<TcpSeqNumber>,
     rto_count: u8,
 }
 
@@ -275,7 +273,6 @@ impl Default for RttEstimator {
             rttvar: Duration::ZERO, // ignored, will be overwritten on first measurement.
             rto: RTTE_INITIAL_RTO,
             timestamp: None,
-            send_max: None,
             rto_count: 0,
         }
     }
@@ -320,13 +317,12 @@ impl RttEstimator {
         );
     }
 
+    /// New data ending at `seq` went out. Time it, unless a segment is being
+    /// timed already.
     fn on_send(&mut self, timestamp: Instant, seq: TcpSeqNumber) {
-        if self.send_max.map(|send_max| seq > send_max).unwrap_or(true) {
-            self.send_max = Some(seq);
-            if self.timestamp.is_none() {
-                self.timestamp = Some((timestamp, seq));
-                trace!("rtte: sampling at seq={:?}", seq);
-            }
+        if self.timestamp.is_none() {
+            self.timestamp = Some((timestamp, seq));
+            trace!("rtte: sampling at seq={:?}", seq);
         }
     }
 
@@ -523,8 +519,14 @@ pub(crate) struct TcpSocketState<'d> {
     recv_read: TcpSeqNumber,
     /// SND.NXT: the next sequence number to send. In an idle socket,
     /// send_unack+tx_buffer.len(). Unlike the RFC's, it is rewound to `send_unack`
-    /// on a retransmission timeout.
+    /// on a retransmission timeout, so it is only the retransmission cursor.
     send_next: TcpSeqNumber,
+    /// The highest sequence number sent, plus one: the RFC's SND.NXT, which never
+    /// moves back, like BSD's `snd_max`. It counts the SYN and the FIN.
+    send_max: TcpSeqNumber,
+    /// Whether the remote acknowledged our SYN. Until it does, the SYN takes up
+    /// `send_unack` (ISS), and the transmit buffer starts one later.
+    syn_acked: bool,
     /// Last.ACK.sent (RFC 7323): the ACK number of the last segment sent. In an
     /// idle socket, RCV.NXT.
     recv_ack_sent: Option<TcpSeqNumber>,
@@ -543,6 +545,12 @@ pub(crate) struct TcpSocketState<'d> {
     /// MAX.SND.WND (RFC 5961): the largest remote window ever received.
     /// An ACK further than this below send_unack is not acceptable.
     send_window_max: usize,
+    /// SND.WL1 (RFC 9293): the sequence number of the segment that last updated
+    /// the send window.
+    send_wl1: TcpSeqNumber,
+    /// SND.WL2 (RFC 9293): the ACK number of the segment that last updated the
+    /// send window.
+    send_wl2: TcpSeqNumber,
     /// Snd.Wind.Shift (RFC 7323): the shift applied to the remote's window.
     /// None if the remote does not support window scaling (Snd.WS.OK clear).
     send_window_shift: Option<u8>,
@@ -656,10 +664,14 @@ impl<'d> TcpSocketState<'d> {
             send_unack: TcpSeqNumber::default(),
             recv_read: TcpSeqNumber::default(),
             send_next: TcpSeqNumber::default(),
+            send_max: TcpSeqNumber::default(),
+            syn_acked: false,
             recv_ack_sent: None,
             recv_adv: TcpSeqNumber::default(),
             send_window: 0,
             send_window_max: 0,
+            send_wl1: TcpSeqNumber::default(),
+            send_wl2: TcpSeqNumber::default(),
             recv_window_shift: rx_cap_log2.saturating_sub(16) as u8,
             send_window_shift: None,
             #[cfg(feature = "tcp-sack")]
@@ -784,10 +796,14 @@ impl<'d> TcpSocketState<'d> {
         self.pending_fast_retransmit = false;
         self.recv_read = TcpSeqNumber::default();
         self.send_next = TcpSeqNumber::default();
+        self.send_max = TcpSeqNumber::default();
+        self.syn_acked = false;
         self.recv_ack_sent = None;
         self.recv_adv = TcpSeqNumber::default();
         self.send_window = 0;
         self.send_window_max = 0;
+        self.send_wl1 = TcpSeqNumber::default();
+        self.send_wl2 = TcpSeqNumber::default();
         self.send_window_shift = None;
         #[cfg(feature = "tcp-sack")]
         {
@@ -840,6 +856,12 @@ impl<'d> TcpSocketState<'d> {
     /// Number of octets transmitted but not yet ACKed.
     fn flight_size(&self) -> usize {
         self.send_next - self.send_unack
+    }
+
+    /// The sequence number of the first octet in the transmit buffer: SND.UNA, or
+    /// one later while our SYN is unacknowledged.
+    fn tx_start(&self) -> TcpSeqNumber {
+        self.send_unack + !self.syn_acked as usize
     }
 
     fn set_state(&mut self, state: State) {
@@ -960,8 +982,9 @@ impl<'d> TcpSocketState<'d> {
     /// connection carries on.
     #[cfg(feature = "icmp-errors")]
     pub(crate) fn process_icmp_error(&mut self, error: IcmpError, seq: TcpSeqNumber) {
-        // The quoted segment must be one we actually have in flight.
-        if seq < self.send_unack || seq > self.send_next {
+        // The quoted segment must be one we actually have in flight. The bound is
+        // inclusive: our pure ACKs carry SND.NXT, and an error can be about one.
+        if seq < self.send_unack || seq > self.send_max {
             trace!("icmp error quoting out-of-window seq, ignoring");
             return;
         }
@@ -994,17 +1017,9 @@ impl<'d> TcpSocketState<'d> {
         // Ingress reprs come from `parse`, which never splits the payload.
         debug_assert!(repr.payload2.is_empty());
 
-        // Consider how much the sequence number space differs from the transmit buffer space.
-        let (sent_syn, sent_fin) = match self.state {
-            // In SYN-SENT or SYN-RECEIVED, we've just sent a SYN.
-            State::SynSent | State::SynReceived => (true, false),
-            // In FIN-WAIT-1, LAST-ACK, or CLOSING, we've just sent a FIN.
-            State::FinWait1 | State::LastAck | State::Closing => (false, true),
-            // In all other states we've already got acknowledgements for
-            // all of the control flags we sent.
-            _ => (false, false),
-        };
-        let control_len = (sent_syn as usize) + (sent_fin as usize);
+        // In FIN-WAIT-1, LAST-ACK and CLOSING, a FIN follows the transmit buffer.
+        // An ACK of it is acceptable only once it was sent, like any other.
+        let sent_fin = matches!(self.state, State::FinWait1 | State::LastAck | State::Closing);
 
         // Reject unacceptable acknowledgements.
         let mut old_ack = false;
@@ -1016,16 +1031,17 @@ impl<'d> TcpSocketState<'d> {
                 return ProcessResult::None;
             }
             (State::SynSent, TcpControl::Rst, Some(ack_number)) => {
-                if ack_number != self.send_unack + 1 {
+                if ack_number != self.send_unack + 1 || ack_number > self.send_max {
                     debug!("unacceptable RST|ACK in response to initial SYN");
                     return ProcessResult::None;
                 }
             }
             // Any other RST need only have a valid sequence number.
             (_, TcpControl::Rst, _) => (),
-            // SYN|ACK in the SYN-SENT state must have the exact ACK number.
+            // SYN|ACK in the SYN-SENT state must have the exact ACK number, of a
+            // SYN that was sent.
             (State::SynSent, TcpControl::Syn, Some(ack_number)) => {
-                if ack_number != self.send_unack + 1 {
+                if ack_number != self.send_unack + 1 || ack_number > self.send_max {
                     debug!("unacceptable SYN|ACK in response to initial SYN");
                     return ProcessResult::Rst;
                 }
@@ -1058,25 +1074,20 @@ impl<'d> TcpSocketState<'d> {
                 debug!("expecting an ACK");
                 return ProcessResult::None;
             }
-            // ACK in the SYN-RECEIVED state must have the exact ACK number, or we RST it.
+            // ACK in the SYN-RECEIVED state must have the exact ACK number, of a
+            // SYN|ACK that was sent, or we RST it.
             (State::SynReceived, _, Some(ack_number)) => {
-                if ack_number != self.send_unack + 1 {
+                if ack_number != self.send_unack + 1 || ack_number > self.send_max {
                     debug!("unacceptable ACK in response to SYN|ACK");
                     return ProcessResult::Rst;
                 }
             }
             // Every acknowledgement must be for transmitted but unacknowledged data.
             (_, _, Some(ack_number)) => {
-                let unacknowledged = self.tx_buffer.len() + control_len;
-
-                // Acceptable ACK range (both inclusive)
-                let mut ack_min = self.send_unack;
-                let ack_max = self.send_unack + unacknowledged;
-
-                // If we have sent a SYN, it MUST be acknowledged.
-                if sent_syn {
-                    ack_min += 1;
-                }
+                // Acceptable ACK range (both inclusive). An unacknowledged SYN
+                // must be acknowledged.
+                let ack_min = self.tx_start();
+                let ack_max = self.send_max;
 
                 if ack_number > ack_max {
                     debug!("unacceptable ACK ({} not in {}...{})", ack_number, ack_min, ack_max);
@@ -1226,9 +1237,9 @@ impl<'d> TcpSocketState<'d> {
             && let Some(ack_number) = repr.ack_number
         {
             // Sequence number corresponding to the first byte in `tx_buffer`.
-            // This normally equals `send_unack`, but is 1 higher if we have sent a SYN,
-            // as the SYN occupies 1 sequence number "before" the data.
-            let tx_buffer_start_seq = self.send_unack + (sent_syn as usize);
+            // This normally equals `send_unack`, but is 1 higher while our SYN is
+            // unacknowledged, as the SYN occupies 1 sequence number "before" the data.
+            let tx_buffer_start_seq = self.tx_start();
 
             if ack_number >= tx_buffer_start_seq {
                 ack_len = ack_number - tx_buffer_start_seq;
@@ -1241,7 +1252,7 @@ impl<'d> TcpSocketState<'d> {
                     ack_of_fin = true;
                 }
 
-                ack_all = self.send_next <= ack_number;
+                ack_all = self.send_max <= ack_number;
             }
         }
 
@@ -1299,14 +1310,15 @@ impl<'d> TcpSocketState<'d> {
                 }
 
                 self.recv_read = repr.seq_number + 1;
-                self.send_next = self.send_unack + 1;
                 self.recv_ack_sent = Some(repr.seq_number);
+                // The window this segment carries is the first one.
+                self.send_wl1 = repr.seq_number;
+                self.send_wl2 = repr.ack_number.unwrap_or(self.send_unack);
                 // Our SYN advertised the free receive buffer, which is all of it,
                 // since nothing was received yet. If it never left, nothing was
-                // advertised: in SYN-SENT the SYN is the only segment that takes
-                // up sequence space, so it left if anything did.
+                // advertised.
                 self.recv_adv = self.recv_read;
-                if self.rtte.send_max.is_some() {
+                if self.send_max != self.send_unack {
                     self.recv_adv += self.syn_window() as usize;
                 }
                 #[cfg(feature = "tcp-sack")]
@@ -1403,9 +1415,15 @@ impl<'d> TcpSocketState<'d> {
         self.remote_last_ts = Some(now);
 
         // RFC 9293 3.10.7.4: the send window is updated only if
-        // SND.UNA <= SEG.ACK <= SND.NXT, so an old ACK leaves it alone.
+        // SND.UNA <= SEG.ACK <= SND.NXT, so an old ACK leaves it alone. And only
+        // from a segment no older than the one that last updated it, so a
+        // reordered segment can't bring back a stale window: if SND.WL1 < SEG.SEQ,
+        // or SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK.
         let mut is_window_update = false;
-        if !old_ack {
+        let seg_ack = repr.ack_number.unwrap_or(self.send_wl2);
+        if !old_ack
+            && (self.send_wl1 < repr.seq_number || (self.send_wl1 == repr.seq_number && self.send_wl2 <= seg_ack))
+        {
             // RFC 1323: The window field (SEG.WND) in the header of every incoming segment, with the
             // exception of SYN segments, is left-shifted by Snd.Wind.Scale bits before updating SND.WND.
             let scale = match repr.control {
@@ -1416,6 +1434,8 @@ impl<'d> TcpSocketState<'d> {
             is_window_update = new_send_window != self.send_window;
             self.send_window = new_send_window;
             self.send_window_max = self.send_window_max.max(new_send_window);
+            self.send_wl1 = repr.seq_number;
+            self.send_wl2 = seg_ack;
 
             self.congestion_controller.set_remote_window(new_send_window);
         }
@@ -1484,8 +1504,9 @@ impl<'d> TcpSocketState<'d> {
             }
 
             // We've processed everything in the incoming segment, so advance the local
-            // sequence number past it.
+            // sequence number past it. An acceptable ACK acknowledges our SYN.
             self.send_unack = ack_number;
+            self.syn_acked = true;
 
             // During retransmission, if an earlier segment got lost but later was
             // successfully received, self.send_unack can move past self.send_next.
@@ -1968,7 +1989,7 @@ impl<'d> TcpSocketState<'d> {
             src_port: tuple.local.port,
             dst_port: tuple.remote.port,
             control: TcpControl::None,
-            seq_number: self.send_next,
+            seq_number: self.send_max,
             ack_number: Some(ack),
             window_len: (self.recv_window() >> self.recv_window_shift) as u16,
             window_scale: None,
@@ -2006,48 +2027,47 @@ impl<'d> TcpSocketState<'d> {
             }
         };
 
-        match self.state {
-            // We transmit an RST in the CLOSED state. If we ended up in the CLOSED state
-            // with a specified address, it means that the socket was aborted. When
-            // aborting a connection, forget about it after sending a single RST packet.
-            State::Closed => {
-                let offset = self.flight_size();
-                self.send_segment(clock, &mut send, &repr, TcpControl::Rst, offset, 0)?;
-                self.tuple = None;
-                // Wake tx now so that async users can wait for the RST to be sent.
-                #[cfg(feature = "async")]
-                self.tx_waker.wake();
-                return Ok(());
-            }
+        // We transmit an RST in the CLOSED state. If we ended up in the CLOSED state
+        // with a specified address, it means that the socket was aborted. When
+        // aborting a connection, forget about it after sending a single RST packet.
+        if self.state == State::Closed {
+            self.send_segment(clock, &mut send, &repr, TcpControl::Rst, 0, 0)?;
+            self.tuple = None;
+            // Wake tx now so that async users can wait for the RST to be sent.
+            #[cfg(feature = "async")]
+            self.tx_waker.wake();
+            return Ok(());
+        }
 
-            // We transmit a SYN in the SYN-SENT state, and a SYN|ACK in the
-            // SYN-RECEIVED state: if it's not in flight yet, or to carry an ACK
-            // (a simultaneous open acknowledges the remote's SYN with one).
-            State::SynSent | State::SynReceived => {
-                if self.send_next == self.send_unack || self.ack_due(clock) {
-                    let mut syn = TcpRepr {
-                        window_len: self.syn_window(),
-                        max_seg_size: Some(local_mss as u16),
-                        ..repr
-                    };
-                    if self.state == State::SynSent {
-                        syn.ack_number = None;
-                        syn.window_scale = Some(self.recv_window_shift);
-                        #[cfg(feature = "tcp-sack")]
-                        {
-                            syn.sack_permitted = true;
-                        }
-                    } else {
-                        #[cfg(feature = "tcp-sack")]
-                        {
-                            syn.sack_permitted = self.send_sack;
-                        }
-                        syn.window_scale = self.send_window_shift.map(|_| self.recv_window_shift);
-                    }
-                    self.send_segment(clock, &mut send, &syn, TcpControl::Syn, 0, 0)?;
+        // We transmit a SYN in the SYN-SENT state, and a SYN|ACK in the other states,
+        // until the remote acknowledges it: if it's not in flight yet, or to carry
+        // an ACK (a simultaneous open acknowledges the remote's SYN with one). A
+        // close in SYN-RECEIVED leaves it unacknowledged in FIN-WAIT-1, where the
+        // FIN goes out after it.
+        if !self.syn_acked && (self.send_next == self.send_unack || self.ack_due(clock)) {
+            let mut syn = TcpRepr {
+                window_len: self.syn_window(),
+                max_seg_size: Some(local_mss as u16),
+                ..repr
+            };
+            if self.state == State::SynSent {
+                syn.ack_number = None;
+                syn.window_scale = Some(self.recv_window_shift);
+                #[cfg(feature = "tcp-sack")]
+                {
+                    syn.sack_permitted = true;
                 }
+            } else {
+                #[cfg(feature = "tcp-sack")]
+                {
+                    syn.sack_permitted = self.send_sack;
+                }
+                syn.window_scale = self.send_window_shift.map(|_| self.recv_window_shift);
             }
+            self.send_segment(clock, &mut send, &syn, TcpControl::Syn, 0, 0)?;
+        }
 
+        match self.state {
             // We transmit data in all states where we may have data in the buffer,
             // or the transmit half of the connection is still open.
             State::Established | State::FinWait1 | State::Closing | State::CloseWait | State::LastAck => {
@@ -2068,10 +2088,12 @@ impl<'d> TcpSocketState<'d> {
 
                 // New data, in segments of up to one MSS, up to the edge of the remote
                 // window, with no more in flight than the congestion window. Offsets
-                // count from the first unacknowledged octet.
+                // count from the first unacknowledged octet. The SYN, if unacknowledged,
+                // went out above, so the cursor is at or past the transmit buffer.
+                let tx_start = self.tx_start();
                 let limit = tx_len.min(self.send_window).min(self.congestion_controller.window());
                 loop {
-                    let offset = self.flight_size();
+                    let offset = self.send_next - tx_start;
                     let len = limit.saturating_sub(offset).min(mss);
                     let control = data_control(offset, len);
                     if len == 0 && control != TcpControl::Fin {
@@ -2087,27 +2109,27 @@ impl<'d> TcpSocketState<'d> {
                 }
             }
 
-            // In FIN-WAIT-2 and TIME-WAIT states we may only transmit ACKs for incoming data or FIN
-            State::FinWait2 | State::TimeWait => {}
+            // In SYN-SENT and SYN-RECEIVED only the SYN goes out. In FIN-WAIT-2 and
+            // TIME-WAIT states we may only transmit ACKs for incoming data or FIN.
+            State::Closed | State::SynSent | State::SynReceived | State::FinWait2 | State::TimeWait => {}
         }
 
-        // A zero-window probe is the next octet of data, past the edge of the
-        // window. It isn't counted as sent, so the rest of the state is left
-        // intact. The remote accepts its ACK even with a zero window (RFC 9293
-        // 3.10.7.4), so it carries any ACK or window update that is due.
+        // A zero-window probe is an empty segment at SND.UNA - 1, like Linux's.
+        // The remote has acknowledged that sequence number already, so it answers
+        // with an ACK carrying its window. It carries no new data: if the remote
+        // took it, its RCV.NXT would be past our SND.NXT, and if we counted it as
+        // sent and the remote dropped it, our SND.NXT would be past its RCV.NXT.
+        // Either way, our next pure ACKs would be unacceptable to it. The remote
+        // finds the probe unacceptable and ignores its ACK (RFC 9293 3.10.7.4), so
+        // it doesn't count as having sent one.
         if let Timer::ZeroWindowProbe { expires_at, delay } = self.timer
             && clock.expired(expires_at)
         {
             trace!("sending a zero-window probe");
-            let offset = self.flight_size();
-            let payload = self.tx_buffer.get_allocated(offset, 1);
             send(TcpRepr {
-                control: data_control(offset, payload.len()),
-                seq_number: self.send_next,
-                payload,
+                seq_number: self.send_unack - 1,
                 ..repr
             })?;
-            self.ack_sent(repr.ack_number, repr.window_len, repr.control);
             let delay = (delay * 2).min(RTTE_MAX_RTO);
             self.timer = Timer::ZeroWindowProbe {
                 expires_at: clock.after(delay),
@@ -2120,8 +2142,7 @@ impl<'d> TcpSocketState<'d> {
         // (RFC 5681 2). Then an ACK or a window update that is due, if nothing sent
         // above carried it.
         while self.acks_owed > 0 || self.ack_due(clock) {
-            let offset = self.flight_size();
-            self.send_segment(clock, &mut send, &repr, TcpControl::None, offset, 0)?;
+            self.send_segment(clock, &mut send, &repr, TcpControl::None, 0, 0)?;
             self.acks_owed = self.acks_owed.saturating_sub(1);
         }
 
@@ -2152,7 +2173,7 @@ impl<'d> TcpSocketState<'d> {
             {
                 trace!("sending a keep-alive");
                 send(TcpRepr {
-                    seq_number: self.send_next - 1,
+                    seq_number: self.send_unack - 1,
                     payload: b"\x00",
                     ..repr
                 })?;
@@ -2172,9 +2193,14 @@ impl<'d> TcpSocketState<'d> {
     }
 
     /// Send one segment: `repr` with the `control` flag, with the `len` octets of
-    /// the transmit buffer at `offset` as its payload, and that offset's sequence
-    /// number. Once it's sent,
-    /// record what it acknowledged, advertised and took up in sequence space.
+    /// the transmit buffer at `offset` as its payload. Once it's sent, record what
+    /// it acknowledged, advertised and took up in sequence space.
+    ///
+    /// Data and a FIN go at their place after the transmit buffer's start, the SYN
+    /// at ISS. A segment that takes no sequence space goes at SND.NXT, the highest
+    /// sequence number sent: the retransmission cursor may be behind what the
+    /// remote has received, and a segment from there would be unacceptable to
+    /// it, ACK and window included.
     fn send_segment<E>(
         &mut self,
         clock: &mut Clock,
@@ -2192,9 +2218,16 @@ impl<'d> TcpSocketState<'d> {
         let payload2 = self
             .tx_buffer
             .get_allocated(offset + payload.len(), len - payload.len());
+        let seq_number = if control == TcpControl::Syn {
+            self.send_unack
+        } else if len != 0 || control == TcpControl::Fin {
+            self.tx_start() + offset
+        } else {
+            self.send_max
+        };
         let repr = TcpRepr {
             control,
-            seq_number: self.send_unack + offset,
+            seq_number,
             payload,
             payload2,
             ..*repr
@@ -2227,17 +2260,19 @@ impl<'d> TcpSocketState<'d> {
         send(repr)?;
         let segment_len = repr.segment_len();
         let seq_end = repr.seq_number + segment_len;
-
-        // Use max() so a fast-retransmit segment (whose seq_number is send_unack, well
-        // behind the current frontier) doesn't rewind the tracked "highest sent" sequence.
-        self.send_next = self.send_next.max(seq_end);
         self.ack_sent(repr.ack_number, repr.window_len, repr.control);
 
         // We've sent something, so rewind the keep-alive timer.
         self.timer.rewind_keep_alive(now, self.keep_alive);
 
         if segment_len > 0 {
-            self.rtte.on_send(now, seq_end);
+            // Use max() so a fast-retransmit segment (whose seq_number is send_unack, well
+            // behind the current frontier) doesn't rewind the cursor.
+            self.send_next = self.send_next.max(seq_end);
+            if seq_end > self.send_max {
+                self.send_max = seq_end;
+                self.rtte.on_send(now, seq_end);
+            }
             self.congestion_controller.post_transmit(now, segment_len);
 
             if !self.timer.is_retransmit() {
@@ -2679,6 +2714,7 @@ impl<'d> TcpSocket<'_, 'd> {
         s.set_state(State::SynSent);
         s.send_unack = seq;
         s.send_next = seq;
+        s.send_max = seq;
         // Every connection we open offers timestamps; the SYN|ACK decides
         // whether they stay on.
         #[cfg(feature = "tcp-timestamps")]
@@ -3289,6 +3325,8 @@ mod test {
             assert_eq!(s1.send_unack, s2.send_unack, "send_unack");
             assert_eq!(s1.recv_read, s2.recv_read, "recv_read");
             assert_eq!(s1.send_next, s2.send_next, "send_next");
+            assert_eq!(s1.send_max, s2.send_max, "send_max");
+            assert_eq!(s1.syn_acked, s2.syn_acked, "syn_acked");
             assert_eq!(s1.recv_ack_sent, s2.recv_ack_sent, "recv_ack_sent");
             assert_eq!(s1.recv_adv, s2.recv_adv, "recv_adv");
             assert_eq!(s1.send_window, s2.send_window, "send_window");
@@ -3339,8 +3377,11 @@ mod test {
         s.recv_read = REMOTE_SEQ + 1;
         s.recv_adv = REMOTE_SEQ + 1;
         s.send_next = LOCAL_SEQ;
+        s.send_max = LOCAL_SEQ;
         s.send_window = 256;
         s.send_window_max = 256;
+        s.send_wl1 = REMOTE_SEQ;
+        s.send_wl2 = LOCAL_SEQ;
         s
     }
 
@@ -3354,6 +3395,7 @@ mod test {
         s.tuple = Some(TUPLE);
         s.send_unack = LOCAL_SEQ;
         s.send_next = LOCAL_SEQ;
+        s.send_max = LOCAL_SEQ;
         s
     }
 
@@ -3366,6 +3408,10 @@ mod test {
         s.state = State::Established;
         s.send_unack = LOCAL_SEQ + 1;
         s.send_next = LOCAL_SEQ + 1;
+        s.send_max = LOCAL_SEQ + 1;
+        s.syn_acked = true;
+        s.send_wl1 = REMOTE_SEQ + 1;
+        s.send_wl2 = LOCAL_SEQ + 1;
         s.recv_ack_sent = Some(REMOTE_SEQ + 1);
         s.recv_adv = REMOTE_SEQ + 1 + s.recv_window();
         s
@@ -3386,6 +3432,7 @@ mod test {
         s.state = State::FinWait2;
         s.send_unack = LOCAL_SEQ + 1 + 1;
         s.send_next = LOCAL_SEQ + 1 + 1;
+        s.send_max = LOCAL_SEQ + 1 + 1;
         s
     }
 
@@ -3393,6 +3440,7 @@ mod test {
         let mut s = socket_fin_wait_1();
         s.state = State::Closing;
         s.send_next = LOCAL_SEQ + 1 + 1;
+        s.send_max = LOCAL_SEQ + 1 + 1;
         s.recv_read = REMOTE_SEQ + 1 + 1;
         s.recv_adv += 1;
         s.timer = Timer::Retransmit {
@@ -3451,6 +3499,81 @@ mod test {
             }]
         );
         s
+    }
+
+    /// Both ends of one connection, each with buffers of `tx_len` and `rx_len`
+    /// octets and the remote's MSS set to `mss`: a socket from
+    /// `socket_established`, and its remote. Segments go from one to the other
+    /// with [`deliver`].
+    fn socket_pair(tx_len: usize, rx_len: usize, mss: usize) -> (TestSocket, TestSocket) {
+        let mut a = socket_established_with_buffer_sizes(tx_len, rx_len);
+        let mut b = socket_established_with_buffer_sizes(tx_len, rx_len);
+        b.send_unack = REMOTE_SEQ + 1;
+        b.send_next = REMOTE_SEQ + 1;
+        b.send_max = REMOTE_SEQ + 1;
+        b.recv_read = LOCAL_SEQ + 1;
+        b.recv_ack_sent = Some(LOCAL_SEQ + 1);
+        b.recv_adv = LOCAL_SEQ + 1 + rx_len;
+        b.send_wl1 = LOCAL_SEQ + 1;
+        b.send_wl2 = REMOTE_SEQ + 1;
+        for s in [&mut a, &mut b] {
+            s.send_mss = mss;
+            s.congestion_controller.set_mss(mss);
+            s.send_window = rx_len;
+            s.send_window_max = rx_len;
+        }
+        (a, b)
+    }
+
+    /// Dispatch at `timestamp`, and return everything sent.
+    fn dispatch_all(socket: &mut TestSocket, timestamp: Instant) -> Vec<TcpRepr<'static>> {
+        let mut clock = Clock::new(timestamp);
+        let mut sent = Vec::new();
+        let result: Result<(), ()> =
+            socket
+                .sockets
+                .get_mut(0)
+                .dispatch(&mut socket.stack.tx_context(), &mut clock, |_, _, _, _, _, repr| {
+                    let payload = [repr.payload, repr.payload2].concat().leak();
+                    sent.push(TcpRepr {
+                        payload,
+                        payload2: &[],
+                        ..repr
+                    });
+                    Ok(())
+                });
+        assert_eq!(result, Ok(()));
+        socket.deadline = clock.next();
+        sent
+    }
+
+    /// Hand a segment that the other end of a [`socket_pair`] sent to `socket`.
+    fn deliver(socket: &mut TestSocket, timestamp: Instant, repr: &TcpRepr) {
+        let repr = TcpRepr {
+            src_port: repr.dst_port,
+            dst_port: repr.src_port,
+            ..*repr
+        };
+        assert_eq!(send(socket, timestamp, &repr), None);
+    }
+
+    /// Dispatch both ends of a [`socket_pair`] at `timestamp`, and deliver what
+    /// each sends to the other, until neither sends anything.
+    fn exchange(a: &mut TestSocket, b: &mut TestSocket, timestamp: Instant) {
+        for _ in 0..50 {
+            let from_a = dispatch_all(a, timestamp);
+            let from_b = dispatch_all(b, timestamp);
+            if from_a.is_empty() && from_b.is_empty() {
+                return;
+            }
+            for repr in &from_a {
+                deliver(b, timestamp, repr);
+            }
+            for repr in &from_b {
+                deliver(a, timestamp, repr);
+            }
+        }
+        panic!("the two ends never stop sending");
     }
 
     // =========================================================================================//
@@ -4280,6 +4403,102 @@ mod test {
         assert_eq!(s.state, State::FinWait1);
     }
 
+    /// The SYN|ACK of a socket in SYN-RECEIVED.
+    const SYN_ACK: TcpRepr<'static> = TcpRepr {
+        control: TcpControl::Syn,
+        seq_number: LOCAL_SEQ,
+        ack_number: Some(TcpSeqNumber(REMOTE_SEQ.0 + 1)),
+        max_seg_size: Some(BASE_MSS),
+        ..RECV_TEMPL
+    };
+
+    #[test]
+    fn test_syn_received_close_after_syn_ack() {
+        // A close in SYN-RECEIVED sends the FIN right away (RFC 9293 3.10.4). Our
+        // SYN stays in sequence space: the FIN goes after it, and the ACK of the
+        // SYN alone doesn't acknowledge the FIN.
+        let mut s = socket_syn_received();
+        recv!(s, [SYN_ACK]);
+        s.view().close();
+        assert_eq!(s.state, State::FinWait1);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::FinWait1);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::FinWait2);
+    }
+
+    #[test]
+    fn test_syn_received_close_before_syn_ack() {
+        // Closed before the SYN|ACK went out: the SYN|ACK goes out first, then
+        // the FIN, and both are retransmitted until the remote acknowledges them.
+        let mut s = socket_syn_received();
+        s.view().close();
+        let fin = TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        };
+        recv!(s, [SYN_ACK, fin]);
+        recv!(s, time 1000, [SYN_ACK, fin]);
+        send!(
+            s,
+            time 1010,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::FinWait2);
+        recv_nothing!(s, time 1010);
+    }
+
+    #[test]
+    fn test_syn_received_ack_of_unsent_syn_ack() {
+        // Our SYN|ACK hasn't gone out yet, so nothing can acknowledge it.
+        let mut s = socket_syn_received();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: None,
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.state, State::SynReceived);
+    }
+
     #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_syn_received_window_scaling() {
@@ -4892,6 +5111,9 @@ mod test {
     #[test]
     fn test_syn_sent_rst() {
         let mut s = socket_syn_sent();
+        recv(&mut s, Instant::ZERO, 1, |_, repr| {
+            assert_eq!(repr.control, TcpControl::Syn)
+        });
         send!(
             s,
             TcpRepr {
@@ -4930,6 +5152,29 @@ mod test {
                 ack_number: Some(TcpSeqNumber(1234)),
                 ..SEND_TEMPL
             }
+        );
+        assert_eq!(s.state, State::SynSent);
+    }
+
+    #[test]
+    fn test_syn_sent_syn_ack_for_unsent_syn() {
+        // Our SYN hasn't gone out yet, so a SYN|ACK can't acknowledge it.
+        let mut s = socket_syn_sent();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: None,
+                window_len: 0,
+                ..RECV_TEMPL
+            })
         );
         assert_eq!(s.state, State::SynSent);
     }
@@ -5649,6 +5894,71 @@ mod test {
                 ..SEND_TEMPL
             }
         );
+    }
+
+    #[test]
+    fn test_established_ack_of_unsent_data() {
+        // Data queued but not sent yet can't be acknowledged (RFC 9293 3.10.7.4,
+        // RFC 5961 5.2). The ACK is dropped and answered with an ACK.
+        let mut s = socket_established();
+        s.view().send_slice(b"abcdef").unwrap();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 6),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.tx_buffer.len(), 6);
+        assert_eq!(s.send_unack, LOCAL_SEQ + 1);
+        recv!(
+            s,
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &b"abcdef"[..],
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + 6,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    ..RECV_TEMPL
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_established_reordered_segment_keeps_window() {
+        // Only a segment no older than the one that last updated the send window
+        // may update it (RFC 9293 3.10.7.4, SND.WL1 and SND.WL2). The remote sent
+        // 3 octets with a zero window, then a window update, and the update
+        // arrives first.
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 3,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 1000,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.send_window, 1000);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 0,
+                payload: &b"abc"[..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.rx_buffer.len(), 3);
+        assert_eq!(s.send_window, 1000);
     }
 
     #[test]
@@ -6619,6 +6929,39 @@ mod test {
     }
 
     #[test]
+    fn test_fin_wait_1_ack_of_unsent_fin() {
+        // A FIN queued by close() but not sent yet can't be acknowledged.
+        let mut s = socket_established();
+        s.view().close();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::FinWait1);
+        recv!(
+            s,
+            [
+                TcpRepr {
+                    control: TcpControl::Fin,
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    ..RECV_TEMPL
+                }
+            ]
+        );
+        assert_eq!(s.state, State::FinWait1);
+    }
+
+    #[test]
     fn test_fin_wait_1_close() {
         let mut s = socket_fin_wait_1();
         s.view().close();
@@ -6964,6 +7307,7 @@ mod test {
         let _ = s.tx_buffer.enqueue_slice(b"x");
         // Mark it as already sent (send_next is past the data byte and the FIN).
         s.send_next = LOCAL_SEQ + 1 + 1 + 1; // data(1) + FIN(1)
+        s.send_max = s.send_next;
 
         // Remote ACKs just the data byte, not the FIN (partial ACK).
         // ack_number = send_unack + 1  =>  ack_len = 1, ack_of_fin = false.
@@ -8600,6 +8944,135 @@ mod test {
         );
     }
 
+    /// An established socket that sent "abcdef" in three segments, saw the remote
+    /// close its window to 2 octets, and on the retransmission timeout resent the
+    /// first segment only: its retransmission cursor is at `LOCAL_SEQ + 3`, behind
+    /// the `LOCAL_SEQ + 7` it sent.
+    fn socket_after_partial_rto() -> TestSocket {
+        let mut s = socket_established();
+        s.send_mss = 2;
+        s.view().send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &b"ab"[..],
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + 2,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &b"cd"[..],
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + 4,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &b"ef"[..],
+                    ..RECV_TEMPL
+                }
+            ]
+        );
+        send!(
+            s,
+            time 10,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 2,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            time 1000,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"ab"[..],
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.send_next, LOCAL_SEQ + 1 + 2);
+        s
+    }
+
+    #[test]
+    fn test_ack_after_rto() {
+        // The remote may have received everything, so an ACK from the rewound
+        // cursor could be below its RCV.NXT, and dropped with its ACK and window.
+        // It goes at the highest sequence number sent.
+        let mut s = socket_after_partial_rto();
+        send!(
+            s,
+            time 1010,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 2,
+                payload: &b"xyz"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            time 1010,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1 + 3),
+                window_len: 61,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_abort_after_rto() {
+        // Same for the RST of an abort: the remote drops one below its RCV.NXT.
+        let mut s = socket_after_partial_rto();
+        s.view().abort();
+        recv!(
+            s,
+            time 1010,
+            [TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_rto_on_both_ends() {
+        // Both ends send 500 octets in 100-octet segments. All of them arrive, but
+        // the one ACK each end sends is lost, so both retransmission timers fire,
+        // and each end's retransmission is old to the other. The ACKs answering
+        // them must be acceptable, though both cursors were rewound.
+        let (mut a, mut b) = socket_pair(4096, 4096, 100);
+        a.view().send_slice(&[b'a'; 500]).unwrap();
+        b.view().send_slice(&[b'b'; 500]).unwrap();
+        let from_a = dispatch_all(&mut a, Instant::ZERO);
+        let from_b = dispatch_all(&mut b, Instant::ZERO);
+        for repr in &from_a {
+            deliver(&mut b, Instant::ZERO, repr);
+        }
+        for repr in &from_b {
+            deliver(&mut a, Instant::ZERO, repr);
+        }
+        // The ACKs are lost.
+        assert_eq!(dispatch_all(&mut a, Instant::ZERO).len(), 1);
+        assert_eq!(dispatch_all(&mut b, Instant::ZERO).len(), 1);
+
+        while !a.tx_buffer.is_empty() || !b.tx_buffer.is_empty() {
+            let now = a.deadline.min(b.deadline);
+            assert!(now < Instant::from_secs(60), "the connection is stuck");
+            exchange(&mut a, &mut b, now);
+        }
+    }
+
     // =========================================================================================//
     // Tests for window management.
     // =========================================================================================//
@@ -9548,19 +10021,19 @@ mod test {
             s,
             time 1000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
 
+        // The probe took no sequence space, the remote answers it with its window.
         send!(
             s,
             time 1010,
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 2),
+                ack_number: Some(LOCAL_SEQ + 1),
                 window_len: 6,
                 ..SEND_TEMPL
             }
@@ -9570,9 +10043,9 @@ mod test {
             s,
             time 1010,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 2,
+                seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"bcdef1"[..],
+                payload: &b"abcdef"[..],
                 ..RECV_TEMPL
             }]
         );
@@ -9617,14 +10090,12 @@ mod test {
         s.timer
             .set_for_zero_window_probe(Instant::from_millis(10), Duration::from_millis(100));
 
-        // The probe must carry 1 byte of data past the window edge even though
-        // the congestion window is exhausted: an empty probe occupies no
-        // sequence space and elicits no reply, so the connection would stall
-        // if the remote's window update got lost.
+        // The probe goes out even though the congestion window is exhausted:
+        // the connection would stall if the remote's window update got lost. It
+        // carries no data, so it takes no window.
         recv!(s, time 110, Ok(TcpRepr {
-            seq_number: LOCAL_SEQ + 1 + 2048,
+            seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
-            payload: &data[..1],
             ..RECV_TEMPL
         }));
     }
@@ -9648,9 +10119,8 @@ mod test {
             s,
             time 1000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
@@ -9670,9 +10140,8 @@ mod test {
             s,
             time 3000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
@@ -9692,9 +10161,8 @@ mod test {
             s,
             time 7000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
@@ -9719,9 +10187,8 @@ mod test {
             s,
             time 1000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
@@ -9731,9 +10198,8 @@ mod test {
             s,
             time 3000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
@@ -9764,9 +10230,8 @@ mod test {
             s,
             time probe_at,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
@@ -9801,19 +10266,28 @@ mod test {
         );
         recv_nothing!(s, time 999);
 
-        // The probe carries the ACK, so none follows it.
+        // The remote ignores the ACK on the probe, which is out of its window, so
+        // the probe doesn't stand in for the delayed ACK.
         recv!(
             s,
             time 1000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1 + 3),
                 window_len: 61,
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
-        recv_nothing!(s, time 1010);
+        recv!(
+            s,
+            time 1005,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 3),
+                window_len: 61,
+                ..RECV_TEMPL
+            }]
+        );
         assert_eq!(s.deadline, Instant::from_millis(3000));
     }
 
@@ -9846,23 +10320,30 @@ mod test {
         );
         recv_nothing!(s, time 999);
 
-        // One segment goes out: the probe, carrying the ACK.
+        // The probe, then the ACK: the remote ignores the ACK on the probe.
         recv!(
             s,
             time 1000,
-            [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1 + 3),
-                window_len: 61,
-                payload: &b"a"[..],
-                ..RECV_TEMPL
-            }]
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ,
+                    ack_number: Some(REMOTE_SEQ + 1 + 3),
+                    window_len: 61,
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 3),
+                    window_len: 61,
+                    ..RECV_TEMPL
+                }
+            ]
         );
         recv_nothing!(s, time 1010);
     }
 
     #[test]
-    fn test_zero_window_probe_shift() {
+    fn test_zero_window_probe_answer_keeps_backoff() {
         let mut s = socket_established();
 
         s.view().send_slice(b"abcdef123456!@#$%^").unwrap();
@@ -9881,9 +10362,8 @@ mod test {
             s,
             time 1000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
@@ -9893,38 +10373,78 @@ mod test {
             s,
             time 3000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"a"[..],
                 ..RECV_TEMPL
             }]
         );
 
-        // ack the ZWP byte, but still advertise zero window.
-        // this should restart the ZWP timer.
+        // answer the ZWP, still advertising a zero window.
+        // this doesn't restart the ZWP timer: nothing new is acknowledged.
         send!(
             s,
             time 3100,
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 2),
+                ack_number: Some(LOCAL_SEQ + 1),
                 window_len: 0,
                 ..SEND_TEMPL
             }
         );
 
-        // ZWP should be sent at 3100+1000 = 4100
-        recv_nothing!(s, time 4099);
+        // The probes back off: the next one is at 3000+4000 = 7000, and it is the
+        // same octet again.
+        recv_nothing!(s, time 6999);
         recv!(
             s,
-            time 4100,
+            time 7000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 2,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"b"[..],
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    #[test]
+    fn test_zero_window_probes_on_both_ends() {
+        // Both ends fill the other's 8-octet window, and both probe. Both
+        // applications read before the probes arrive, and each end's window
+        // update crosses the other's probe. Nothing is lost, so the transfer
+        // must finish: a probe that the remote takes as data, or our next
+        // segments, would not be acceptable to it.
+        let (mut a, mut b) = socket_pair(64, 8, 100);
+        a.view().send_slice(&[b'a'; 32]).unwrap();
+        b.view().send_slice(&[b'b'; 32]).unwrap();
+        exchange(&mut a, &mut b, Instant::ZERO);
+        assert!(a.timer.is_zero_window_probe() && b.timer.is_zero_window_probe());
+
+        let mut now = a.deadline.min(b.deadline);
+        let probe_a = dispatch_all(&mut a, now);
+        let probe_b = dispatch_all(&mut b, now);
+        let mut buf = [0; 64];
+        let mut got_a = a.view().recv_slice(&mut buf).unwrap();
+        let mut got_b = b.view().recv_slice(&mut buf).unwrap();
+        let update_a = dispatch_all(&mut a, now);
+        let update_b = dispatch_all(&mut b, now);
+        for repr in probe_a.iter().chain(&update_a) {
+            deliver(&mut b, now, repr);
+        }
+        for repr in probe_b.iter().chain(&update_b) {
+            deliver(&mut a, now, repr);
+        }
+
+        while got_a < 32 || got_b < 32 {
+            exchange(&mut a, &mut b, now);
+            let read_a = a.view().recv_slice(&mut buf).unwrap();
+            let read_b = b.view().recv_slice(&mut buf).unwrap();
+            got_a += read_a;
+            got_b += read_b;
+            if read_a == 0 && read_b == 0 {
+                now = a.deadline.min(b.deadline);
+                assert!(now < Instant::from_secs(600), "the transfer is stuck");
+            }
+        }
     }
 
     // =========================================================================================//
@@ -12290,12 +12810,13 @@ mod test {
             })
         );
 
-        // Queued data plus a closed remote window arms the probe timer
+        // Queued data plus a closed remote window arms the probe timer. The
+        // remote sent up to the island, so its ACKs come from there.
         s.view().send_slice(b"abcdef").unwrap();
         send!(
             s,
             TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
+                seq_number: REMOTE_SEQ + 1 + 30,
                 ack_number: Some(LOCAL_SEQ + 1),
                 window_len: 0,
                 ..SEND_TEMPL
@@ -12309,10 +12830,9 @@ mod test {
             s,
             time 1000,
             [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
+                seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
                 window_len: 128,
-                payload: &b"a"[..],
                 sack_ranges: [block(20, 30), None, None],
                 ..RECV_TEMPL
             }]

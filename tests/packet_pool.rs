@@ -43,6 +43,8 @@ fn exhaustion() {
     assert!(!held.is_empty());
     assert!(POOL.alloc().is_none());
 
+    assert!(matches!(stack.udp_socket(udp).alloc(), Err(SendError::NoBuffer)));
+
     // A send now fails, and the socket is unharmed.
     assert_eq!(
         stack.udp_socket(udp).send_slice(b"hello", dst),
@@ -55,7 +57,13 @@ fn exhaustion() {
     buf.set_len(5);
     buf.copy_from_slice(b"hello");
     stack.udp_socket(udp).send_packet(buf, dst).unwrap();
-    held.push(POOL.alloc().unwrap());
+    let mut buf = stack.udp_socket(udp).alloc().unwrap();
+    assert!(buf.is_empty());
+    assert!(buf.headroom() >= test_device::TX_HEADROOM + 20 + 8);
+    buf.set_len(5);
+    buf.copy_from_slice(b"hello");
+    stack.udp_socket(udp).send_packet(buf, dst).unwrap();
+    held.push(stack.udp_socket(udp).alloc().unwrap());
     assert!(POOL.alloc().is_none());
 
     // Freeing one buffer is enough for a send. Taking it back starves sends again.

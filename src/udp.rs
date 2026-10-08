@@ -821,6 +821,22 @@ impl UdpSocket<'_, '_> {
         Ok(())
     }
 
+    /// Allocate an empty UDP payload buffer with headroom for the headers.
+    ///
+    /// Set the payload length with [`PacketBuf::set_len`] before writing.
+    ///
+    /// # Errors
+    /// - `InvalidState`: if the socket is not bound.
+    /// - `NoBuffer`: if every packet buffer is in use.
+    pub fn alloc(&self) -> Result<PacketBuf, SendError> {
+        if !self.is_open() {
+            return Err(SendError::InvalidState);
+        }
+        let mut buf = self.tx.inner.pool.alloc().ok_or(SendError::NoBuffer)?;
+        buf.reserve(self.send_headroom());
+        Ok(buf)
+    }
+
     /// Headroom to reserve in a buffer for [`send_packet`](Self::send_packet), so
     /// that the payload isn't moved.
     pub fn send_headroom(&self) -> usize {
@@ -1208,6 +1224,23 @@ mod test {
 
     /// The fully wildcard remote: an ordinary unconnected bind.
     const ANY: ListenSocketAddr = ListenSocketAddr::UNSPECIFIED;
+
+    #[test]
+    fn test_alloc_without_route_or_device_room() {
+        let (mut stack, handle) = stack_with_socket();
+        let driver = TestDevice::new(Medium::Ip);
+        driver.room.set(Some(0));
+        driver.install(&mut stack, HardwareAddress::Ip);
+        let mut socket = stack.udp_socket(handle);
+        assert!(matches!(socket.alloc(), Err(SendError::InvalidState)));
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+        let mut buf = socket.alloc().unwrap();
+        assert!(buf.is_empty());
+        assert_eq!(buf.headroom(), crate::test_device::TX_HEADROOM + 40 + 8);
+        buf.set_len(3);
+        buf.copy_from_slice(b"udp");
+        assert_eq!(&*buf, b"udp");
+    }
 
     /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
     /// specified remote can resolve their local address.

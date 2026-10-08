@@ -823,18 +823,12 @@ impl UdpSocket<'_, '_> {
 
     /// Allocate an empty UDP payload buffer with headroom for the headers.
     ///
-    /// Set the payload length with [`PacketBuf::set_len`] before writing.
-    ///
-    /// # Errors
-    /// - `InvalidState`: if the socket is not bound.
-    /// - `NoBuffer`: if every packet buffer is in use.
-    pub fn alloc(&self) -> Result<PacketBuf, SendError> {
-        if !self.is_open() {
-            return Err(SendError::InvalidState);
-        }
-        let mut buf = self.tx.inner.pool.alloc().ok_or(SendError::NoBuffer)?;
+    /// Allocation works before binding. Returns `None` if every packet buffer
+    /// is in use. Set the payload length with [`PacketBuf::set_len`] before writing.
+    pub fn alloc(&self) -> Option<PacketBuf> {
+        let mut buf = self.tx.inner.pool.alloc()?;
         buf.reserve(self.send_headroom());
-        Ok(buf)
+        Some(buf)
     }
 
     /// Headroom to reserve in a buffer for [`send_packet`](Self::send_packet), so
@@ -1232,11 +1226,10 @@ mod test {
         driver.room.set(Some(0));
         driver.install(&mut stack, HardwareAddress::Ip);
         let mut socket = stack.udp_socket(handle);
-        assert!(matches!(socket.alloc(), Err(SendError::InvalidState)));
-        socket.bind(LOCAL_PORT, ANY).unwrap();
         let mut buf = socket.alloc().unwrap();
         assert!(buf.is_empty());
         assert_eq!(buf.headroom(), crate::test_device::TX_HEADROOM + 40 + 8);
+        socket.bind(LOCAL_PORT, ANY).unwrap();
         buf.set_len(3);
         buf.copy_from_slice(b"udp");
         assert_eq!(&*buf, b"udp");

@@ -43,7 +43,7 @@ fn exhaustion() {
     assert!(!held.is_empty());
     assert!(POOL.alloc().is_none());
 
-    assert!(matches!(stack.udp_socket(udp).alloc(), Err(SendError::NoBuffer)));
+    assert!(stack.udp_socket(udp).alloc().is_none());
 
     // A send now fails, and the socket is unharmed.
     assert_eq!(

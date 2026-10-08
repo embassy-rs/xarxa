@@ -566,33 +566,12 @@ impl RawSocket<'_, '_> {
 
     /// Allocate an empty packet buffer with headroom for this socket.
     ///
-    /// Set the payload length with [`PacketBuf::set_len`] before writing.
-    ///
-    /// # Errors
-    /// - `InvalidState`: if the socket is not bound.
-    /// - `Unaddressable`: if Ethernet mode has no interface to send on.
-    /// - `NoBuffer`: if every packet buffer is in use.
-    pub fn alloc(&self) -> Result<PacketBuf, SendError> {
-        let Some(mode) = self.state.mode else {
-            return Err(SendError::InvalidState);
-        };
-
-        // Ethernet selects its interface here; IP routing follows packet construction.
-        let headroom = match mode {
-            #[cfg(feature = "raw-ethernet")]
-            RawMode::Ethernet { .. } => {
-                let iface = self.ethernet_iface().ok_or(SendError::Unaddressable)?;
-                self.tx.tx_headroom(iface)
-            }
-            #[cfg(feature = "raw-ip")]
-            RawMode::Ip { .. } => self.tx.max_ip_headroom(),
-        };
-
-        let Some(mut buf) = self.tx.inner.pool.alloc() else {
-            return Err(SendError::NoBuffer);
-        };
-        buf.reserve(headroom);
-        Ok(buf)
+    /// Allocation works before binding. Returns `None` if every packet buffer
+    /// is in use. Set the payload length with [`PacketBuf::set_len`] before writing.
+    pub fn alloc(&self) -> Option<PacketBuf> {
+        let mut buf = self.tx.inner.pool.alloc()?;
+        buf.reserve(self.send_headroom());
+        Some(buf)
     }
 
     /// The interface an Ethernet-mode socket sends on: its bound interface, else
@@ -893,7 +872,10 @@ mod test {
         );
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
-        assert!(matches!(socket.alloc(), Err(SendError::InvalidState)));
+        let buf = socket.alloc().unwrap();
+        assert!(buf.is_empty());
+        assert_eq!(buf.headroom(), 0);
+        drop(buf);
         for mode in [
             RawMode::Ethernet { ethertype: None },
             RawMode::Ip {

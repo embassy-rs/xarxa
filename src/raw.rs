@@ -564,6 +564,16 @@ impl RawSocket<'_, '_> {
         self.send_packet(buf).map_err(|(err, _)| err)
     }
 
+    /// Allocate an empty packet buffer with headroom for this socket.
+    ///
+    /// Allocation works before binding. Returns `None` if every packet buffer
+    /// is in use. Set the payload length with [`PacketBuf::set_len`] before writing.
+    pub fn alloc(&self) -> Option<PacketBuf> {
+        let mut buf = self.tx.inner.pool.alloc()?;
+        buf.reserve(self.send_headroom());
+        Some(buf)
+    }
+
     /// The interface an Ethernet-mode socket sends on: its bound interface, else
     /// the first Ethernet interface.
     #[cfg(feature = "raw-ethernet")]
@@ -850,6 +860,37 @@ mod test {
 
     const IP_PROTO: IpProtocol = IpProtocol(63);
     const ETHERTYPE_CUSTOM: EthernetProtocol = EthernetProtocol(0x88b5);
+
+    #[test]
+    fn test_alloc_ignores_device_readiness() {
+        let mut stack = Stack::new(crate::pool::test_pool(), 0);
+        let driver = TestDevice::new(Medium::Ethernet);
+        driver.room.set(Some(0));
+        driver.install(
+            &mut stack,
+            HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 1])),
+        );
+        let handle = stack.add_raw_socket().unwrap();
+        let mut socket = stack.raw_socket(handle);
+        let buf = socket.alloc().unwrap();
+        assert!(buf.is_empty());
+        assert_eq!(buf.headroom(), 0);
+        drop(buf);
+        for mode in [
+            RawMode::Ethernet { ethertype: None },
+            RawMode::Ip {
+                version: None,
+                protocol: None,
+            },
+        ] {
+            socket.bind(mode).unwrap();
+            let buf = socket.alloc().unwrap();
+            assert!(buf.is_empty());
+            assert!(buf.headroom() >= crate::test_device::TX_HEADROOM);
+            assert_eq!(buf.tailroom() + buf.headroom(), buf.capacity());
+            socket.close();
+        }
+    }
 
     /// A whole IPv4 packet with an arbitrary protocol. The header checksum is left
     /// zero, so tests double as proof that nothing rewrites the header.

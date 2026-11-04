@@ -1206,3 +1206,51 @@ impl IfaceState<'_> {
         candidate_cidr.address()
     }
 }
+
+#[cfg(all(test, feature = "async", feature = "medium-ethernet", feature = "ipv4"))]
+mod waiter_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    use crate::iface::Medium;
+    use crate::stack::Stack;
+    use crate::test_device::TestDevice;
+    use crate::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Addr};
+
+    /// A waker that counts how often it is woken.
+    struct Count(AtomicUsize);
+
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Two tasks wait for the interface's configuration, as embassy-net's
+    /// `Stack::wait_config_up` does through `register_waker`. A config change must
+    /// wake both: a waiter that is not woken never polls again.
+    #[test]
+    fn config_change_wakes_every_waiter() {
+        let driver = TestDevice::new(Medium::Ethernet);
+        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let handle = driver.install(
+            &mut stack,
+            HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
+        );
+
+        let first = Arc::new(Count(AtomicUsize::new(0)));
+        let second = Arc::new(Count(AtomicUsize::new(0)));
+        stack.iface(handle).register_waker(&Waker::from(first.clone()));
+        stack.iface(handle).register_waker(&Waker::from(second.clone()));
+
+        let cidr = IpCidr::new(Ipv4Addr::new(192, 168, 1, 2).into(), 24);
+        stack.iface(handle).add_ip_addr(cidr).unwrap();
+
+        // First waiter was woken when the second registered (replaced), and/or
+        // would have been left hanging without that. Second is woken by
+        // config_changed. Both must have made progress.
+        assert_eq!(second.0.load(Ordering::SeqCst), 1, "the second waiter");
+        assert_eq!(first.0.load(Ordering::SeqCst), 1, "the first waiter");
+    }
+}

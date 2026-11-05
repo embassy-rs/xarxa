@@ -78,7 +78,11 @@ mod tests {
         reg.register(&Waker::from(second.clone()));
 
         assert_eq!(first.0.load(Ordering::SeqCst), 1, "replaced waiter must be woken");
-        assert_eq!(second.0.load(Ordering::SeqCst), 0, "current waiter stays asleep until wake()");
+        assert_eq!(
+            second.0.load(Ordering::SeqCst),
+            0,
+            "current waiter stays asleep until wake()"
+        );
 
         reg.wake();
         assert_eq!(second.0.load(Ordering::SeqCst), 1);

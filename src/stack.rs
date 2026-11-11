@@ -1545,7 +1545,7 @@ impl<'d> Stack<'d> {
                 buf.push_front(header_len);
                 self.transmit_icmpv4_error(
                     iface,
-                    &mut buf,
+                    buf,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::ProtoUnreachable.into(),
                 );
@@ -1624,7 +1624,7 @@ impl<'d> Stack<'d> {
 
         if result == ProcessResult::Rst {
             let reply = TcpSocketState::rst_reply(&tcp_repr);
-            self.transmit_tcp_rst(iface, &reply, dst_addr, src_addr);
+            self.transmit_tcp_rst(iface, &reply, dst_addr, src_addr, buf);
         }
     }
 
@@ -1633,22 +1633,26 @@ impl<'d> Stack<'d> {
     ///
     /// The RST is routed before it is built, since its checksum is the egress
     /// interface's to compute and that is not necessarily the arrival one. It is
-    /// dropped if there is no route, or if the pool is empty.
+    /// dropped if there is no route.
+    ///
+    /// `buf` is the segment it answers, from its TCP header on. The RST is built
+    /// in that same buffer, so it needs no other.
     #[cfg(feature = "tcp")]
-    fn transmit_tcp_rst(&mut self, arrival: IfaceHandle, repr: &TcpRepr<'_>, src_addr: IpAddr, dst_addr: IpAddr) {
+    fn transmit_tcp_rst(
+        &mut self,
+        arrival: IfaceHandle,
+        repr: &TcpRepr<'static>,
+        src_addr: IpAddr,
+        dst_addr: IpAddr,
+        mut buf: PacketBuf,
+    ) {
         let Some((route, checksum_caps)) = self.route_reply(arrival, &dst_addr) else {
             return;
         };
-        let Some(buf) = crate::tcp::build_tcp_packet(
-            self.inner.pool,
-            route.ip_headroom,
-            repr,
-            &src_addr,
-            &dst_addr,
-            &checksum_caps,
-        ) else {
+        if !crate::tcp::build_tcp_packet_in(&mut buf, route.ip_headroom, repr, &src_addr, &dst_addr, &checksum_caps) {
+            trace!("tcp: not enough room for RST");
             return;
-        };
+        }
         self.transmit_reply(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, 64);
     }
 
@@ -1832,7 +1836,7 @@ impl<'d> Stack<'d> {
                 } => {
                     self.transmit_icmpv6_error(
                         iface,
-                        &mut buf,
+                        buf,
                         Icmpv6Message::ParamProblem,
                         Icmpv6ParamProblem::UnrecognizedOption.into(),
                         pointer,
@@ -1885,7 +1889,7 @@ impl<'d> Stack<'d> {
                 buf.push_front(l4_offset);
                 self.transmit_icmpv6_error(
                     iface,
-                    &mut buf,
+                    buf,
                     Icmpv6Message::ParamProblem,
                     Icmpv6ParamProblem::UnrecognizedNxtHdr.into(),
                     nh_offset as u32,
@@ -1979,15 +1983,9 @@ impl<'d> Stack<'d> {
             // NDISC is only processed if the packet arrived with the un-decremented
             // hop limit, and only on mediums with link-layer addresses.
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            Icmpv6Message::NeighborSolicit if hop_limit == 0xff && ll_src.is_some() => {
-                self.inner.process_ndisc_solicit(
-                    self.ifaces.get_mut(iface.index()),
-                    src_addr,
-                    dst_addr,
-                    &mut icmp_packet,
-                    now,
-                )
-            }
+            Icmpv6Message::NeighborSolicit if hop_limit == 0xff && ll_src.is_some() => self
+                .inner
+                .process_ndisc_solicit(self.ifaces.get_mut(iface.index()), src_addr, dst_addr, buf, now),
 
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             Icmpv6Message::NeighborAdvert if hop_limit == 0xff && ll_src.is_some() => {
@@ -2050,8 +2048,10 @@ impl<'d> Stack<'d> {
         }
     }
 
-    /// Build an ICMP destination unreachable error for a packet whose neighbor
-    /// resolution failed, and deliver it back through local ingress processing.
+    /// Turn a packet whose neighbor resolution failed into the ICMP destination
+    /// unreachable error about it, and deliver that back through local ingress
+    /// processing. The error is built in the packet's own buffer, so this needs
+    /// no other.
     ///
     /// Queued packets are locally generated (nothing is forwarded), so the sender
     /// the error must reach is a local socket. The error is fed into ingress,
@@ -2090,18 +2090,17 @@ impl<'d> Stack<'d> {
                 // than transmitted, so no device is going to fill its checksums in.
                 // No link layer either, so no headroom beyond the IP header.
                 let checksum_caps = ChecksumCapabilities::default();
-                let Some(mut reply) = build_icmpv4_error(
-                    self.inner.pool,
+                if !make_icmpv4_error(
+                    &mut orig,
                     0,
-                    &orig,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::HostUnreachable.into(),
                     &checksum_caps,
-                ) else {
+                ) {
                     return;
-                };
-                push_ipv4_header(&mut reply, reply_src, src_addr, IpProtocol::Icmp, 64, &checksum_caps);
-                self.process_ipv4(iface, None, reply, now);
+                }
+                push_ipv4_header(&mut orig, reply_src, src_addr, IpProtocol::Icmp, 64, &checksum_caps);
+                self.process_ipv4(iface, None, orig, now);
             }
             #[cfg(feature = "ipv6")]
             Ok(IpVersion::V6) => {
@@ -2124,28 +2123,28 @@ impl<'d> Stack<'d> {
                 // The error is fed back through local ingress processing rather
                 // than transmitted, so no device is going to fill its checksums in.
                 // No link layer either, so no headroom beyond the IP header.
-                let Some(mut reply) = build_icmpv6_error(
-                    self.inner.pool,
+                if !make_icmpv6_error(
+                    &mut orig,
                     0,
-                    &orig,
                     &reply_src,
                     &src_addr,
                     Icmpv6Message::DstUnreachable,
                     Icmpv6DstUnreachable::AddrUnreachable.into(),
                     0,
                     &ChecksumCapabilities::default(),
-                ) else {
+                ) {
                     return;
-                };
-                push_ipv6_header(&mut reply, reply_src, src_addr, IpProtocol::Icmpv6, 64);
-                self.process_ipv6(iface, None, reply, now);
+                }
+                push_ipv6_header(&mut orig, reply_src, src_addr, IpProtocol::Icmpv6, 64);
+                self.process_ipv6(iface, None, orig, now);
             }
             Err(_) => {}
         }
     }
 
     /// Transmit an ICMPv4 error message in reply to the ingress packet in `orig`
-    /// (a whole IP packet, starting at the IP header, quoted in the error).
+    /// (a whole IP packet, starting at the IP header, quoted in the error). The
+    /// error is built in `orig` itself.
     ///
     /// Errors are only sent when both the source and the destination of the
     /// offending packet are unicast (RFC 1122 §3.2.2): none about broadcast or
@@ -2154,12 +2153,12 @@ impl<'d> Stack<'d> {
     pub(crate) fn transmit_icmpv4_error(
         &mut self,
         iface: IfaceHandle,
-        orig: &mut PacketBuf,
+        mut orig: PacketBuf,
         msg_type: Icmpv4Message,
         msg_code: u8,
     ) {
         let (src_addr, dst_addr) = {
-            let packet = Ipv4Packet::new_unchecked(orig);
+            let packet = Ipv4Packet::new_unchecked(&mut orig);
             (packet.src_addr(), packet.dst_addr())
         };
         {
@@ -2171,19 +2170,12 @@ impl<'d> Stack<'d> {
         let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddr::V4(src_addr)) else {
             return;
         };
-        let Some(reply) = build_icmpv4_error(
-            self.inner.pool,
-            route.ip_headroom,
-            orig,
-            msg_type,
-            msg_code,
-            &checksum_caps,
-        ) else {
+        if !make_icmpv4_error(&mut orig, route.ip_headroom, msg_type, msg_code, &checksum_caps) {
             return;
-        };
+        }
         self.transmit_reply(
             &route,
-            reply,
+            orig,
             IpAddr::V4(dst_addr),
             IpAddr::V4(src_addr),
             IpProtocol::Icmp,
@@ -2192,7 +2184,8 @@ impl<'d> Stack<'d> {
     }
 
     /// Transmit an ICMPv6 error message in reply to the ingress packet in `orig`
-    /// (a whole IP packet, starting at the IP header, quoted in the error).
+    /// (a whole IP packet, starting at the IP header, quoted in the error). The
+    /// error is built in `orig` itself.
     ///
     /// Errors are never sent to non-unicast sources, nor about multicast-destined
     /// packets (RFC 4443 §2.4). The exception is an unrecognized hop-by-hop option
@@ -2201,14 +2194,14 @@ impl<'d> Stack<'d> {
     pub(crate) fn transmit_icmpv6_error(
         &mut self,
         iface: IfaceHandle,
-        orig: &mut PacketBuf,
+        mut orig: PacketBuf,
         msg_type: Icmpv6Message,
         msg_code: u8,
         pointer: u32,
         allow_multicast_dst: bool,
     ) {
         let (src_addr, dst_addr) = {
-            let packet = Ipv6Packet::new_unchecked(orig);
+            let packet = Ipv6Packet::new_unchecked(&mut orig);
             (packet.src_addr(), packet.dst_addr())
         };
         if !src_addr.x_is_unicast() {
@@ -2225,22 +2218,21 @@ impl<'d> Stack<'d> {
         let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddr::V6(src_addr)) else {
             return;
         };
-        let Some(reply) = build_icmpv6_error(
-            self.inner.pool,
+        if !make_icmpv6_error(
+            &mut orig,
             route.ip_headroom,
-            orig,
             &reply_src,
             &src_addr,
             msg_type,
             msg_code,
             pointer,
             &checksum_caps,
-        ) else {
+        ) {
             return;
-        };
+        }
         self.transmit_reply(
             &route,
-            reply,
+            orig,
             IpAddr::V6(reply_src),
             IpAddr::V6(src_addr),
             IpProtocol::Icmpv6,
@@ -2343,12 +2335,18 @@ impl StackInner {
         );
 
         if for_us && operation == ArpOperation::Request {
-            let Some(mut reply) = self.pool.alloc() else {
-                trace!("arp: no packet buffer for reply");
+            // The reply is built in the request's own buffer, so it needs no
+            // other. Nothing of the request is kept: the buffer is laid out
+            // anew, with no copy, and every byte of the reply is written below.
+            let mut reply = buf;
+            let headroom = iface.caps.tx_headroom + ETHERNET_HEADER_LEN;
+            if headroom + ARP_BUFFER_LEN > reply.capacity() {
+                trace!("arp: no room for reply");
                 return;
-            };
-            reply.reserve(iface.caps.tx_headroom + ETHERNET_HEADER_LEN);
+            }
+            reply.reserve(headroom);
             reply.set_len(ARP_BUFFER_LEN);
+            reply.set_meta(crate::driver::PacketMeta::default());
             {
                 let mut arp_reply = ArpPacket::new_unchecked(&mut reply);
                 arp_reply.set_hardware_type(ArpHardware::Ethernet);
@@ -2365,15 +2363,19 @@ impl StackInner {
         }
     }
 
+    ///
+    /// `buf` is the solicitation, from its ICMPv6 header on. The advertisement
+    /// that answers it is built in that same buffer, so it needs no other.
     #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
     fn process_ndisc_solicit(
         &mut self,
         iface: &mut IfaceState<'_>,
         src_addr: Ipv6Addr,
         dst_addr: Ipv6Addr,
-        icmp_packet: &mut Icmpv6Packet<'_>,
+        mut buf: PacketBuf,
         now: Instant,
     ) {
+        let icmp_packet = &mut Icmpv6Packet::new_unchecked(&mut buf);
         if icmp_packet.msg_code() != 0 {
             return;
         }
@@ -2396,14 +2398,19 @@ impl StackInner {
             && iface.has_ip_addr(target_addr.into())
         {
             // Neighbor advert: NA header (24 bytes) plus the target link-layer
-            // address option.
-            let Some(mut reply) = self.pool.alloc() else {
-                trace!("ndisc: no packet buffer for neighbor advert");
-                return;
-            };
+            // address option. Nothing of the solicitation is kept: the buffer is
+            // laid out anew, with no copy, and every byte of the advert is
+            // written below.
+            let mut reply = buf;
             let opt_len = lladdr_option_len(iface.hardware_addr);
-            reply.reserve(iface.ip_headroom + IPV6_HEADER_LEN);
+            let headroom = iface.ip_headroom + IPV6_HEADER_LEN;
+            if headroom + 24 + opt_len > reply.capacity() {
+                trace!("ndisc: no room for neighbor advert");
+                return;
+            }
+            reply.reserve(headroom);
             reply.set_len(24 + opt_len);
+            reply.set_meta(crate::driver::PacketMeta::default());
             {
                 let mut na = Icmpv6Packet::new_unchecked(&mut reply);
                 na.set_msg_type(Icmpv6Message::NeighborAdvert);
@@ -2978,84 +2985,107 @@ pub(crate) fn push_ipv6_header(
 /// 4-byte type-specific field), followed by the quoted packet.
 const ICMP_ERROR_HEADER_LEN: usize = 8;
 
-/// Build an ICMPv4 error message, quoting as much of `orig` (a whole IP packet)
-/// as fits within the minimum MTU (RFC 1812 §4.3.2.3). `ip_headroom` is what the
-/// IP packet needs in front of it, as in [`EgressRoute::ip_headroom`].
+/// Turn `packet`, a whole IP packet, into the body of an ICMP error message about
+/// it, in its own buffer: the packet becomes the quote, cut to `max_quote` bytes
+/// or to what the buffer holds, with room for the ICMP error header in front of
+/// it. `headroom` is what the ICMP message needs in front of it.
+///
+/// The quote is moved back if the packet has less room in front than that.
+/// Returns `false`, with the packet left as it was, if the buffer can't hold
+/// the headers at all.
+fn quote_in_place(packet: &mut PacketBuf, headroom: usize, max_quote: usize) -> bool {
+    let headroom = headroom + ICMP_ERROR_HEADER_LEN;
+    if headroom > packet.capacity() {
+        return false;
+    }
+    // A buffer smaller than the minimum MTU quotes less.
+    let quote_len = packet.len().min(max_quote).min(packet.capacity() - headroom);
+    packet.set_len(quote_len);
+    if !packet.ensure_headroom(headroom) {
+        return false;
+    }
+    packet.push_front(ICMP_ERROR_HEADER_LEN);
+    // The error is a new packet, not the one it quotes.
+    packet.set_meta(crate::driver::PacketMeta::default());
+    true
+}
+
+/// Turn `packet`, a whole IPv4 packet, into an ICMPv4 error message about it,
+/// quoting as much of it as fits within the minimum MTU (RFC 1812 §4.3.2.3).
+/// The message is built in the packet's own buffer, so an error needs no
+/// buffer of its own. `ip_headroom` is what the IP packet needs in front of
+/// it, as in [`EgressRoute::ip_headroom`].
+///
+/// Returns `false` if the buffer can't hold it.
 #[cfg(feature = "ipv4")]
-fn build_icmpv4_error(
-    pool: PoolRef,
+fn make_icmpv4_error(
+    packet: &mut PacketBuf,
     ip_headroom: usize,
-    orig: &[u8],
     msg_type: Icmpv4Message,
     msg_code: u8,
     checksum_caps: &ChecksumCapabilities,
-) -> Option<PacketBuf> {
-    let mut reply = pool.alloc()?;
-    reply.reserve(ip_headroom + IPV4_HEADER_LEN);
-    // A buffer smaller than the minimum MTU quotes less.
-    let quote_len = orig
-        .len()
-        .min(IPV4_MIN_MTU - IPV4_HEADER_LEN - ICMP_ERROR_HEADER_LEN)
-        .min(reply.tailroom() - ICMP_ERROR_HEADER_LEN);
-    reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
-    {
-        let mut icmp = Icmpv4Packet::new_unchecked(&mut reply);
-        icmp.set_msg_type(msg_type);
-        icmp.set_msg_code(msg_code);
-        icmp.clear_unused();
-        icmp.data_mut().copy_from_slice(&orig[..quote_len]);
-        if !checksum_caps.icmpv4.tx {
-            icmp.fill_checksum();
-        } else {
-            icmp.set_checksum(0);
-        }
+) -> bool {
+    if !quote_in_place(
+        packet,
+        ip_headroom + IPV4_HEADER_LEN,
+        IPV4_MIN_MTU - IPV4_HEADER_LEN - ICMP_ERROR_HEADER_LEN,
+    ) {
+        return false;
     }
-    Some(reply)
+    let mut icmp = Icmpv4Packet::new_unchecked(packet);
+    icmp.set_msg_type(msg_type);
+    icmp.set_msg_code(msg_code);
+    icmp.clear_unused();
+    if !checksum_caps.icmpv4.tx {
+        icmp.fill_checksum();
+    } else {
+        icmp.set_checksum(0);
+    }
+    true
 }
 
-/// Build an ICMPv6 error message, quoting as much of `orig` (a whole IP packet)
-/// as fits within the minimum MTU (RFC 4443 §2.4). `src_addr` and `dst_addr` are
-/// the addresses the error will be sent between, for the checksum. `pointer` is
-/// written for parameter problem messages. `ip_headroom` is what the IP packet
-/// needs in front of it, as in [`EgressRoute::ip_headroom`].
+/// Turn `packet`, a whole IPv6 packet, into an ICMPv6 error message about it,
+/// quoting as much of it as fits within the minimum MTU (RFC 4443 §2.4). The
+/// message is built in the packet's own buffer, so an error needs no buffer of
+/// its own. `src_addr` and `dst_addr` are the addresses the error will be sent
+/// between, for the checksum. `pointer` is written for parameter problem
+/// messages. `ip_headroom` is what the IP packet needs in front of it, as in
+/// [`EgressRoute::ip_headroom`].
+///
+/// Returns `false` if the buffer can't hold it.
 #[cfg(feature = "ipv6")]
 #[allow(clippy::too_many_arguments)]
-fn build_icmpv6_error(
-    pool: PoolRef,
+fn make_icmpv6_error(
+    packet: &mut PacketBuf,
     ip_headroom: usize,
-    orig: &[u8],
     src_addr: &Ipv6Addr,
     dst_addr: &Ipv6Addr,
     msg_type: Icmpv6Message,
     msg_code: u8,
     pointer: u32,
     checksum_caps: &ChecksumCapabilities,
-) -> Option<PacketBuf> {
-    let mut reply = pool.alloc()?;
-    reply.reserve(ip_headroom + IPV6_HEADER_LEN);
-    // A buffer smaller than the minimum MTU quotes less.
-    let quote_len = orig
-        .len()
-        .min(IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMP_ERROR_HEADER_LEN)
-        .min(reply.tailroom() - ICMP_ERROR_HEADER_LEN);
-    reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
-    {
-        let mut icmp = Icmpv6Packet::new_unchecked(&mut reply);
-        icmp.set_msg_type(msg_type);
-        icmp.set_msg_code(msg_code);
-        if msg_type == Icmpv6Message::ParamProblem {
-            icmp.set_param_problem_ptr(pointer);
-        } else {
-            icmp.clear_reserved();
-        }
-        icmp.payload_mut().copy_from_slice(&orig[..quote_len]);
-        if !checksum_caps.icmpv6.tx {
-            icmp.fill_checksum(src_addr, dst_addr);
-        } else {
-            icmp.set_checksum(0);
-        }
+) -> bool {
+    if !quote_in_place(
+        packet,
+        ip_headroom + IPV6_HEADER_LEN,
+        IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMP_ERROR_HEADER_LEN,
+    ) {
+        return false;
     }
-    Some(reply)
+    let mut icmp = Icmpv6Packet::new_unchecked(packet);
+    icmp.set_msg_type(msg_type);
+    icmp.set_msg_code(msg_code);
+    if msg_type == Icmpv6Message::ParamProblem {
+        icmp.set_param_problem_ptr(pointer);
+    } else {
+        icmp.clear_reserved();
+    }
+    if !checksum_caps.icmpv6.tx {
+        icmp.fill_checksum(src_addr, dst_addr);
+    } else {
+        icmp.set_checksum(0);
+    }
+    true
 }
 
 /// The outcome of processing a hop-by-hop options header.
@@ -8215,5 +8245,130 @@ pub(crate) mod test {
             eth_frame_from(OTHER_HW, OUR_HW, EthernetProtocol::Ipv6, &packet[..packet.len() - 1]),
         );
         assert!(!stack.raw_socket(raw).can_recv());
+    }
+
+    // ===== Pool exhaustion =====
+    //
+    // Each test has a small pool of its own, so it can take every buffer.
+
+    type SmallPool<const N: usize> = crate::StaticPool<{ crate::pool::TEST_POOL_SIZE }, N>;
+
+    /// A stack on a pool of its own, with one interface that owns [`OUR_V4`]/24.
+    fn small_pool_stack(
+        pool: &'static impl crate::pool::Pool,
+        medium: Medium,
+        mtu: usize,
+    ) -> (Stack<'static>, Queue, Sent, Room) {
+        let driver = TestDevice::new(medium).with_mtu(mtu);
+        let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
+        let mut stack = Stack::new(pool, 0x1234_5678_dead_beef);
+        let handle = driver.install(
+            &mut stack,
+            match medium {
+                Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
+                _ => HardwareAddress::Ip,
+            },
+        );
+        stack
+            .iface(handle)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)])
+            .unwrap();
+        stack.poll(Instant::ZERO);
+        tx.borrow_mut().clear();
+        (stack, rx, tx, room)
+    }
+
+    /// Take every buffer of `pool` but `free` of them.
+    fn hold_all_but(pool: &'static impl crate::pool::Pool, free: usize) -> Vec<PacketBuf> {
+        let mut held: Vec<PacketBuf> = core::iter::from_fn(|| pool.alloc()).collect();
+        for _ in 0..free {
+            drop(held.pop());
+        }
+        held
+    }
+
+    /// The error for a failed resolution is built in the parked packet's own
+    /// buffer, so it reaches the socket with no buffer free at all.
+    #[test]
+    #[cfg(feature = "icmp-errors")]
+    fn test_resolution_failure_needs_no_buffer() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, _tx, room) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+
+        // The solicitations go out, and nobody answers.
+        let mut t = Instant::ZERO;
+        for _ in 0..MAX_MULTICAST_SOLICIT {
+            t = stack.poll(t);
+        }
+        let _held = hold_all_but(&POOL, 0);
+        room.set(Some(0));
+        stack.poll(t);
+        let (error, _) = stack.udp_socket(udp).take_icmp_error().unwrap();
+        assert_eq!(error, IcmpError::HostUnreachable);
+    }
+
+    /// The replies to received packets are built in the buffer the packet came
+    /// in, so one free buffer is enough to receive a packet and answer it.
+    #[test]
+    fn test_replies_need_no_other_buffer() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        let _held = hold_all_but(&POOL, 1);
+
+        // An ARP request, and its reply.
+        inject(&mut stack, &rx, arp_request_from(OTHER_HW, REMOTE_V4));
+        assert_eq!(tx.borrow().len(), 1);
+        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
+
+        // An echo request, and its reply.
+        let echo = icmpv4_echo(Icmpv4Message::EchoRequest, 1, 1, b"ping");
+        let frame = |packet: &[u8]| eth_frame_from(OTHER_HW, OUR_HW, EthernetProtocol::Ipv4, packet);
+        inject(
+            &mut stack,
+            &rx,
+            frame(&ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &echo)),
+        );
+        assert_eq!(tx.borrow().len(), 2);
+        let (msg_type, _, _) = parse_icmpv4_reply(&tx.borrow()[1][ETHERNET_HEADER_LEN..], OUR_V4, REMOTE_V4);
+        assert_eq!(msg_type, Icmpv4Message::EchoReply);
+
+        // A datagram for a port nobody is bound to, and the error about it, which
+        // quotes it.
+        let datagram = ipv4_packet(
+            REMOTE_V4,
+            OUR_V4,
+            IpProtocol::Udp,
+            &udp_datagram(REMOTE_V4.into(), 4000, OUR_V4.into(), 9999, b"anyone?"),
+        );
+        inject(&mut stack, &rx, frame(&datagram));
+        assert_eq!(tx.borrow().len(), 3);
+        let (msg_type, msg_code, quoted) =
+            parse_icmpv4_reply(&tx.borrow()[2][ETHERNET_HEADER_LEN..], OUR_V4, REMOTE_V4);
+        assert_eq!(msg_type, Icmpv4Message::DstUnreachable);
+        assert_eq!(msg_code, u8::from(Icmpv4DstUnreachable::PortUnreachable));
+        assert_eq!(quoted, datagram);
+
+        // A SYN for a port nobody listens on, and the RST that answers it.
+        #[cfg(feature = "tcp-listener")]
+        {
+            let syn = tcp_segment(REMOTE_V4.into(), 4000, OUR_V4.into(), 9999, true);
+            inject(
+                &mut stack,
+                &rx,
+                frame(&ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Tcp, &syn)),
+            );
+            assert_eq!(tx.borrow().len(), 4);
+            let mut reply = tx.borrow()[3][ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..].to_vec();
+            let rst = TcpPacket::new_checked(&mut reply[..]).unwrap();
+            assert!(rst.rst());
+            assert!(rst.verify_checksum(&OUR_V4.into(), &REMOTE_V4.into()));
+        }
+
+        // The one buffer is free again.
+        let free: Vec<PacketBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
+        assert_eq!(free.len(), 1);
     }
 }

@@ -2330,6 +2330,41 @@ pub(crate) fn build_tcp_packet(
     Some(buf)
 }
 
+/// Write a TCP segment with no payload into `buf`, in place of what it holds,
+/// with the same headroom in front as [`build_tcp_packet`] reserves. This is how
+/// an RST is built in the buffer of the segment it answers.
+///
+/// Returns `false` if the buffer can't hold it.
+pub(crate) fn build_tcp_packet_in(
+    buf: &mut PacketBuf,
+    ip_headroom: usize,
+    repr: &TcpRepr<'static>,
+    src_addr: &IpAddr,
+    dst_addr: &IpAddr,
+    checksum_caps: &ChecksumCapabilities,
+) -> bool {
+    let ip_header_len = match dst_addr {
+        #[cfg(feature = "ipv4")]
+        IpAddr::V4(_) => IPV4_HEADER_LEN,
+        #[cfg(feature = "ipv6")]
+        IpAddr::V6(_) => IPV6_HEADER_LEN,
+    };
+    let headroom = ip_headroom + ip_header_len;
+    let len = repr.buffer_len();
+    if headroom + len > buf.capacity() {
+        return false;
+    }
+    // Nothing of what the buffer holds is kept, so it is laid out anew rather
+    // than moved to make room: every byte of the segment is written below.
+    buf.reserve(headroom);
+    buf.set_len(len);
+    // The reply is a new packet, not the one it answers.
+    buf.set_meta(crate::driver::PacketMeta::default());
+    let mut packet = TcpPacket::new_unchecked(buf);
+    repr.emit(&mut packet, src_addr, dst_addr, checksum_caps);
+    true
+}
+
 /// Deliver an ICMP error to the TCP connection whose segment provoked it: exact
 /// 4-tuple match against the flow quoted in the error. `local`/`remote` are the
 /// quoted packet's source and destination, since the quote is a segment this

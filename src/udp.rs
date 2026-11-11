@@ -1097,14 +1097,14 @@ impl Stack<'_> {
                 #[cfg(feature = "ipv4")]
                 IpAddr::V4(_) => self.transmit_icmpv4_error(
                     iface,
-                    &mut buf,
+                    buf,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::PortUnreachable.into(),
                 ),
                 #[cfg(feature = "ipv6")]
                 IpAddr::V6(_) => self.transmit_icmpv6_error(
                     iface,
-                    &mut buf,
+                    buf,
                     Icmpv6Message::DstUnreachable,
                     Icmpv6DstUnreachable::PortUnreachable.into(),
                     0,

@@ -8,8 +8,7 @@ use crate::storage::Vec;
 
 use crate::driver::PacketBuf;
 use crate::iface::{Iface, IfaceState};
-use crate::pool::PoolRef;
-use crate::stack::StackInner;
+use crate::stack::{Blocked, StackInner};
 use crate::time::{Clock, Duration, Instant};
 use crate::wire::*;
 
@@ -264,7 +263,18 @@ impl IfaceState<'_> {
     /// - Depending on `igmp_report_state` and the therein contained
     ///   timeouts, send IGMP membership reports.
     pub(crate) fn multicast_egress(&mut self, inner: &mut StackInner, clock: &mut Clock) {
-        let pool = inner.pool;
+        // A report that finds no room in the device or no packet buffer is not
+        // sent, and nothing sends it again later. So it stays due: the group
+        // keeps its state, and so does the answer to a query. A full device
+        // wakes the poll task once it has room. Nothing signals a freed buffer,
+        // so poll again soon for that.
+        if let Err(blocked) = self.multicast_send_due(inner, clock) {
+            blocked.schedule_retry(clock);
+        }
+    }
+
+    /// Send the reports that are due, up to the first that can't go out.
+    fn multicast_send_due(&mut self, inner: &mut StackInner, clock: &mut Clock) -> Result<(), Blocked> {
         // Send the pending joins and leaves, in one pass over the groups. IPv4
         // reports need an address. Keep joins pending across DHCP restart.
         #[cfg(feature = "ipv4")]
@@ -280,13 +290,14 @@ impl IfaceState<'_> {
                         IpAddr::V6(_) => true,
                     } =>
                 {
+                    let pkt = inner.alloc_obligation(&mut *self.driver)?;
                     let pkt = match addr {
                         #[cfg(feature = "ipv4")]
-                        IpAddr::V4(addr) => self.igmp_report_packet(pool, IgmpVersion::Version2, addr),
+                        IpAddr::V4(addr) => self.igmp_report_packet(pkt, IgmpVersion::Version2, addr),
                         // An empty EXCLUDE list accepts every source.
                         #[cfg(feature = "ipv6")]
                         IpAddr::V6(addr) => {
-                            self.mldv2_report_packet(pool, core::iter::once((MldRecordType::ChangeToExclude, addr)))
+                            self.mldv2_report_packet(pkt, core::iter::once((MldRecordType::ChangeToExclude, addr)))
                         }
                     };
                     if let Some(pkt) = pkt {
@@ -296,13 +307,14 @@ impl IfaceState<'_> {
                     i += 1;
                 }
                 GroupState::Leaving => {
+                    let pkt = inner.alloc_obligation(&mut *self.driver)?;
                     let pkt = match addr {
                         #[cfg(feature = "ipv4")]
-                        IpAddr::V4(addr) => self.igmp_leave_packet(pool, addr),
+                        IpAddr::V4(addr) => self.igmp_leave_packet(pkt, addr),
                         // An empty INCLUDE list leaves.
                         #[cfg(feature = "ipv6")]
                         IpAddr::V6(addr) => {
-                            self.mldv2_report_packet(pool, core::iter::once((MldRecordType::ChangeToInclude, addr)))
+                            self.mldv2_report_packet(pkt, core::iter::once((MldRecordType::ChangeToInclude, addr)))
                         }
                     };
                     if let Some(pkt) = pkt {
@@ -325,7 +337,8 @@ impl IfaceState<'_> {
                     timeout,
                     group,
                 } if clock.expired(timeout) => {
-                    if let Some(pkt) = self.igmp_report_packet(pool, version, group) {
+                    let pkt = inner.alloc_obligation(&mut *self.driver)?;
+                    if let Some(pkt) = self.igmp_report_packet(pkt, version, group) {
                         // Send initial membership report
                         self.dispatch_ip(inner, pkt);
                     }
@@ -349,7 +362,8 @@ impl IfaceState<'_> {
 
                     match addr {
                         Some(addr) => {
-                            if let Some(pkt) = self.igmp_report_packet(pool, version, addr) {
+                            let pkt = inner.alloc_obligation(&mut *self.driver)?;
+                            if let Some(pkt) = self.igmp_report_packet(pkt, version, addr) {
                                 // Send initial membership report
                                 self.dispatch_ip(inner, pkt);
 
@@ -381,20 +395,23 @@ impl IfaceState<'_> {
                     #[allow(unreachable_patterns)]
                     _ => None,
                 });
-                if let Some(pkt) = self.mldv2_report_packet(pool, records) {
+                let pkt = inner.alloc_obligation(&mut *self.driver)?;
+                if let Some(pkt) = self.mldv2_report_packet(pkt, records) {
                     self.dispatch_ip(inner, pkt);
                 }
                 self.multicast.mld_report_state = MldReportState::Inactive;
             }
             MldReportState::ToSpecificQuery { group, timeout } if clock.expired(timeout) => {
                 let record = (MldRecordType::ModeIsExclude, group);
-                if let Some(pkt) = self.mldv2_report_packet(pool, core::iter::once(record)) {
+                let pkt = inner.alloc_obligation(&mut *self.driver)?;
+                if let Some(pkt) = self.mldv2_report_packet(pkt, core::iter::once(record)) {
                     self.dispatch_ip(inner, pkt);
                 }
                 self.multicast.mld_report_state = MldReportState::Inactive;
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Transmit a fully-built IP packet (IP header included) on this interface.
@@ -497,9 +514,8 @@ impl IfaceState<'_> {
     }
 
     #[cfg(feature = "ipv4")]
-    fn igmp_report_packet(&self, pool: PoolRef, version: IgmpVersion, group_addr: Ipv4Addr) -> Option<PacketBuf> {
+    fn igmp_report_packet(&self, mut pkt: PacketBuf, version: IgmpVersion, group_addr: Ipv4Addr) -> Option<PacketBuf> {
         let iface_addr = self.ipv4_addr()?;
-        let mut pkt = pool.alloc()?;
         pkt.reserve(self.ip_headroom + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
@@ -526,9 +542,8 @@ impl IfaceState<'_> {
     }
 
     #[cfg(feature = "ipv4")]
-    fn igmp_leave_packet(&self, pool: PoolRef, group_addr: Ipv4Addr) -> Option<PacketBuf> {
+    fn igmp_leave_packet(&self, mut pkt: PacketBuf, group_addr: Ipv4Addr) -> Option<PacketBuf> {
         let iface_addr = self.ipv4_addr()?;
-        let mut pkt = pool.alloc()?;
         pkt.reserve(self.ip_headroom + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
@@ -601,10 +616,10 @@ impl IfaceState<'_> {
     /// Records past what fits in one packet are left out.
     fn mldv2_report_packet(
         &self,
-        pool: PoolRef,
+        pkt: PacketBuf,
         records: impl Iterator<Item = (MldRecordType, Ipv6Addr)> + Clone,
     ) -> Option<PacketBuf> {
-        let (mut pkt, record_count) = self.mldv2_report_start(pool, records.clone().count())?;
+        let (mut pkt, record_count) = self.mldv2_report_start(pkt, records.clone().count())?;
         let mut mld = Icmpv6Packet::new_unchecked(&mut pkt);
         let mut payload = mld.payload_mut();
         for (record_type, mcast_addr) in records.take(record_count) {
@@ -619,12 +634,11 @@ impl IfaceState<'_> {
         Some(pkt)
     }
 
-    /// Allocate an MLDv2 report for `record_count` address records, and write its
+    /// Start an MLDv2 report for `record_count` address records in `pkt`: write its
     /// header. Returns the report and how many records fit in it.
     #[cfg(feature = "ipv6")]
-    fn mldv2_report_start(&self, pool: PoolRef, record_count: usize) -> Option<(PacketBuf, usize)> {
+    fn mldv2_report_start(&self, mut pkt: PacketBuf, record_count: usize) -> Option<(PacketBuf, usize)> {
         // MLD report: the report header (8 bytes) plus one record per group.
-        let mut pkt = pool.alloc()?;
         pkt.reserve(self.ip_headroom + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
         let max_records = (pkt.tailroom() - 8) / MLD_ADDRESS_RECORD_LEN;
         if record_count > max_records {

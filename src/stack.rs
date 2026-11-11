@@ -158,26 +158,27 @@ impl StackInner {
 
 /// Why a packet could not go out right now. The packet is held back, not dropped,
 /// and retried later.
-#[cfg(any(
-    feature = "udp",
-    feature = "tcp",
-    feature = "_raw",
-    feature = "medium-ethernet",
-    feature = "medium-ieee802154",
-    feature = "ipv4-fragmentation",
-    feature = "sixlowpan-fragmentation"
-))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // which variants are made depends on the features
 pub(crate) enum Blocked {
     /// The egress device has no room. The driver wakes the poll task when it has.
     DeviceBusy,
     /// No packet buffer is free. Nothing signals when one is, so [`Stack::poll`]
     /// asks to be polled again after [`POOL_RETRY_DELAY`].
-    #[cfg_attr(
-        not(any(feature = "tcp", feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation")),
-        allow(dead_code)
-    )]
     NoBuffer,
+}
+
+impl Blocked {
+    /// Have the stack polled again soon for a packet held back for this reason,
+    /// if nothing else brings a poll. Nothing signals a freed buffer. A full
+    /// device wakes the poll task once it has room, and a resolution ends with
+    /// a received frame or at a deadline.
+    #[allow(dead_code)] // which builds use it depends on the features
+    pub(crate) fn schedule_retry(self, clock: &mut Clock) {
+        if self == Blocked::NoBuffer {
+            clock.after(POOL_RETRY_DELAY);
+        }
+    }
 }
 
 /// How soon [`Stack::poll`] asks to be polled again while it holds a packet back,
@@ -1148,7 +1149,7 @@ impl<'d> Stack<'d> {
             let handle = IfaceHandle::new(index);
 
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            self.poll_neighbor_timers(handle, now);
+            self.poll_neighbor_timers(handle, &mut clock);
 
             // Give the driver the buffers it wants before each frame, so that it never
             // runs short while frames are coming in. Nothing signals a freed buffer,
@@ -2025,13 +2026,20 @@ impl<'d> Stack<'d> {
     /// on this interface, retransmitting solicitations and failing resolutions that
     /// exhausted their probes.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn poll_neighbor_timers(&mut self, iface: IfaceHandle, now: Instant) {
+    fn poll_neighbor_timers(&mut self, iface: IfaceHandle, clock: &mut Clock) {
+        let now = clock.now();
         let mut cursor = 0;
         while let Some(event) = self.inner.neighbor_cache.poll_retransmit(iface, now, &mut cursor) {
             match event {
                 ProbeEvent::Retransmit(addr) => {
                     debug!("neighbor {} still unresolved, retransmitting solicitation", addr);
-                    self.inner.solicit_neighbor(self.ifaces.get_mut(iface.index()), addr);
+                    // Only a solicitation that went out counts toward giving up.
+                    // One that didn't stays due. A full device wakes the poll task
+                    // once it has room, and nothing signals a freed buffer.
+                    match self.inner.solicit_neighbor(self.ifaces.get_mut(iface.index()), addr) {
+                        Ok(()) => self.inner.neighbor_cache.probe_sent(&(iface, addr), now),
+                        Err(blocked) => blocked.schedule_retry(clock),
+                    }
                 }
                 ProbeEvent::Failed(addr) => {
                     debug!("neighbor {} resolution failed, dropping queued packets", addr);
@@ -2504,8 +2512,11 @@ impl StackInner {
     }
 
     /// Send a solicitation (ARP request / NDISC neighbor solicit) for the given address.
+    ///
+    /// The error says why it didn't go out: no room in the device, or no packet
+    /// buffer. Nothing was sent then, and the caller tries again.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn solicit_neighbor(&mut self, iface: &mut IfaceState<'_>, addr: IpAddr) {
+    fn solicit_neighbor(&mut self, iface: &mut IfaceState<'_>, addr: IpAddr) -> Result<(), Blocked> {
         match addr {
             #[cfg(all(feature = "ipv4", feature = "medium-ethernet"))]
             IpAddr::V4(addr) => self.transmit_arp_request(iface, addr),
@@ -2656,26 +2667,25 @@ impl StackInner {
             NeighborAnswer::NotFound => {}
         }
 
-        // Start resolving: create the INCOMPLETE entry and send the first solicitation.
+        // Start resolving: send the first solicitation and create the INCOMPLETE
+        // entry. If the solicitation didn't go out, the next poll sends it.
         debug!("address {} not in neighbor cache, sending solicitation", next_hop);
-        self.neighbor_cache.start_resolution((iface.handle, next_hop));
-        self.solicit_neighbor(iface, next_hop);
+        let sent = self.solicit_neighbor(iface, next_hop).is_ok();
+        self.neighbor_cache.start_resolution((iface.handle, next_hop), sent);
 
         NeighborLookup::Pending { next_hop }
     }
 
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
-    fn transmit_arp_request(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv4Addr) {
+    fn transmit_arp_request(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv4Addr) -> Result<(), Blocked> {
         let Some(source_protocol_addr) = iface.get_source_address_ipv4(&target_addr) else {
+            // Nothing to wait for: it counts as sent, so the resolution fails
+            // in the end.
             debug!("arp: no source address for request");
-            return;
+            return Ok(());
         };
 
-        let Some(mut buf) = self.pool.alloc() else {
-            // The retransmission timer sends the next one.
-            trace!("arp: no packet buffer for request");
-            return;
-        };
+        let mut buf = self.alloc_obligation(&mut *iface.driver)?;
         buf.reserve(iface.caps.tx_headroom + ETHERNET_HEADER_LEN);
         buf.set_len(ARP_BUFFER_LEN);
         {
@@ -2691,20 +2701,17 @@ impl StackInner {
             arp_packet.set_target_protocol_addr(&target_addr.octets());
         }
         self.transmit_ethernet(iface, EthernetAddress::BROADCAST, buf, EthernetProtocol::Arp);
+        Ok(())
     }
 
     #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
-    fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv6Addr) {
+    fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv6Addr) -> Result<(), Blocked> {
         let src_addr = iface.get_source_address_ipv6(&target_addr);
         let dst_addr = target_addr.solicited_node();
 
         // Neighbor solicit: NS header (24 bytes) plus the source link-layer
         // address option.
-        let Some(mut buf) = self.pool.alloc() else {
-            // The retransmission timer sends the next one.
-            trace!("ndisc: no packet buffer for neighbor solicit");
-            return;
-        };
+        let mut buf = self.alloc_obligation(&mut *iface.driver)?;
         let opt_len = lladdr_option_len(iface.hardware_addr);
         buf.reserve(iface.ip_headroom + IPV6_HEADER_LEN);
         buf.set_len(24 + opt_len);
@@ -2728,6 +2735,7 @@ impl StackInner {
         // The solicited-node destination is multicast, so this never recurses back
         // into neighbor resolution.
         self.transmit_ndisc(iface, buf, src_addr, dst_addr);
+        Ok(())
     }
 
     /// Transmit an NDISC message on the given interface.
@@ -2750,6 +2758,21 @@ impl StackInner {
             buf,
             EthernetProtocol::Ipv6,
         );
+    }
+
+    /// Allocate the buffer for a packet the stack has to send on its own account,
+    /// and that nothing sends again if it is lost: a solicitation, a membership
+    /// report, a DHCP request. It goes straight to the device, so the device is
+    /// asked for room first.
+    ///
+    /// The error says what the packet waits for. The caller leaves its state as
+    /// it was, so the packet stays due.
+    #[allow(dead_code)] // which builds use it depends on the features
+    pub(crate) fn alloc_obligation(&mut self, driver: &mut dyn Driver) -> Result<PacketBuf, Blocked> {
+        if !driver.can_transmit() {
+            return Err(Blocked::DeviceBusy);
+        }
+        self.pool.alloc().ok_or(Blocked::NoBuffer)
     }
 
     /// Transmit a fully-built IP packet, resolving the destination hardware address
@@ -8370,5 +8393,101 @@ pub(crate) mod test {
         // The one buffer is free again.
         let free: Vec<PacketBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
         assert_eq!(free.len(), 1);
+    }
+
+    /// How many of `frames` carry IPv4.
+    #[cfg(feature = "multicast")]
+    fn ipv4_frames(frames: &Sent) -> usize {
+        frames
+            .borrow()
+            .iter()
+            .filter(|frame| ethertype_of(frame) == EthernetProtocol::Ipv4)
+            .count()
+    }
+
+    /// A resolution only gives up after its solicitations went out. The ones no
+    /// packet buffer was there for stay due, and don't count.
+    #[test]
+    #[cfg(feature = "icmp-errors")]
+    fn test_resolution_counts_the_probes_sent() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 1, "the first ARP request");
+        let mut t = stack.poll(Instant::ZERO);
+        assert_eq!(t, Instant::ZERO + crate::neighbor::RETRANS_TIMER);
+
+        // Something else holds the pool until 2.5 s: no retransmission gets a
+        // buffer, and the stack retries each millisecond.
+        let held = hold_all_but(&POOL, 0);
+        let released = Instant::from_millis(2500);
+        while t < released {
+            let next = stack.poll(t);
+            assert_eq!(next, t + POOL_RETRY_DELAY);
+            t = next;
+        }
+        assert_eq!(tx.borrow().len(), 1);
+        drop(held);
+
+        // The second and the third go out a second apart from then on, and the
+        // resolution fails a second after the third.
+        let mut failed_at = None;
+        while t < Instant::from_secs(10) {
+            let now = t;
+            t = stack.poll(now);
+            if let Some((error, _)) = stack.udp_socket(udp).take_icmp_error() {
+                assert_eq!(error, IcmpError::HostUnreachable);
+                failed_at = Some(now);
+                break;
+            }
+        }
+        assert_eq!(tx.borrow().len(), MAX_MULTICAST_SOLICIT as usize);
+        assert_eq!(failed_at, Some(released + crate::neighbor::RETRANS_TIMER * 2));
+    }
+
+    /// A membership report that no packet buffer is there for stays due: the
+    /// group is reported once there is one.
+    #[test]
+    #[cfg(feature = "multicast")]
+    fn test_multicast_join_waits_for_a_buffer() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        let held = hold_all_but(&POOL, 0);
+        stack
+            .iface(IfaceHandle::new(0))
+            .join_multicast_group(Ipv4Addr::new(224, 1, 2, 3))
+            .unwrap();
+        let t = Instant::from_secs(1);
+        assert_eq!(stack.poll(t), t + POOL_RETRY_DELAY);
+        assert_eq!(ipv4_frames(&tx), 0);
+
+        drop(held);
+        let t = t + POOL_RETRY_DELAY;
+        assert_eq!(stack.poll(t), idle_deadline(t));
+        assert_eq!(ipv4_frames(&tx), 1);
+    }
+
+    /// A device with no room is the same: the report stays due, and goes out at
+    /// the poll that follows the device having room.
+    #[test]
+    #[cfg(feature = "multicast")]
+    fn test_multicast_join_waits_for_the_device() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, tx, room) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        room.set(Some(0));
+        stack
+            .iface(IfaceHandle::new(0))
+            .join_multicast_group(Ipv4Addr::new(224, 1, 2, 3))
+            .unwrap();
+        let t = Instant::from_secs(1);
+        // The driver wakes the poll task: no deadline for it.
+        assert_eq!(stack.poll(t), idle_deadline(t));
+        assert_eq!(ipv4_frames(&tx), 0);
+
+        room.set(None);
+        assert_eq!(stack.poll(t), idle_deadline(t));
+        assert_eq!(ipv4_frames(&tx), 1);
     }
 }

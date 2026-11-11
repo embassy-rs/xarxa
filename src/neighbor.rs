@@ -7,6 +7,7 @@ use crate::storage::BoundedVec;
 use crate::driver::PacketBuf;
 use crate::error::NotUnicast;
 use crate::iface::IfaceHandle;
+use crate::stack::POOL_RETRY_DELAY;
 use crate::time::{Clock, Duration, Instant};
 use crate::wire::{HardwareAddress, IpAddr};
 
@@ -30,9 +31,13 @@ pub(crate) const RETRANS_TIMER: Duration = Duration::from_millis(1_000);
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 enum State {
-    /// Address resolution started, and the first solicitation went out, since the
-    /// last poll. The poll sets the retransmission timer.
-    Started,
+    /// Address resolution started since the last poll. The poll sets the
+    /// retransmission timer.
+    Started {
+        /// Whether the first solicitation went out. If not, the poll retries it
+        /// soon.
+        sent: bool,
+    },
     /// Address resolution is in progress: solicitations are being sent, no answer
     /// yet. Egress packets for this neighbor are queued in the [PendingQueue]
     /// meanwhile.
@@ -58,7 +63,7 @@ enum State {
 impl From<State> for NeighborState {
     fn from(state: State) -> Self {
         match state {
-            State::Incomplete { .. } | State::Started => NeighborState::Incomplete,
+            State::Incomplete { .. } | State::Started { .. } => NeighborState::Incomplete,
             State::Reachable {
                 hardware_addr,
                 expires_at,
@@ -175,7 +180,7 @@ impl NeighborCache {
 
         match self.get_state(key) {
             Some(State::Reachable { hardware_addr, .. }) => Answer::Found(hardware_addr),
-            Some(State::Incomplete { .. } | State::Started) => Answer::Pending,
+            Some(State::Incomplete { .. } | State::Started { .. }) => Answer::Pending,
             _ => Answer::NotFound,
         }
     }
@@ -188,13 +193,14 @@ impl NeighborCache {
 
     /// Create an INCOMPLETE entry for a neighbor, starting address resolution.
     ///
-    /// The caller sends the first solicitation itself. The end of the next poll
-    /// (or the current one) sets the retransmission timer, which takes over from
-    /// there (see [NeighborCache::poll_retransmit]).
-    pub(crate) fn start_resolution(&mut self, key: Key) {
+    /// The caller sends the first solicitation itself, and says with `sent`
+    /// whether it went out. The end of the next poll (or the current one) sets
+    /// the retransmission timer, which takes over from there (see
+    /// [NeighborCache::poll_retransmit]).
+    pub(crate) fn start_resolution(&mut self, key: Key, sent: bool) {
         debug_assert!(key.1.is_unicast());
 
-        self.insert_state(key, State::Started);
+        self.insert_state(key, State::Started { sent });
     }
 
     /// Advance the retransmission timers of the neighbors being resolved on `iface`,
@@ -204,10 +210,13 @@ impl NeighborCache {
     /// is returned: each call resumes the scan where the previous one stopped, so
     /// the whole loop is one pass over the cache.
     ///
-    /// An entry with probes left gets its probe counter bumped and its timer
-    /// rearmed, and is returned as [ProbeEvent::Retransmit] so the caller sends
-    /// another solicitation; an entry that exhausted its probes is removed and
-    /// returned as [ProbeEvent::Failed] so the caller drops the packets queued on it.
+    /// An entry with probes left is returned as [ProbeEvent::Retransmit], so the
+    /// caller sends another solicitation. Only [`probe_sent`](Self::probe_sent)
+    /// counts it and rearms the timer, once it went out: a solicitation there
+    /// was no buffer or no room in the device for is not one the neighbor failed
+    /// to answer (RFC 4861 §7.2.2 counts the solicitations sent). An entry that
+    /// exhausted its probes is removed and returned as [ProbeEvent::Failed], so
+    /// the caller drops the packets queued on it.
     pub(crate) fn poll_retransmit(
         &mut self,
         iface: IfaceHandle,
@@ -226,8 +235,6 @@ impl NeighborCache {
                         self.storage.swap_remove(*cursor);
                         return Some(ProbeEvent::Failed(addr));
                     }
-                    *probes_sent += 1;
-                    *retrans_at = timestamp + RETRANS_TIMER;
                     *cursor += 1;
                     return Some(ProbeEvent::Retransmit(addr));
                 }
@@ -235,6 +242,19 @@ impl NeighborCache {
             }
         }
         None
+    }
+
+    /// Count a solicitation that went out for a neighbor being resolved, and time
+    /// the next one.
+    pub(crate) fn probe_sent(&mut self, key: &Key, timestamp: Instant) {
+        if let Some(State::Incomplete {
+            probes_sent,
+            retrans_at,
+        }) = self.get_state_mut(key)
+        {
+            *probes_sent += 1;
+            *retrans_at = timestamp + RETRANS_TIMER;
+        }
     }
 
     /// Make the entries that expired stale, set the retransmission timer of the
@@ -247,13 +267,18 @@ impl NeighborCache {
     pub(crate) fn expire(&mut self, clock: &mut Clock) {
         for (_, state) in self.storage.iter_mut() {
             match *state {
-                State::Started => {
+                State::Started { sent } => {
+                    // A first solicitation that didn't go out is tried again soon.
+                    let delay = if sent { RETRANS_TIMER } else { POOL_RETRY_DELAY };
                     *state = State::Incomplete {
-                        probes_sent: 1,
-                        retrans_at: clock.after(RETRANS_TIMER),
+                        probes_sent: sent as u8,
+                        retrans_at: clock.after(delay),
                     }
                 }
                 // A due one is retransmitted per interface, after the start call.
+                // One whose solicitation couldn't go out stays due, and is tried
+                // again by the poll that follows a freed buffer or room in the
+                // device.
                 State::Incomplete { retrans_at, .. } => {
                     clock.expired(retrans_at);
                 }
@@ -312,7 +337,7 @@ impl NeighborCache {
                 trace!("replaced {} => {} (was {})", key.1, hardware_addr, old_hardware_addr);
             }
             Some(State::Reachable { .. } | State::Stale { .. }) => {}
-            Some(State::Incomplete { .. } | State::Started) => {
+            Some(State::Incomplete { .. } | State::Started { .. }) => {
                 trace!("filled {} => {} (was incomplete)", key.1, hardware_addr);
             }
             None => {
@@ -447,7 +472,7 @@ impl NeighborCache {
                     State::Stale { .. } => (0u8, Instant::ZERO),
                     State::Reachable { expires_at, .. } => (1u8, *expires_at),
                     State::Incomplete { retrans_at, .. } => (2u8, *retrans_at),
-                    State::Started => (3u8, Instant::ZERO),
+                    State::Started { .. } => (3u8, Instant::ZERO),
                 };
                 if rank < best {
                     best = rank;
@@ -544,7 +569,7 @@ impl PendingQueue {
         self.packets.retain(|packet| {
             let keep = matches!(
                 cache.get_state(&packet.key),
-                Some(State::Started | State::Incomplete { .. } | State::Reachable { .. })
+                Some(State::Started { .. } | State::Incomplete { .. } | State::Reachable { .. })
             );
             if !keep {
                 trace!(
@@ -761,7 +786,7 @@ mod test {
         let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
 
-        cache.start_resolution(key(MOCK_IP_ADDR_1));
+        cache.start_resolution(key(MOCK_IP_ADDR_1), true);
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::Pending);
 
         // First probe was sent at t0; nothing to do before the retransmission timer.
@@ -769,14 +794,18 @@ mod test {
         assert_eq!(next_deadline(&mut cache, t0), t0 + RETRANS_TIMER);
 
         // Second and third probes.
+        let t1 = t0 + RETRANS_TIMER;
         assert_eq!(
-            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0),
+            cache.poll_retransmit(IF_0, t1, &mut 0),
             Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()))
         );
+        cache.probe_sent(&key(MOCK_IP_ADDR_1), t1);
+        let t2 = t0 + RETRANS_TIMER * 2;
         assert_eq!(
-            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 2, &mut 0),
+            cache.poll_retransmit(IF_0, t2, &mut 0),
             Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()))
         );
+        cache.probe_sent(&key(MOCK_IP_ADDR_1), t2);
 
         // Probe limit reached: resolution fails, the entry is removed.
         assert_eq!(
@@ -788,12 +817,46 @@ mod test {
         assert_eq!(next_deadline(&mut cache, t3), idle_deadline(t3));
     }
 
+    /// Only the solicitations that went out count toward giving up. One that
+    /// didn't stays due, and the resolution doesn't fail for it.
+    #[test]
+    fn test_unsent_probes_dont_count() {
+        let mut cache = NeighborCache::new();
+        let t0 = Instant::ZERO;
+        let retransmit = Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()));
+
+        // The first solicitation didn't go out: it is tried again soon.
+        cache.start_resolution(key(MOCK_IP_ADDR_1), false);
+        assert_eq!(next_deadline(&mut cache, t0), t0 + POOL_RETRY_DELAY);
+
+        // It stays due for as long as it isn't sent, and holds no deadline.
+        let mut now = t0 + POOL_RETRY_DELAY;
+        for _ in 0..10 {
+            assert_eq!(cache.poll_retransmit(IF_0, now, &mut 0), retransmit);
+            assert_eq!(next_deadline(&mut cache, now), idle_deadline(now));
+            now += RETRANS_TIMER;
+        }
+
+        // Three that go out, a second apart, and then it fails.
+        for _ in 0..MAX_MULTICAST_SOLICIT {
+            assert_eq!(cache.poll_retransmit(IF_0, now, &mut 0), retransmit);
+            cache.probe_sent(&key(MOCK_IP_ADDR_1), now);
+            assert_eq!(cache.poll_retransmit(IF_0, now, &mut 0), None);
+            assert_eq!(next_deadline(&mut cache, now), now + RETRANS_TIMER);
+            now += RETRANS_TIMER;
+        }
+        assert_eq!(
+            cache.poll_retransmit(IF_0, now, &mut 0),
+            Some(ProbeEvent::Failed(MOCK_IP_ADDR_1.into()))
+        );
+    }
+
     #[test]
     fn test_resolution_success() {
         let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
 
-        cache.start_resolution(key(MOCK_IP_ADDR_1));
+        cache.start_resolution(key(MOCK_IP_ADDR_1), true);
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::Pending);
 
         cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, t0);
@@ -888,7 +951,7 @@ mod test {
         let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
 
-        cache.start_resolution((IF_1, MOCK_IP_ADDR_1.into()));
+        cache.start_resolution((IF_1, MOCK_IP_ADDR_1.into()), true);
         next_deadline(&mut cache, t0);
         // Polling one interface's timers doesn't touch another's entries.
         assert_eq!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0), None);
@@ -941,7 +1004,7 @@ mod test {
     fn test_pending_queue_orphans() {
         let mut queue = PendingQueue::new();
         let mut cache = NeighborCache::new();
-        cache.start_resolution(key(MOCK_IP_ADDR_1));
+        cache.start_resolution(key(MOCK_IP_ADDR_1), true);
 
         queue.push(key(MOCK_IP_ADDR_1), crate::pool::test_pool_ref().alloc().unwrap());
         queue.push(key(MOCK_IP_ADDR_2), crate::pool::test_pool_ref().alloc().unwrap());

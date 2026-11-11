@@ -22,9 +22,8 @@ use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
 use crate::config::DHCP_OPTIONS_BUF_SIZE;
 use crate::driver::ChecksumCapabilities;
 use crate::driver::PacketBuf;
-use crate::pool::PoolRef;
 use crate::route::{Route, RouteOrigin};
-use crate::stack::StackInner;
+use crate::stack::{Blocked, StackInner};
 use crate::time::{Clock, Duration, Instant};
 use crate::wire::{
     DHCP_CLIENT_PORT, DHCP_HEADER_LEN, DHCP_MAGIC_NUMBER, DHCP_SERVER_PORT, DhcpFlags, DhcpMessageType, DhcpOption,
@@ -460,15 +459,14 @@ impl Client {
         0x12345678
     }
 
-    /// Build one client message, UDP header included, ready for
-    /// `transmit_ipv4_on`. `None` if the pool is empty: the retry timer sends
-    /// the next one.
+    /// Build one client message in `buf`, UDP header included, ready for
+    /// `transmit_ipv4_on`.
     ///
     /// Panics if the message doesn't fit in a packet. The options the client
     /// emits are tiny, so only an absurd `outgoing_options` can cause that.
     #[allow(clippy::too_many_arguments)]
     fn build(
-        pool: PoolRef,
+        mut buf: PacketBuf,
         config: &DhcpConfig,
         #[cfg(feature = "hostname")] hostname: Option<&str>,
         message_type: DhcpMessageType,
@@ -482,13 +480,12 @@ impl Client {
         src_addr: Ipv4Addr,
         dst_addr: Ipv4Addr,
         checksum_caps: &ChecksumCapabilities,
-    ) -> Option<PacketBuf> {
+    ) -> PacketBuf {
         // Worst case biggest IPv4 header length.
         // 0x0f * 4 = 60 bytes.
         const MAX_IPV4_HEADER_LEN: usize = 60;
         let max_size = (ip_mtu - MAX_IPV4_HEADER_LEN - UDP_HEADER_LEN) as u16;
 
-        let mut buf = pool.alloc()?;
         buf.reserve(ip_headroom + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         let max_payload = buf.tailroom().min(ip_mtu - IPV4_HEADER_LEN - UDP_HEADER_LEN);
         buf.set_len(max_payload);
@@ -565,7 +562,7 @@ impl Client {
             udp.set_checksum(0);
         }
 
-        Some(buf)
+        buf
     }
 }
 
@@ -695,6 +692,10 @@ impl IfaceState<'_> {
 
     /// Run the client's timers: send whatever is due, expire the lease when its
     /// time comes.
+    ///
+    /// A message that is due and finds no room in the device, or no packet
+    /// buffer, is not counted as sent: its timer stays due, and the state as it
+    /// was.
     pub(crate) fn dhcpv4_poll(&mut self, inner: &mut StackInner, clock: &mut Clock) {
         let ethernet_addr = self.hardware_addr;
         let ip_mtu = self.ip_mtu;
@@ -716,13 +717,17 @@ impl IfaceState<'_> {
                         return;
                     }
 
+                    let buf = match inner.alloc_obligation(&mut *self.driver) {
+                        Ok(buf) => buf,
+                        Err(blocked) => return held_back(blocked, clock),
+                    };
                     debug!("DHCP send DISCOVER to {}", Ipv4Addr::BROADCAST);
                     client.transaction_id = Client::random_transaction_id(inner);
                     client.state = ClientState::Discovering(DiscoverState {
                         retry_at: clock.after(DISCOVER_TIMEOUT),
                     });
                     let buf = Client::build(
-                        inner.pool,
+                        buf,
                         &client.config,
                         #[cfg(feature = "hostname")]
                         inner.hostname(),
@@ -738,9 +743,7 @@ impl IfaceState<'_> {
                         Ipv4Addr::BROADCAST,
                         &checksum_caps,
                     );
-                    if let Some(buf) = buf {
-                        inner.transmit_ipv4_on(self, Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, buf);
-                    }
+                    inner.transmit_ipv4_on(self, Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, buf);
                     return;
                 }
                 ClientState::Requesting(state) => {
@@ -754,12 +757,16 @@ impl IfaceState<'_> {
                         continue;
                     }
 
+                    let buf = match inner.alloc_obligation(&mut *self.driver) {
+                        Ok(buf) => buf,
+                        Err(blocked) => return held_back(blocked, clock),
+                    };
                     debug!("DHCP send request to {}", Ipv4Addr::BROADCAST);
                     // Exponential backoff: Double every 2 retries.
                     state.retry_at = clock.after(INITIAL_REQUEST_TIMEOUT * (1u32 << (state.retry as u32 / 2)));
                     state.retry += 1;
                     let buf = Client::build(
-                        inner.pool,
+                        buf,
                         &client.config,
                         #[cfg(feature = "hostname")]
                         inner.hostname(),
@@ -775,9 +782,7 @@ impl IfaceState<'_> {
                         Ipv4Addr::BROADCAST,
                         &checksum_caps,
                     );
-                    if let Some(buf) = buf {
-                        inner.transmit_ipv4_on(self, Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, buf);
-                    }
+                    inner.transmit_ipv4_on(self, Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, buf);
                     return;
                 }
                 ClientState::Renewing(state) => {
@@ -790,6 +795,11 @@ impl IfaceState<'_> {
                     if !clock.expired(state.retry_at()) {
                         return;
                     }
+
+                    let buf = match inner.alloc_obligation(&mut *self.driver) {
+                        Ok(buf) => buf,
+                        Err(blocked) => return held_back(blocked, clock),
+                    };
 
                     state.rebinding |= now >= state.rebind_at;
 
@@ -819,7 +829,7 @@ impl IfaceState<'_> {
                     debug!("DHCP send renew to {}", dst_addr);
                     client.transaction_id = Client::random_transaction_id(inner);
                     let buf = Client::build(
-                        inner.pool,
+                        buf,
                         &client.config,
                         #[cfg(feature = "hostname")]
                         inner.hostname(),
@@ -835,9 +845,7 @@ impl IfaceState<'_> {
                         dst_addr,
                         &checksum_caps,
                     );
-                    if let Some(buf) = buf {
-                        inner.transmit_ipv4_on(self, src_addr, dst_addr, buf);
-                    }
+                    inner.transmit_ipv4_on(self, src_addr, dst_addr, buf);
                     return;
                 }
             }
@@ -895,6 +903,13 @@ impl IfaceState<'_> {
 
         self.config_changed();
     }
+}
+
+/// A message that is due can't go out now. Have the stack polled again for it,
+/// if nothing else does.
+fn held_back(blocked: Blocked, clock: &mut Clock) {
+    trace!("DHCP message held back");
+    blocked.schedule_retry(clock);
 }
 
 fn parse_ipv4(data: &[u8]) -> Option<Ipv4Addr> {

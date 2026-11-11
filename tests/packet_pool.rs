@@ -84,20 +84,35 @@ fn exhaustion() {
     }
     assert!(again.len() >= count);
 
-    // Still with no buffer free: a router solicitation that can't be built counts
-    // as sent, and the retry timer sends the next one, 4 s later. The stack doesn't
-    // ask to be polled again right away.
+    // Still with no buffer free: a router solicitation that can't be built doesn't
+    // count as sent. It stays due, and the stack asks to be polled again 1 ms later
+    // to retry it, since nothing signals a freed buffer. So do the multicast
+    // reports for the interface's groups.
     #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
     {
         use xarxa::iface::slaac::SlaacConfig;
-        use xarxa::time::Instant;
+        use xarxa::time::{Duration, Instant};
         use xarxa::wire::EthernetAddress;
 
         let mut stack = Stack::new(&POOL, 0x1234_5678_dead_beef);
         let hw = HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01]));
-        let iface = TestDevice::new(Medium::Ethernet).install(&mut stack, hw);
+        let device = TestDevice::new(Medium::Ethernet);
+        let tx = device.tx.clone();
+        let iface = device.install(&mut stack, hw);
         stack.iface(iface).set_slaac(Some(SlaacConfig::default())).unwrap();
-        assert_eq!(stack.poll(Instant::from_secs(1)), Instant::from_secs(5));
+        let now = Instant::from_secs(1);
+        let retry = now + Duration::from_millis(1);
+        assert_eq!(stack.poll(now), retry);
+        assert_eq!(stack.poll(retry), retry + Duration::from_millis(1));
+        assert!(tx.borrow().is_empty());
+
+        // A buffer is free by the next retry: everything that was due goes out,
+        // the solicitation among it, and its retry timer runs from then, 4 s.
+        drop(again.pop());
+        let retry = retry + Duration::from_millis(1);
+        assert_eq!(stack.poll(retry), retry + Duration::from_secs(4));
+        assert!(!tx.borrow().is_empty());
+        again.push(POOL.alloc().unwrap());
     }
 
     // Still with no buffer free: nothing waits for one on behalf of a socket. The

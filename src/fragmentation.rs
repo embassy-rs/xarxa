@@ -30,10 +30,9 @@ pub(crate) enum Fragmenter {
 pub(crate) struct Ipv4Fragmenter {
     /// The IP packet, header included.
     pub buffer: PacketBuf,
-    /// The destination address.
-    pub dst_addr: IpAddr,
-    /// The next hop the packet was routed to.
-    pub next_hop: IpAddr,
+    /// Where the fragments go on the link: the resolved next hop, or nowhere
+    /// on an IP medium.
+    pub link_dst: HardwareAddress,
     /// The identification every fragment carries.
     pub ident: u16,
     /// The offset of the next fragment in the packet's payload.
@@ -78,6 +77,9 @@ impl StackInner {
     /// Fragments go out while the device has room for them and the pool has
     /// buffers. The rest wait in the fragmenter for the next poll, and the error
     /// says which of the two ran out.
+    ///
+    /// A packet only gets here once its next hop is resolved, so the fragments
+    /// go straight to the link layer.
     pub(crate) fn fragment_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
         loop {
             // The packet's metadata rides on its first fragment.
@@ -130,15 +132,9 @@ impl StackInner {
         ipv4_id
     }
 
-    /// Fragment an IPv4 packet larger than the interface's MTU, and start
-    /// transmitting the fragments.
-    pub(crate) fn fragment_ipv4(
-        &mut self,
-        iface: &mut IfaceState<'_>,
-        dst_addr: IpAddr,
-        next_hop: IpAddr,
-        mut buf: PacketBuf,
-    ) {
+    /// Fragment an IPv4 packet larger than the interface's MTU, whose next hop
+    /// is resolved to `link_dst`, and start transmitting the fragments.
+    pub(crate) fn fragment_ipv4(&mut self, iface: &mut IfaceState<'_>, link_dst: HardwareAddress, mut buf: PacketBuf) {
         debug!("start fragmentation");
 
         if !iface.fragmenter.is_idle() {
@@ -152,11 +148,10 @@ impl StackInner {
             return;
         }
 
-        // Keep the packet, and the routing decision for its fragments.
+        // Keep the packet, and where its fragments go.
         iface.fragmenter = Fragmenter::Ipv4(Ipv4Fragmenter {
             buffer: buf,
-            dst_addr,
-            next_hop,
+            link_dst,
             ident: self.next_ipv4_frag_ident(),
             frag_offset: 0,
         });
@@ -201,12 +196,17 @@ impl StackInner {
         }
 
         frag.frag_offset += payload_len as u16;
-        let (dst_addr, next_hop) = (frag.dst_addr, frag.next_hop);
+        let link_dst = frag.link_dst;
         if !more_frags {
             iface.fragmenter = Fragmenter::Idle;
         }
-        // A fragment its neighbor can't park is lost.
-        let _ = self.dispatch_ip(iface, dst_addr, next_hop, tx_buffer, EthernetProtocol::Ipv4);
+        match link_dst {
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(addr) => self.transmit_ethernet(iface, addr, tx_buffer, EthernetProtocol::Ipv4),
+            // An IP medium. IEEE 802.15.4 takes no IPv4.
+            #[allow(unreachable_patterns)]
+            _ => self.transmit_raw(iface, tx_buffer),
+        }
     }
 }
 

@@ -2620,6 +2620,11 @@ impl StackInner {
         match hardware_addr {
             #[cfg(feature = "medium-ethernet")]
             HardwareAddress::Ethernet(hardware_addr) => {
+                // Only IPv4 is parked larger than the MTU, to be fragmented.
+                #[cfg(feature = "ipv4-fragmentation")]
+                if buf.len() > iface.ip_mtu {
+                    return self.fragment_ipv4(iface, HardwareAddress::Ethernet(hardware_addr), buf);
+                }
                 let ethertype = match dst_addr {
                     #[cfg(feature = "ipv4")]
                     IpAddr::V4(_) => EthernetProtocol::Ipv4,
@@ -2845,13 +2850,13 @@ impl StackInner {
         let _ = self.transmit_ip(iface, dst, next_hop, buf, EthernetProtocol::Ipv4);
     }
 
-    /// Transmit a fully-built IP packet on an interface, fragmenting it first if it
-    /// is larger than the interface's MTU (IPv4 only).
+    /// Transmit a fully-built IP packet on an interface, fragmenting it if it is
+    /// larger than the interface's MTU (IPv4 only).
     ///
-    /// A packet whose neighbor is being resolved is parked on it. If the neighbor
-    /// already holds one, it is handed back unchanged, with what it waits for.
-    /// Packets the stack sends on its own drop it then, sockets hold their
-    /// caller back.
+    /// A packet whose neighbor is being resolved is parked on it, whole: it is
+    /// fragmented once the neighbor is known. If the neighbor already holds one,
+    /// it is handed back unchanged, with what it waits for. Packets the stack
+    /// sends on its own drop it then, sockets hold their caller back.
     pub(crate) fn transmit_ip(
         &mut self,
         iface: &mut IfaceState<'_>,
@@ -2860,6 +2865,11 @@ impl StackInner {
         buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) -> TxResult {
+        #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
+        let _ = (dst_addr, next_hop);
+        #[cfg(not(feature = "medium-ethernet"))]
+        let _ = ethertype;
+
         // The medium is IPv6-only. This comes first, so an IPv4 packet is never
         // fragmented for it.
         #[cfg(all(feature = "medium-ieee802154", feature = "ipv4"))]
@@ -2868,51 +2878,37 @@ impl StackInner {
             return Ok(());
         }
 
-        let total_ip_len = buf.len();
-
-        if total_ip_len > iface.ip_mtu {
-            match ethertype {
-                // If we have an IPv4 packet, then we need to check if we need to fragment it.
-                #[cfg(feature = "ipv4-fragmentation")]
-                EthernetProtocol::Ipv4 => self.fragment_ipv4(iface, dst_addr, next_hop, buf),
-                #[cfg(not(feature = "ipv4-fragmentation"))]
-                EthernetProtocol::Ipv4 => {
-                    debug!("Enable the `ipv4-fragmentation` feature for fragmentation support. Dropping");
-                }
-                // We don't support IPv6 fragmentation yet.
-                _ => {
-                    debug!("IPv6 fragmentation support is unimplemented. Dropping.");
-                }
-            }
+        // Only IPv4 is fragmented, so any other packet larger than the MTU is
+        // dropped here, before its neighbor is resolved.
+        let oversized = buf.len() > iface.ip_mtu;
+        #[cfg(feature = "ipv4-fragmentation")]
+        let unfragmentable = oversized && ethertype != EthernetProtocol::Ipv4;
+        #[cfg(not(feature = "ipv4-fragmentation"))]
+        let unfragmentable = oversized;
+        if unfragmentable {
+            debug!("packet larger than the MTU, and not fragmentable. Dropping");
             return Ok(());
         }
-
-        self.dispatch_ip(iface, dst_addr, next_hop, buf, ethertype)
-    }
-
-    /// Hand an IP packet that fits the interface's MTU to the link layer.
-    pub(crate) fn dispatch_ip(
-        &mut self,
-        iface: &mut IfaceState<'_>,
-        dst_addr: IpAddr,
-        next_hop: IpAddr,
-        buf: PacketBuf,
-        ethertype: EthernetProtocol,
-    ) -> TxResult {
-        #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
-        let _ = (dst_addr, next_hop, ethertype);
-        #[cfg(not(feature = "medium-ethernet"))]
-        let _ = ethertype;
 
         match iface.medium() {
             #[cfg(feature = "medium-ip")]
             Medium::Ip => {
+                #[cfg(feature = "ipv4-fragmentation")]
+                if oversized {
+                    self.fragment_ipv4(iface, HardwareAddress::Ip, buf);
+                    return Ok(());
+                }
                 self.transmit_raw(iface, buf);
                 Ok(())
             }
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
                 NeighborLookup::Found(hardware_addr) => {
+                    #[cfg(feature = "ipv4-fragmentation")]
+                    if oversized {
+                        self.fragment_ipv4(iface, hardware_addr, buf);
+                        return Ok(());
+                    }
                     self.transmit_ethernet(iface, hardware_addr.ethernet_or_panic(), buf, ethertype);
                     Ok(())
                 }
@@ -2920,7 +2916,7 @@ impl StackInner {
             },
             #[cfg(feature = "medium-ieee802154")]
             Medium::Ieee802154 => {
-                // IPv4 was dropped by `transmit_ip`, which every packet passes.
+                // IPv4 was dropped above.
                 match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
                     NeighborLookup::Found(hardware_addr) => {
                         self.dispatch_ieee802154(iface, hardware_addr.ieee802154_or_panic(), buf);
@@ -8460,6 +8456,76 @@ pub(crate) mod test {
             .iter()
             .filter(|frame| ethertype_of(frame) == EthernetProtocol::Ipv4)
             .count()
+    }
+
+    /// A packet that is sent in fragments is parked whole on its neighbor while
+    /// it is resolved, and fragmented once it is. Its fragments are not parked
+    /// one by one, and the interface takes packets for other neighbors meanwhile.
+    #[test]
+    #[cfg(feature = "ipv4-fragmentation")]
+    fn test_fragments_wait_for_their_neighbor() {
+        static POOL: SmallPool<16> = crate::StaticPool::new();
+        let (mut stack, rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 576 + ETHERNET_HEADER_LEN);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+
+        stack
+            .udp_socket(udp)
+            .send_slice(&[0xab; 1400], (REMOTE_V4, 1000))
+            .unwrap();
+        assert_eq!(tx.borrow().len(), 1);
+        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
+        assert!(
+            stack
+                .inner
+                .neighbor_cache
+                .has_parked(&(IfaceHandle::new(0), REMOTE_V4.into()))
+        );
+        assert!(stack.ifaces.get(0).fragmenter.is_idle());
+        // The poll waits for the resolution, not for a buffer.
+        assert_eq!(
+            stack.poll(Instant::ZERO),
+            Instant::ZERO + crate::neighbor::RETRANS_TIMER
+        );
+        // Another neighbor is not held back by it.
+        let other = Ipv4Addr::new(192, 168, 1, 3);
+        stack.udp_socket(udp).send_slice(b"hi", (other, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 2);
+        assert_eq!(ethertype_of(&tx.borrow()[1]), EthernetProtocol::Arp);
+
+        // The neighbor answers: all three fragments go out.
+        tx.borrow_mut().clear();
+        inject(&mut stack, &rx, arp_request_from(OTHER_HW, REMOTE_V4));
+        assert_eq!(ipv4_frames(&tx), 3);
+        assert!(stack.ifaces.get(0).fragmenter.is_idle());
+    }
+
+    /// If the next hop of a packet being sent in fragments can't be resolved,
+    /// the packet goes, its socket is told, and the interface is free again.
+    #[test]
+    #[cfg(all(feature = "ipv4-fragmentation", feature = "icmp-errors"))]
+    fn test_fragments_dropped_when_resolution_fails() {
+        static POOL: SmallPool<16> = crate::StaticPool::new();
+        let (mut stack, _rx, _tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 576 + ETHERNET_HEADER_LEN);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        stack
+            .udp_socket(udp)
+            .send_slice(&[0xab; 1400], (REMOTE_V4, 1000))
+            .unwrap();
+
+        let mut t = Instant::ZERO;
+        for _ in 0..=MAX_MULTICAST_SOLICIT {
+            t = stack.poll(t);
+        }
+        let (error, remote) = stack.udp_socket(udp).take_icmp_error().unwrap();
+        assert_eq!(error, IcmpError::HostUnreachable);
+        assert_eq!(remote, SocketAddr::new(REMOTE_V4.into(), 1000));
+        assert!(stack.ifaces.get(0).fragmenter.is_idle());
+        assert_eq!(stack.poll(t), idle_deadline(t));
+        // No buffer is left behind.
+        let free: Vec<PacketBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
+        assert_eq!(free.len(), 16);
     }
 
     /// A resolution only gives up after its solicitations went out. The ones no

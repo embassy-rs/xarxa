@@ -1,7 +1,6 @@
 // Heads up! Before working on this file you should read, at least,
 // the parts of RFC 1122 that discuss ARP, and RFC 4861 § 7.2 and § 7.3.
 
-use crate::error::Full;
 use crate::storage::BoundedVec;
 
 use crate::driver::PacketBuf;
@@ -15,10 +14,8 @@ use crate::wire::{HardwareAddress, IpAddr};
 /// protocol address.
 pub(crate) type Key = (IfaceHandle, IpAddr);
 
-// Maximum number of entries in the neighbor cache, and maximum number of packets
-// waiting for neighbor resolution (when full, the oldest packet is dropped to
-// make room). Both are compile-time knobs.
-pub(crate) use crate::config::{NEIGHBOR_CACHE_COUNT, PENDING_QUEUE_COUNT};
+// Maximum number of entries in the neighbor cache. A compile-time knob.
+pub(crate) use crate::config::NEIGHBOR_CACHE_COUNT;
 
 /// Maximum number of solicitations sent for one resolution before giving up.
 /// (RFC 4861 MAX_MULTICAST_SOLICIT)
@@ -39,8 +36,7 @@ enum State {
         sent: bool,
     },
     /// Address resolution is in progress: solicitations are being sent, no answer
-    /// yet. Egress packets for this neighbor are queued in the [PendingQueue]
-    /// meanwhile.
+    /// yet. The entry holds one egress packet for this neighbor meanwhile.
     Incomplete {
         /// Number of solicitations sent so far.
         probes_sent: u8,
@@ -98,13 +94,13 @@ impl Answer {
 
 /// A due resolution timer, returned by [NeighborCache::poll_retransmit].
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum ProbeEvent {
     /// Another solicitation should be sent to the neighbor.
     Retransmit(IpAddr),
     /// Resolution failed after the maximum number of solicitations. The entry has
-    /// been removed; packets queued on it should be dropped.
-    Failed(IpAddr),
+    /// been removed, and this is the packet that was parked on it, if any.
+    Failed(IpAddr, Option<PacketBuf>),
 }
 
 /// An entry in the [`NeighborCache`].
@@ -123,7 +119,7 @@ pub struct Neighbor {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeighborState {
-    /// Address resolution is in progress. Packets for this neighbor are parked
+    /// Address resolution is in progress. A packet for this neighbor is parked
     /// until it resolves or resolution gives up.
     Incomplete,
     /// The neighbor's hardware address is known.
@@ -151,13 +147,29 @@ pub enum NeighborState {
 /// discovery, and expire after 60 s unless traffic from the neighbor refreshes
 /// them.
 ///
+/// An entry also holds the packet parked on the neighbor while it is resolved:
+/// one per neighbor, so a neighbor that never answers holds back only the
+/// packets sent to it.
+///
 /// Access it with [`Stack::neighbor_cache`] and [`Stack::neighbor_cache_mut`].
 ///
 /// [`Stack::neighbor_cache`]: crate::Stack::neighbor_cache
 /// [`Stack::neighbor_cache_mut`]: crate::Stack::neighbor_cache_mut
 #[derive(Debug)]
 pub struct NeighborCache {
-    storage: BoundedVec<(Key, State), NEIGHBOR_CACHE_COUNT>,
+    storage: BoundedVec<Entry, NEIGHBOR_CACHE_COUNT>,
+}
+
+/// An entry of the [`NeighborCache`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug)]
+struct Entry {
+    key: Key,
+    state: State,
+    /// The packet waiting for the neighbor. It was sent while the neighbor was
+    /// being resolved, and stays after the resolution while the device has no
+    /// room for it. It goes with the entry, and when the entry goes stale.
+    parked: Option<PacketBuf>,
 }
 
 impl NeighborCache {
@@ -188,7 +200,7 @@ impl NeighborCache {
     /// Whether the cache has an entry for a neighbor, in any state.
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
     pub(crate) fn contains(&self, key: &Key) -> bool {
-        self.storage.iter().any(|(probe, _)| probe == key)
+        self.storage.iter().any(|entry| entry.key == *key)
     }
 
     /// Create an INCOMPLETE entry for a neighbor, starting address resolution.
@@ -215,25 +227,25 @@ impl NeighborCache {
     /// counts it and rearms the timer, once it went out: a solicitation there
     /// was no buffer or no room in the device for is not one the neighbor failed
     /// to answer (RFC 4861 §7.2.2 counts the solicitations sent). An entry that
-    /// exhausted its probes is removed and returned as [ProbeEvent::Failed], so
-    /// the caller drops the packets queued on it.
+    /// exhausted its probes is removed and returned as [ProbeEvent::Failed], with
+    /// the packet parked on it.
     pub(crate) fn poll_retransmit(
         &mut self,
         iface: IfaceHandle,
         timestamp: Instant,
         cursor: &mut usize,
     ) -> Option<ProbeEvent> {
-        while let Some((key, state)) = self.storage.get_mut(*cursor) {
-            let addr = key.1;
-            match state {
+        while let Some(entry) = self.storage.get_mut(*cursor) {
+            let (entry_iface, addr) = entry.key;
+            match entry.state {
                 State::Incomplete {
                     probes_sent,
                     retrans_at,
-                } if key.0 == iface && timestamp >= *retrans_at => {
-                    if *probes_sent >= MAX_MULTICAST_SOLICIT {
+                } if entry_iface == iface && timestamp >= retrans_at => {
+                    if probes_sent >= MAX_MULTICAST_SOLICIT {
                         // The last entry moves into `cursor`; examine it next.
-                        self.storage.swap_remove(*cursor);
-                        return Some(ProbeEvent::Failed(addr));
+                        let entry = self.storage.swap_remove(*cursor);
+                        return Some(ProbeEvent::Failed(addr, entry.parked));
                     }
                     *cursor += 1;
                     return Some(ProbeEvent::Retransmit(addr));
@@ -265,12 +277,12 @@ impl NeighborCache {
     /// up, and at its end, after everything that can start a resolution or fill
     /// an entry. Only the end call's deadline counts.
     pub(crate) fn expire(&mut self, clock: &mut Clock) {
-        for (_, state) in self.storage.iter_mut() {
-            match *state {
+        for entry in self.storage.iter_mut() {
+            match entry.state {
                 State::Started { sent } => {
                     // A first solicitation that didn't go out is tried again soon.
                     let delay = if sent { RETRANS_TIMER } else { POOL_RETRY_DELAY };
-                    *state = State::Incomplete {
+                    entry.state = State::Incomplete {
                         probes_sent: sent as u8,
                         retrans_at: clock.after(delay),
                     }
@@ -287,7 +299,11 @@ impl NeighborCache {
                     expires_at,
                 } => {
                     if clock.expired(expires_at) {
-                        *state = State::Stale { hardware_addr };
+                        entry.state = State::Stale { hardware_addr };
+                        // The stack no longer sends to this hardware address.
+                        if entry.parked.take().is_some() {
+                            trace!("neighbor: dropping parked packet for {}, its entry went stale", entry.key.1);
+                        }
                     }
                 }
                 State::Stale { .. } => {}
@@ -370,11 +386,7 @@ impl NeighborCache {
 
     /// Iterate over all entries.
     pub fn iter(&self) -> impl Iterator<Item = Neighbor> + '_ {
-        self.storage.iter().map(|((iface, addr), state)| Neighbor {
-            iface: *iface,
-            addr: *addr,
-            state: (*state).into(),
-        })
+        self.storage.iter().map(Entry::neighbor)
     }
 
     /// Add or replace an entry, mapping `addr` on `iface` to `hardware_addr`.
@@ -409,41 +421,29 @@ impl NeighborCache {
 
     /// Remove the entry for a neighbor, returning it if there was one.
     ///
-    /// Removing an entry whose resolution is still in progress drops the packets
-    /// parked on it at the next poll.
+    /// Removing an entry drops the packet parked on it, if any.
     pub fn remove(&mut self, iface: IfaceHandle, addr: IpAddr) -> Option<Neighbor> {
-        let index = self.storage.iter().position(|(key, _)| *key == (iface, addr))?;
-        let ((iface, addr), state) = self.storage.swap_remove(index);
-        Some(Neighbor {
-            iface,
-            addr,
-            state: state.into(),
-        })
+        let index = self.storage.iter().position(|entry| entry.key == (iface, addr))?;
+        Some(self.storage.swap_remove(index).neighbor())
     }
 
     /// Keep only the entries for which `f` returns true.
     ///
-    /// Same caveat as [`NeighborCache::remove`] for entries being resolved.
+    /// Same caveat as [`NeighborCache::remove`] for parked packets.
     pub fn retain(&mut self, mut f: impl FnMut(&Neighbor) -> bool) {
-        self.storage.retain(|((iface, addr), state)| {
-            f(&Neighbor {
-                iface: *iface,
-                addr: *addr,
-                state: (*state).into(),
-            })
-        });
+        self.storage.retain(|entry| f(&entry.neighbor()));
     }
 
     /// Remove all entries for one interface.
     ///
-    /// Same caveat as [`NeighborCache::remove`] for entries being resolved.
+    /// Same caveat as [`NeighborCache::remove`] for parked packets.
     pub fn clear_iface(&mut self, iface: IfaceHandle) {
-        self.storage.retain(|(key, _)| key.0 != iface);
+        self.storage.retain(|entry| entry.key.0 != iface);
     }
 
     /// Remove all entries.
     ///
-    /// Same caveat as [`NeighborCache::remove`] for entries being resolved.
+    /// Same caveat as [`NeighborCache::remove`] for parked packets.
     pub fn clear(&mut self) {
         self.storage.clear()
     }
@@ -458,20 +458,29 @@ impl NeighborCache {
         self.storage.is_empty()
     }
 
+    /// Set the state of a neighbor's entry, creating it if there is none. An
+    /// existing entry keeps its parked packet.
     fn insert_state(&mut self, key: Key, state: State) {
         if let Some(entry) = self.get_state_mut(&key) {
             *entry = state;
-        } else if let Err((key, state)) = self.storage.push((key, state)) {
+            return;
+        }
+        let entry = Entry {
+            key,
+            state,
+            parked: None,
+        };
+        if let Err(entry) = self.storage.push(entry) {
             // The cache is full, and we need to evict an entry. Prefer evicting
             // stale entries, then resolved ones: evicting an in-progress resolution
-            // would strand the packets queued on it.
+            // drops the packet parked on it.
             let mut index = 0;
             let mut best = (u8::MAX, Instant::ZERO);
-            for (i, (_, state)) in self.storage.iter().enumerate() {
-                let rank = match state {
+            for (i, probe) in self.storage.iter().enumerate() {
+                let rank = match probe.state {
                     State::Stale { .. } => (0u8, Instant::ZERO),
-                    State::Reachable { expires_at, .. } => (1u8, *expires_at),
-                    State::Incomplete { retrans_at, .. } => (2u8, *retrans_at),
+                    State::Reachable { expires_at, .. } => (1u8, expires_at),
+                    State::Incomplete { retrans_at, .. } => (2u8, retrans_at),
                     State::Started { .. } => (3u8, Instant::ZERO),
                 };
                 if rank < best {
@@ -480,110 +489,87 @@ impl NeighborCache {
                 }
             }
 
-            let (_old_key, _) = self.storage[index];
-            trace!("neighbor cache full, evicted {}", _old_key.1);
-            self.storage[index] = (key, state);
+            trace!("neighbor cache full, evicted {}", self.storage[index].key.1);
+            self.storage[index] = entry;
         }
+    }
+
+    /// Park a packet on a neighbor that is being resolved. It holds one: if it
+    /// already holds one, or isn't being resolved, the packet is handed back.
+    pub(crate) fn park(&mut self, key: &Key, buf: PacketBuf) -> Result<(), PacketBuf> {
+        match self.get_mut(key) {
+            Some(Entry {
+                state: State::Started { .. } | State::Incomplete { .. },
+                parked: parked @ None,
+                ..
+            }) => {
+                *parked = Some(buf);
+                Ok(())
+            }
+            _ => Err(buf),
+        }
+    }
+
+    /// Whether a packet is parked on a neighbor.
+    pub(crate) fn has_parked(&self, key: &Key) -> bool {
+        self.storage
+            .iter()
+            .any(|entry| entry.key == *key && entry.parked.is_some())
+    }
+
+    /// The index of the first entry at or after `cursor` on `iface` whose
+    /// neighbor is resolved and that holds a parked packet, for
+    /// [`take_parked_at`](Self::take_parked_at).
+    pub(crate) fn next_resolved_parked(&self, iface: IfaceHandle, cursor: usize) -> Option<usize> {
+        self.storage
+            .iter()
+            .enumerate()
+            .skip(cursor)
+            .find(|(_, entry)| {
+                entry.key.0 == iface && entry.parked.is_some() && matches!(entry.state, State::Reachable { .. })
+            })
+            .map(|(index, _)| index)
+    }
+
+    /// Take the packet parked on the resolved neighbor at `index`, from
+    /// [`next_resolved_parked`](Self::next_resolved_parked), with the
+    /// neighbor's address and hardware address.
+    pub(crate) fn take_parked_at(&mut self, index: usize) -> (IpAddr, HardwareAddress, PacketBuf) {
+        let entry = &mut self.storage[index];
+        let State::Reachable { hardware_addr, .. } = entry.state else {
+            unreachable!()
+        };
+        (entry.key.1, hardware_addr, unwrap!(entry.parked.take()))
+    }
+
+    /// Take the packet parked on a neighbor, if any.
+    pub(crate) fn take_parked(&mut self, key: &Key) -> Option<PacketBuf> {
+        self.get_mut(key)?.parked.take()
     }
 
     fn get_state(&self, key: &Key) -> Option<State> {
         self.storage
             .iter()
-            .find(|(probe, _)| probe == key)
-            .map(|(_, state)| *state)
+            .find(|entry| entry.key == *key)
+            .map(|entry| entry.state)
     }
 
     fn get_state_mut(&mut self, key: &Key) -> Option<&mut State> {
-        self.storage
-            .iter_mut()
-            .find(|(probe, _)| probe == key)
-            .map(|(_, state)| state)
+        self.get_mut(key).map(|entry| &mut entry.state)
+    }
+
+    fn get_mut(&mut self, key: &Key) -> Option<&mut Entry> {
+        self.storage.iter_mut().find(|entry| entry.key == *key)
     }
 }
 
-/// A packet waiting for neighbor resolution.
-#[derive(Debug)]
-pub(crate) struct PendingPacket {
-    pub key: Key,
-    pub buf: PacketBuf,
-}
-
-/// A queue of egress packets waiting for neighbor resolution.
-///
-/// When egress needs a neighbor that is not in the [NeighborCache], the fully-built IP packet
-/// is queued here and a solicitation (ARP request / NDISC neighbor solicit) is sent
-/// instead, retransmitted per RFC 4861 until an answer arrives or the probe limit is
-/// reached. When the answer arrives and fills the cache, the queued packets are
-/// flushed to the device; if resolution fails, they are dropped.
-#[derive(Debug, Default)]
-pub(crate) struct PendingQueue {
-    packets: BoundedVec<PendingPacket, PENDING_QUEUE_COUNT>,
-}
-
-impl PendingQueue {
-    pub fn new() -> Self {
-        Self {
-            packets: BoundedVec::new(),
+impl Entry {
+    fn neighbor(&self) -> Neighbor {
+        Neighbor {
+            iface: self.key.0,
+            addr: self.key.1,
+            state: self.state.into(),
         }
-    }
-
-    /// Queue a packet waiting for `key` to resolve.
-    pub fn push(&mut self, key: Key, buf: PacketBuf) {
-        let packet = PendingPacket { key, buf };
-        if let Err(packet) = self.packets.push(packet) {
-            trace!("neighbor: pending queue full, dropping oldest packet");
-            self.packets.remove(0);
-            unwrap!(self.packets.push(packet).map_err(|_| Full));
-        }
-    }
-
-    /// Whether any packet is waiting for `key`.
-    pub fn has_matching(&self, key: &Key) -> bool {
-        self.packets.iter().any(|packet| packet.key == *key)
-    }
-
-    /// The index and key of the first packet at or after `cursor` that is parked
-    /// on `iface`, or `None` once there is none. This is how a caller walks the
-    /// queue while removing packets from it.
-    pub fn next_on(&self, iface: IfaceHandle, cursor: usize) -> Option<(usize, Key)> {
-        self.packets
-            .iter()
-            .enumerate()
-            .skip(cursor)
-            .find(|(_, packet)| packet.key.0 == iface)
-            .map(|(index, packet)| (index, packet.key))
-    }
-
-    /// Remove and return the first packet waiting for `key` (FIFO order).
-    pub fn pop_matching(&mut self, key: &Key) -> Option<PendingPacket> {
-        let index = self.packets.iter().position(|packet| packet.key == *key)?;
-        Some(self.packets.remove(index))
-    }
-
-    /// Drop the packets whose resolution is gone: the entry was removed or
-    /// evicted, or it resolved and went stale before the device took them.
-    ///
-    /// Otherwise a packet leaves the queue when its resolution succeeds or fails
-    /// (RFC 4861 §7.2.2), so it needs no timer of its own.
-    pub fn purge_orphans(&mut self, cache: &NeighborCache) {
-        self.packets.retain(|packet| {
-            let keep = matches!(
-                cache.get_state(&packet.key),
-                Some(State::Started { .. } | State::Incomplete { .. } | State::Reachable { .. })
-            );
-            if !keep {
-                trace!(
-                    "neighbor: dropping queued packet for {}, its resolution is gone",
-                    packet.key.1
-                );
-            }
-            keep
-        });
-    }
-
-    /// Drop all packets queued on the given interface.
-    pub fn purge_iface(&mut self, iface: IfaceHandle) {
-        self.packets.retain(|packet| packet.key.0 != iface);
     }
 }
 
@@ -600,12 +586,18 @@ mod test {
     const IF_0: IfaceHandle = IfaceHandle::new(0);
     const IF_1: IfaceHandle = IfaceHandle::new(1);
 
-    fn take_matching(queue: &mut PendingQueue, key: &Key) -> std::vec::Vec<PendingPacket> {
-        let mut taken = std::vec::Vec::new();
-        while let Some(packet) = queue.pop_matching(key) {
-            taken.push(packet);
-        }
-        taken
+    fn buf() -> PacketBuf {
+        crate::pool::test_pool_ref().alloc().unwrap()
+    }
+
+    fn is_retransmit(event: Option<ProbeEvent>, addr: Ipv6Addr) -> bool {
+        matches!(event, Some(ProbeEvent::Retransmit(a)) if a == addr.into())
+    }
+
+    /// Whether the event is a failed resolution of `addr`, and whether a packet
+    /// was parked on it.
+    fn is_failed(event: Option<ProbeEvent>, addr: Ipv6Addr, parked: bool) -> bool {
+        matches!(event, Some(ProbeEvent::Failed(a, p)) if a == addr.into() && p.is_some() == parked)
     }
 
     #[cfg(feature = "medium-ethernet")]
@@ -790,28 +782,19 @@ mod test {
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::Pending);
 
         // First probe was sent at t0; nothing to do before the retransmission timer.
-        assert_eq!(cache.poll_retransmit(IF_0, t0, &mut 0), None);
+        assert!(cache.poll_retransmit(IF_0, t0, &mut 0).is_none());
         assert_eq!(next_deadline(&mut cache, t0), t0 + RETRANS_TIMER);
 
         // Second and third probes.
         let t1 = t0 + RETRANS_TIMER;
-        assert_eq!(
-            cache.poll_retransmit(IF_0, t1, &mut 0),
-            Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()))
-        );
+        assert!(is_retransmit(cache.poll_retransmit(IF_0, t1, &mut 0), MOCK_IP_ADDR_1));
         cache.probe_sent(&key(MOCK_IP_ADDR_1), t1);
         let t2 = t0 + RETRANS_TIMER * 2;
-        assert_eq!(
-            cache.poll_retransmit(IF_0, t2, &mut 0),
-            Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()))
-        );
+        assert!(is_retransmit(cache.poll_retransmit(IF_0, t2, &mut 0), MOCK_IP_ADDR_1));
         cache.probe_sent(&key(MOCK_IP_ADDR_1), t2);
 
         // Probe limit reached: resolution fails, the entry is removed.
-        assert_eq!(
-            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 3, &mut 0),
-            Some(ProbeEvent::Failed(MOCK_IP_ADDR_1.into()))
-        );
+        assert!(is_failed(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 3, &mut 0), MOCK_IP_ADDR_1, false));
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::NotFound);
         let t3 = t0 + RETRANS_TIMER * 3;
         assert_eq!(next_deadline(&mut cache, t3), idle_deadline(t3));
@@ -823,7 +806,6 @@ mod test {
     fn test_unsent_probes_dont_count() {
         let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
-        let retransmit = Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()));
 
         // The first solicitation didn't go out: it is tried again soon.
         cache.start_resolution(key(MOCK_IP_ADDR_1), false);
@@ -832,23 +814,20 @@ mod test {
         // It stays due for as long as it isn't sent, and holds no deadline.
         let mut now = t0 + POOL_RETRY_DELAY;
         for _ in 0..10 {
-            assert_eq!(cache.poll_retransmit(IF_0, now, &mut 0), retransmit);
+            assert!(is_retransmit(cache.poll_retransmit(IF_0, now, &mut 0), MOCK_IP_ADDR_1));
             assert_eq!(next_deadline(&mut cache, now), idle_deadline(now));
             now += RETRANS_TIMER;
         }
 
         // Three that go out, a second apart, and then it fails.
         for _ in 0..MAX_MULTICAST_SOLICIT {
-            assert_eq!(cache.poll_retransmit(IF_0, now, &mut 0), retransmit);
+            assert!(is_retransmit(cache.poll_retransmit(IF_0, now, &mut 0), MOCK_IP_ADDR_1));
             cache.probe_sent(&key(MOCK_IP_ADDR_1), now);
-            assert_eq!(cache.poll_retransmit(IF_0, now, &mut 0), None);
+            assert!(cache.poll_retransmit(IF_0, now, &mut 0).is_none());
             assert_eq!(next_deadline(&mut cache, now), now + RETRANS_TIMER);
             now += RETRANS_TIMER;
         }
-        assert_eq!(
-            cache.poll_retransmit(IF_0, now, &mut 0),
-            Some(ProbeEvent::Failed(MOCK_IP_ADDR_1.into()))
-        );
+        assert!(is_failed(cache.poll_retransmit(IF_0, now, &mut 0), MOCK_IP_ADDR_1, false));
     }
 
     #[test]
@@ -864,7 +843,7 @@ mod test {
 
         // The resolved entry has no retransmission timer anymore, only its expiry.
         let t1 = t0 + RETRANS_TIMER;
-        assert_eq!(cache.poll_retransmit(IF_0, t1, &mut 0), None);
+        assert!(cache.poll_retransmit(IF_0, t1, &mut 0).is_none());
         assert_eq!(next_deadline(&mut cache, t1), t0 + NeighborCache::ENTRY_LIFETIME);
     }
 
@@ -954,84 +933,82 @@ mod test {
         cache.start_resolution((IF_1, MOCK_IP_ADDR_1.into()), true);
         next_deadline(&mut cache, t0);
         // Polling one interface's timers doesn't touch another's entries.
-        assert_eq!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0), None);
-        assert_eq!(
-            cache.poll_retransmit(IF_1, t0 + RETRANS_TIMER, &mut 0),
-            Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()))
-        );
+        assert!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0).is_none());
+        assert!(is_retransmit(cache.poll_retransmit(IF_1, t0 + RETRANS_TIMER, &mut 0), MOCK_IP_ADDR_1));
     }
 
+    /// A neighbor being resolved holds one parked packet. Another is handed
+    /// back, and so is one for a neighbor that isn't being resolved.
     #[test]
-    fn test_pending_queue() {
-        let mut queue = PendingQueue::new();
-
-        queue.push(key(MOCK_IP_ADDR_1), crate::pool::test_pool_ref().alloc().unwrap());
-        queue.push(key(MOCK_IP_ADDR_2), crate::pool::test_pool_ref().alloc().unwrap());
-        queue.push(key(MOCK_IP_ADDR_1), crate::pool::test_pool_ref().alloc().unwrap());
-        // Same address, different interface: distinct key.
-        queue.push(
-            (IF_1, MOCK_IP_ADDR_1.into()),
-            crate::pool::test_pool_ref().alloc().unwrap(),
-        );
-
-        let taken = take_matching(&mut queue, &key(MOCK_IP_ADDR_1));
-        assert_eq!(taken.len(), 2);
-        assert!(take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).is_empty());
-        assert_eq!(take_matching(&mut queue, &key(MOCK_IP_ADDR_2)).len(), 1);
-        assert_eq!(take_matching(&mut queue, &(IF_1, MOCK_IP_ADDR_1.into())).len(), 1);
-    }
-
-    #[test]
-    fn test_pending_queue_full() {
-        let mut queue = PendingQueue::new();
-
-        for _ in 0..PENDING_QUEUE_COUNT {
-            queue.push(key(MOCK_IP_ADDR_1), crate::pool::test_pool_ref().alloc().unwrap());
-        }
-        // This push drops the oldest packet to make room.
-        queue.push(key(MOCK_IP_ADDR_2), crate::pool::test_pool_ref().alloc().unwrap());
-
-        assert_eq!(
-            take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).len(),
-            PENDING_QUEUE_COUNT - 1
-        );
-        assert_eq!(take_matching(&mut queue, &key(MOCK_IP_ADDR_2)).len(), 1);
-    }
-
-    /// A parked packet stays while its resolution is in progress or resolved, and
-    /// goes once its entry is gone.
-    #[test]
-    fn test_pending_queue_orphans() {
-        let mut queue = PendingQueue::new();
+    fn test_park() {
         let mut cache = NeighborCache::new();
-        cache.start_resolution(key(MOCK_IP_ADDR_1), true);
+        let k1 = key(MOCK_IP_ADDR_1);
+        let k1_if1 = (IF_1, MOCK_IP_ADDR_1.into());
+        cache.start_resolution(k1, true);
+        cache.start_resolution(k1_if1, true);
 
-        queue.push(key(MOCK_IP_ADDR_1), crate::pool::test_pool_ref().alloc().unwrap());
-        queue.push(key(MOCK_IP_ADDR_2), crate::pool::test_pool_ref().alloc().unwrap());
-        queue.purge_orphans(&cache);
-        assert!(take_matching(&mut queue, &key(MOCK_IP_ADDR_2)).is_empty());
+        assert!(cache.park(&k1, buf()).is_ok());
+        assert!(cache.park(&k1, buf()).is_err());
+        assert!(cache.has_parked(&k1));
+        // Same address, different interface: another neighbor, with its own slot.
+        assert!(!cache.has_parked(&k1_if1));
+        assert!(cache.park(&k1_if1, buf()).is_ok());
+        // No entry, or one that isn't being resolved: nothing to wait for.
+        assert!(cache.park(&key(MOCK_IP_ADDR_2), buf()).is_err());
+        cache.fill(key(MOCK_IP_ADDR_2), HADDR_B, Instant::ZERO);
+        assert!(cache.park(&key(MOCK_IP_ADDR_2), buf()).is_err());
 
-        cache.remove(IF_0, MOCK_IP_ADDR_1.into());
-        queue.purge_orphans(&cache);
-        assert!(take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).is_empty());
+        // Resolved, it can be taken from its index.
+        assert_eq!(cache.next_resolved_parked(IF_0, 0), None);
+        cache.fill(k1, HADDR_A, Instant::ZERO);
+        let index = cache.next_resolved_parked(IF_0, 0).unwrap();
+        assert_eq!(cache.next_resolved_parked(IF_1, 0), None);
+        let (addr, hardware_addr, _) = cache.take_parked_at(index);
+        assert_eq!((addr, hardware_addr), (MOCK_IP_ADDR_1.into(), HADDR_A));
+        assert!(!cache.has_parked(&k1));
+        assert_eq!(cache.next_resolved_parked(IF_0, 0), None);
+
+        assert!(cache.take_parked(&k1_if1).is_some());
+        assert!(cache.take_parked(&k1_if1).is_none());
     }
 
+    /// A parked packet goes with its entry: removed, evicted, failed, or gone
+    /// stale.
     #[test]
-    fn test_pending_queue_purge_iface() {
-        let mut queue = PendingQueue::new();
+    fn test_parked_goes_with_entry() {
+        let mut cache = NeighborCache::new();
+        let t0 = Instant::ZERO;
 
-        queue.push(
-            (IF_0, MOCK_IP_ADDR_1.into()),
-            crate::pool::test_pool_ref().alloc().unwrap(),
-        );
-        queue.push(
-            (IF_1, MOCK_IP_ADDR_1.into()),
-            crate::pool::test_pool_ref().alloc().unwrap(),
-        );
+        cache.start_resolution(key(MOCK_IP_ADDR_1), true);
+        cache.park(&key(MOCK_IP_ADDR_1), buf()).unwrap();
+        cache.remove(IF_0, MOCK_IP_ADDR_1.into());
+        assert!(!cache.has_parked(&key(MOCK_IP_ADDR_1)));
 
-        queue.purge_iface(IF_0);
-        assert!(take_matching(&mut queue, &(IF_0, MOCK_IP_ADDR_1.into())).is_empty());
-        assert_eq!(take_matching(&mut queue, &(IF_1, MOCK_IP_ADDR_1.into())).len(), 1);
+        // A failed resolution hands it to the caller.
+        cache.start_resolution(key(MOCK_IP_ADDR_1), true);
+        cache.park(&key(MOCK_IP_ADDR_1), buf()).unwrap();
+        next_deadline(&mut cache, t0);
+        let mut now = t0;
+        for _ in 1..MAX_MULTICAST_SOLICIT {
+            now += RETRANS_TIMER;
+            assert!(is_retransmit(cache.poll_retransmit(IF_0, now, &mut 0), MOCK_IP_ADDR_1));
+            cache.probe_sent(&key(MOCK_IP_ADDR_1), now);
+        }
+        now += RETRANS_TIMER;
+        assert!(is_failed(cache.poll_retransmit(IF_0, now, &mut 0), MOCK_IP_ADDR_1, true));
+
+        // Resolved, it waits for the device, until the entry goes stale.
+        cache.start_resolution(key(MOCK_IP_ADDR_1), true);
+        cache.park(&key(MOCK_IP_ADDR_1), buf()).unwrap();
+        cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, t0);
+        assert!(cache.has_parked(&key(MOCK_IP_ADDR_1)));
+        next_deadline(&mut cache, t0 + NeighborCache::ENTRY_LIFETIME);
+        assert!(!cache.has_parked(&key(MOCK_IP_ADDR_1)));
+
+        cache.start_resolution((IF_1, MOCK_IP_ADDR_1.into()), true);
+        cache.park(&(IF_1, MOCK_IP_ADDR_1.into()), buf()).unwrap();
+        cache.clear_iface(IF_1);
+        assert!(!cache.has_parked(&(IF_1, MOCK_IP_ADDR_1.into())));
     }
 }
 

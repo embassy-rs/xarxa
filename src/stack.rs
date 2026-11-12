@@ -31,7 +31,7 @@ use crate::iface::{AddIfaceError, Iface, IfaceHandle, IfaceIter, IfaceState, Med
 #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 use crate::neighbor::NeighborState;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-use crate::neighbor::{Answer as NeighborAnswer, Key as NeighborKey, NeighborCache, PendingQueue, ProbeEvent};
+use crate::neighbor::{Answer as NeighborAnswer, Key as NeighborKey, NeighborCache, ProbeEvent};
 use crate::pool::PoolRef;
 use crate::rand::Rand;
 #[cfg(feature = "_raw")]
@@ -91,8 +91,6 @@ pub(crate) struct StackInner {
     pub(crate) rand: Rand,
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     pub(crate) neighbor_cache: NeighborCache,
-    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    pending: PendingQueue,
     pub(crate) routes: Routes,
     #[cfg(feature = "ipv4-fragmentation")]
     pub(crate) ipv4_id: u16,
@@ -149,10 +147,7 @@ impl StackInner {
         #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
         let _ = handle;
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-        {
-            self.neighbor_cache.clear_iface(handle);
-            self.pending.purge_iface(handle);
-        }
+        self.neighbor_cache.clear_iface(handle);
     }
 }
 
@@ -166,6 +161,11 @@ pub(crate) enum Blocked {
     /// No packet buffer is free. Nothing signals when one is, so [`Stack::poll`]
     /// asks to be polled again after [`POOL_RETRY_DELAY`].
     NoBuffer,
+    /// The packet waits for a neighbor that is being resolved: it would be
+    /// parked, and the neighbor already holds a parked packet. A poll follows
+    /// when a resolution ends: a received frame, or the deadline of its timer.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    Neighbor,
 }
 
 impl Blocked {
@@ -178,6 +178,58 @@ impl Blocked {
         if self == Blocked::NoBuffer {
             clock.after(POOL_RETRY_DELAY);
         }
+    }
+}
+
+/// The outcome of handing a packet to the egress path. An error hands the
+/// packet back, with what it waits for.
+pub(crate) type TxResult = Result<(), (Blocked, PacketBuf)>;
+
+/// What the last send a UDP or raw socket refused waits for. [`Stack::poll`]
+/// wakes the socket's send waker once it is there.
+#[cfg(all(feature = "async", any(feature = "udp", feature = "_raw")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // which variants are made depends on the features
+pub(crate) enum TxWait {
+    /// Nothing: no send was refused, or the socket was woken since.
+    None,
+    /// Room for a new packet on this interface: in the device, and after the
+    /// fragments it is sending.
+    Iface(IfaceHandle),
+    /// Room for a parked packet on this neighbor: the one parked on it went
+    /// out, or its resolution ended.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    Neighbor(NeighborKey),
+}
+
+#[cfg(all(feature = "async", any(feature = "udp", feature = "_raw")))]
+impl TxWait {
+    /// What a packet the egress path handed back waits for. `route` is the way
+    /// it was going out.
+    #[allow(dead_code)] // only IP packets are handed back
+    pub(crate) fn blocked(blocked: Blocked, route: &EgressRoute) -> Self {
+        match blocked {
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            Blocked::Neighbor => TxWait::Neighbor((route.iface, route.next_hop)),
+            _ => TxWait::Iface(route.iface),
+        }
+    }
+
+    /// Check, at the end of a poll, whether what the socket waits for is there.
+    /// If so the wait is over, and the caller wakes the socket.
+    fn poll(&mut self, inner: &StackInner, ifaces: &mut Slab<IfaceState<'_>, IFACE_COUNT>) -> bool {
+        #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
+        let _ = inner;
+        let over = match *self {
+            TxWait::None => return false,
+            TxWait::Iface(iface) => ifaces.get_mut(iface.index()).can_transmit_new_packet().is_ok(),
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            TxWait::Neighbor(key) => !inner.neighbor_cache.has_parked(&key),
+        };
+        if over {
+            *self = TxWait::None;
+        }
+        over
     }
 }
 
@@ -448,6 +500,9 @@ impl TxContext<'_, '_> {
     ///
     /// `src_addr` and `dst_addr` must belong to the same address family, the packet
     /// is dropped otherwise.
+    ///
+    /// A packet that would have to wait and can't is handed back, with the IP
+    /// header on it. See [`StackInner::transmit_ip`].
     pub(crate) fn transmit_ip(
         &mut self,
         route: &EgressRoute,
@@ -456,7 +511,7 @@ impl TxContext<'_, '_> {
         dst_addr: IpAddr,
         next_header: IpProtocol,
         hop_limit: u8,
-    ) {
+    ) -> TxResult {
         let iface = self.ifaces.get_mut(route.iface.index());
         #[cfg(feature = "ipv4")]
         let checksum_caps = iface.checksum_caps();
@@ -474,10 +529,11 @@ impl TxContext<'_, '_> {
             #[allow(unreachable_patterns)]
             _ => {
                 debug!("cannot transmit, address family mismatch");
-                return;
+                return Ok(());
             }
         };
-        self.inner.transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype);
+        self.inner
+            .transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype)
     }
 
     /// Transmit a fully-built Ethernet frame on the given interface, as-is.
@@ -491,8 +547,10 @@ impl TxContext<'_, '_> {
     }
 
     /// Transmit a fully-built IP packet (IP header included, emitted as-is).
+    ///
+    /// A packet that would have to wait and can't is handed back unchanged.
     #[cfg(feature = "raw-ip")]
-    pub(crate) fn transmit_raw_ip(&mut self, route: &EgressRoute, buf: PacketBuf, dst_addr: IpAddr) {
+    pub(crate) fn transmit_raw_ip(&mut self, route: &EgressRoute, buf: PacketBuf, dst_addr: IpAddr) -> TxResult {
         let iface = self.ifaces.get_mut(route.iface.index());
         let ethertype = match dst_addr {
             #[cfg(feature = "ipv4")]
@@ -500,7 +558,8 @@ impl TxContext<'_, '_> {
             #[cfg(feature = "ipv6")]
             IpAddr::V6(_) => EthernetProtocol::Ipv6,
         };
-        self.inner.transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype);
+        self.inner
+            .transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype)
     }
 }
 
@@ -574,8 +633,6 @@ impl<'d> Stack<'d> {
                 rand,
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
-                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-                pending: PendingQueue::new(),
                 routes: Routes::new(),
                 #[cfg(feature = "ipv4-fragmentation")]
                 ipv4_id,
@@ -802,24 +859,21 @@ impl<'d> Stack<'d> {
     pub fn remove_iface(&mut self, handle: IfaceHandle) {
         self.ifaces.remove(handle.index());
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-        {
-            self.inner.neighbor_cache.clear_iface(handle);
-            self.inner.pending.purge_iface(handle);
-        }
+        self.inner.neighbor_cache.clear_iface(handle);
         self.inner.routes.purge_iface(handle);
         // Sockets waiting for room on the interface would wait forever. Their retry
         // routes again.
         #[cfg(all(feature = "async", feature = "udp"))]
         for (_, socket) in self.sockets.udp.iter_mut() {
-            if socket.tx_blocked_on == Some(handle) {
-                socket.tx_blocked_on = None;
+            if socket.tx_wait == TxWait::Iface(handle) {
+                socket.tx_wait = TxWait::None;
                 socket.tx_waker.wake();
             }
         }
         #[cfg(all(feature = "async", feature = "_raw"))]
         for (_, socket) in self.sockets.raw.iter_mut() {
-            if socket.tx_blocked_on == Some(handle) {
-                socket.tx_blocked_on = None;
+            if socket.tx_wait == TxWait::Iface(handle) {
+                socket.tx_wait = TxWait::None;
                 socket.tx_waker.wake();
             }
         }
@@ -1260,33 +1314,25 @@ impl<'d> Stack<'d> {
             }
         }
 
-        // Wake the sockets whose last send found the device busy, if it has room now.
-        // This comes after the poll's own egress above, which has first claim on the
-        // room. A device still full was just asked again, which arms its wakeup.
+        // Wake the sockets whose last send was refused, if what it waited for is
+        // there now: room in the device, or room to park on its neighbor. This comes
+        // after the poll's own egress above, which has first claim on both. A
+        // device still full was just asked again, which arms its wakeup.
         #[cfg(all(feature = "async", feature = "udp"))]
         for (_, socket) in self.sockets.udp.iter_mut() {
-            if let Some(iface) = socket.tx_blocked_on
-                && self.ifaces.get_mut(iface.index()).can_transmit_new_packet().is_ok()
-            {
-                socket.tx_blocked_on = None;
+            if socket.tx_wait.poll(&self.inner, &mut self.ifaces) {
                 socket.tx_waker.wake();
             }
         }
         #[cfg(all(feature = "async", feature = "_raw"))]
         for (_, socket) in self.sockets.raw.iter_mut() {
-            if let Some(iface) = socket.tx_blocked_on
-                && self.ifaces.get_mut(iface.index()).can_transmit_new_packet().is_ok()
-            {
-                socket.tx_blocked_on = None;
+            if socket.tx_wait.poll(&self.inner, &mut self.ifaces) {
                 socket.tx_waker.wake();
             }
         }
 
         // Expire again with the real clock.
         self.expire(&mut clock);
-
-        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-        self.inner.pending.purge_orphans(&self.inner.neighbor_cache);
 
         #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
         self.fragments.assembler.remove_expired(&mut clock);
@@ -2041,16 +2087,16 @@ impl<'d> Stack<'d> {
                         Err(blocked) => blocked.schedule_retry(clock),
                     }
                 }
-                ProbeEvent::Failed(addr) => {
-                    debug!("neighbor {} resolution failed, dropping queued packets", addr);
-                    // RFC 4861 §7.3.3: answer each packet queued on the failed
+                ProbeEvent::Failed(addr, parked) => {
+                    debug!("neighbor {} resolution failed, dropping the packet parked on it", addr);
+                    // RFC 4861 §7.3.3: answer the packet parked on the failed
                     // resolution with an ICMP destination unreachable error.
-                    #[cfg(feature = "icmp-errors")]
-                    while let Some(packet) = self.inner.pending.pop_matching(&(iface, addr)) {
-                        self.deliver_neighbor_failure_error(iface, packet.buf, now);
+                    if let Some(packet) = parked {
+                        #[cfg(feature = "icmp-errors")]
+                        self.deliver_neighbor_failure_error(iface, packet, now);
+                        #[cfg(not(feature = "icmp-errors"))]
+                        drop(packet);
                     }
-                    #[cfg(not(feature = "icmp-errors"))]
-                    while self.inner.pending.pop_matching(&(iface, addr)).is_some() {}
                 }
             }
         }
@@ -2269,6 +2315,9 @@ impl<'d> Stack<'d> {
     }
 
     /// Transmit a locally-generated reply, routed by [`route_reply`](Self::route_reply).
+    ///
+    /// Best-effort: a reply that would have to wait and can't is dropped. The
+    /// peer sends again what it answers.
     fn transmit_reply(
         &mut self,
         route: &EgressRoute,
@@ -2278,7 +2327,8 @@ impl<'d> Stack<'d> {
         next_header: IpProtocol,
         hop_limit: u8,
     ) {
-        self.tx_context()
+        let _ = self
+            .tx_context()
             .transmit_ip(route, buf, src_addr, dst_addr, next_header, hop_limit);
     }
 }
@@ -2541,33 +2591,18 @@ impl StackInner {
     ) {
         let key = (iface.handle, addr);
         self.neighbor_cache.fill(key, hardware_addr, now);
-        // This runs during ingress. What stays parked is retried later in the same
-        // poll, by `flush_resolved_pending`.
-        let _ = self.flush_pending(iface, &key, hardware_addr);
-    }
-
-    /// Transmit the packets parked on `key`, now resolved to `hardware_addr`, in
-    /// FIFO order, for as long as the interface takes them. The rest stay parked,
-    /// `flush_resolved_pending` retries them on the next `poll`, and the error
-    /// says what they wait for.
-    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn flush_pending(
-        &mut self,
-        iface: &mut IfaceState<'_>,
-        key: &NeighborKey,
-        hardware_addr: HardwareAddress,
-    ) -> Result<(), Blocked> {
-        while self.pending.has_matching(key) {
-            if let Err(blocked) = iface.can_transmit_new_packet() {
-                trace!("neighbor: interface has no room, {} stays parked", key.1);
-                return Err(blocked);
+        // This runs during ingress. If the interface has no room, the packet stays
+        // parked, and `flush_resolved_pending` retries it later in the same poll.
+        if self.neighbor_cache.has_parked(&key) {
+            if iface.can_transmit_new_packet().is_err() {
+                trace!("neighbor: interface has no room, {} stays parked", addr);
+                return;
             }
-            // NOTE(unwrap): checked by `has_matching` above.
-            let packet = unwrap!(self.pending.pop_matching(key));
-            trace!("neighbor: {} resolved, flushing queued packet", key.1);
-            self.transmit_link(iface, hardware_addr, packet.buf, packet.key.1);
+            // NOTE(unwrap): checked by `has_parked` above.
+            let buf = unwrap!(self.neighbor_cache.take_parked(&key));
+            trace!("neighbor: {} resolved, sending parked packet", addr);
+            self.transmit_link(iface, hardware_addr, buf, addr);
         }
-        Ok(())
     }
 
     /// Hand an IP packet whose next hop resolved to `hardware_addr` to the
@@ -2606,17 +2641,15 @@ impl StackInner {
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     pub(crate) fn flush_resolved_pending(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
         let mut cursor = 0;
-        while let Some((index, key)) = self.pending.next_on(iface.handle, cursor) {
-            match self.neighbor_cache.lookup(&key) {
-                NeighborAnswer::Found(hardware_addr) => {
-                    // Out of room. Everything else waits too.
-                    self.flush_pending(iface, &key, hardware_addr)?;
-                    // Every packet on `key` is gone, so what came after the one
-                    // at `index` is at `index` now.
-                    cursor = index;
-                }
-                _ => cursor = index + 1,
+        while let Some(index) = self.neighbor_cache.next_resolved_parked(iface.handle, cursor) {
+            if let Err(blocked) = iface.can_transmit_new_packet() {
+                trace!("neighbor: interface has no room, parked packets stay");
+                return Err(blocked);
             }
+            let (addr, hardware_addr, buf) = self.neighbor_cache.take_parked_at(index);
+            trace!("neighbor: {} resolved, sending parked packet", addr);
+            self.transmit_link(iface, hardware_addr, buf, addr);
+            cursor = index + 1;
         }
         Ok(())
     }
@@ -2751,7 +2784,8 @@ impl StackInner {
         dst_addr: Ipv6Addr,
     ) {
         push_ipv6_header(&mut buf, src_addr, dst_addr, IpProtocol::Icmpv6, 0xff);
-        self.transmit_ip(
+        // Best-effort: an advertisement that would have to wait is dropped.
+        let _ = self.transmit_ip(
             iface,
             IpAddr::V6(dst_addr),
             IpAddr::V6(dst_addr),
@@ -2775,14 +2809,6 @@ impl StackInner {
         self.pool.alloc().ok_or(Blocked::NoBuffer)
     }
 
-    /// Transmit a fully-built IP packet, resolving the destination hardware address
-    /// on Ethernet mediums.
-    ///
-    /// `next_hop` is the pre-routed address to resolve on the link, from an
-    /// [`EgressRoute`].
-    ///
-    /// If the neighbor is not resolved yet, the packet is queued in the interface's
-    /// pending queue and flushed when resolution completes.
     /// Transmit a fully-built UDP packet on a given interface as an IPv4 packet from
     /// `src_addr` to `dst_addr`, bypassing routing and source address checks.
     ///
@@ -2814,11 +2840,18 @@ impl StackInner {
                 .map(|route| route.via_router)
                 .unwrap_or(dst)
         };
-        self.transmit_ip(iface, dst, next_hop, buf, EthernetProtocol::Ipv4);
+        // A unicast one whose server is being resolved may be parked. If it
+        // can't, it is lost, and the client's timer sends the next.
+        let _ = self.transmit_ip(iface, dst, next_hop, buf, EthernetProtocol::Ipv4);
     }
 
     /// Transmit a fully-built IP packet on an interface, fragmenting it first if it
     /// is larger than the interface's MTU (IPv4 only).
+    ///
+    /// A packet whose neighbor is being resolved is parked on it. If the neighbor
+    /// already holds one, it is handed back unchanged, with what it waits for.
+    /// Packets the stack sends on its own drop it then, sockets hold their
+    /// caller back.
     pub(crate) fn transmit_ip(
         &mut self,
         iface: &mut IfaceState<'_>,
@@ -2826,13 +2859,13 @@ impl StackInner {
         next_hop: IpAddr,
         buf: PacketBuf,
         ethertype: EthernetProtocol,
-    ) {
+    ) -> TxResult {
         // The medium is IPv6-only. This comes first, so an IPv4 packet is never
         // fragmented for it.
         #[cfg(all(feature = "medium-ieee802154", feature = "ipv4"))]
         if iface.medium() == Medium::Ieee802154 && matches!(dst_addr, IpAddr::V4(_)) {
             debug!("dropping IPv4 packet routed to an IEEE 802.15.4 interface");
-            return;
+            return Ok(());
         }
 
         let total_ip_len = buf.len();
@@ -2851,7 +2884,7 @@ impl StackInner {
                     debug!("IPv6 fragmentation support is unimplemented. Dropping.");
                 }
             }
-            return;
+            return Ok(());
         }
 
         self.dispatch_ip(iface, dst_addr, next_hop, buf, ethertype)
@@ -2865,7 +2898,7 @@ impl StackInner {
         next_hop: IpAddr,
         buf: PacketBuf,
         ethertype: EthernetProtocol,
-    ) {
+    ) -> TxResult {
         #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
         let _ = (dst_addr, next_hop, ethertype);
         #[cfg(not(feature = "medium-ethernet"))]
@@ -2873,29 +2906,44 @@ impl StackInner {
 
         match iface.medium() {
             #[cfg(feature = "medium-ip")]
-            Medium::Ip => self.transmit_raw(iface, buf),
+            Medium::Ip => {
+                self.transmit_raw(iface, buf);
+                Ok(())
+            }
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
                 NeighborLookup::Found(hardware_addr) => {
-                    self.transmit_ethernet(iface, hardware_addr.ethernet_or_panic(), buf, ethertype)
+                    self.transmit_ethernet(iface, hardware_addr.ethernet_or_panic(), buf, ethertype);
+                    Ok(())
                 }
-                NeighborLookup::Pending { next_hop } => {
-                    debug!("neighbor {} pending, queing packet", next_hop);
-                    self.pending.push((iface.handle, next_hop), buf);
-                }
+                NeighborLookup::Pending { next_hop } => self.park((iface.handle, next_hop), buf),
             },
             #[cfg(feature = "medium-ieee802154")]
             Medium::Ieee802154 => {
                 // IPv4 was dropped by `transmit_ip`, which every packet passes.
                 match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
                     NeighborLookup::Found(hardware_addr) => {
-                        self.dispatch_ieee802154(iface, hardware_addr.ieee802154_or_panic(), buf)
+                        self.dispatch_ieee802154(iface, hardware_addr.ieee802154_or_panic(), buf);
+                        Ok(())
                     }
-                    NeighborLookup::Pending { next_hop } => {
-                        debug!("neighbor {} pending, queing packet", next_hop);
-                        self.pending.push((iface.handle, next_hop), buf);
-                    }
+                    NeighborLookup::Pending { next_hop } => self.park((iface.handle, next_hop), buf),
                 }
+            }
+        }
+    }
+
+    /// Park a packet on a neighbor that is being resolved, if it doesn't hold one
+    /// already. Nothing is ever dropped to make room.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    fn park(&mut self, key: NeighborKey, buf: PacketBuf) -> TxResult {
+        match self.neighbor_cache.park(&key, buf) {
+            Ok(()) => {
+                debug!("neighbor {} pending, parking packet", key.1);
+                Ok(())
+            }
+            Err(buf) => {
+                trace!("neighbor {} pending, and already holds a packet", key.1);
+                Err((Blocked::Neighbor, buf))
             }
         }
     }
@@ -5775,36 +5823,39 @@ pub(crate) mod test {
     #[test]
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4", feature = "udp"))]
     fn test_device_full_keeps_packets_parked() {
+        const OTHER_V4: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 3);
         let (mut stack, rx, tx, room) = test_stack_with_room(Medium::Ethernet);
         let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let other_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x03]);
         let udp = stack.add_udp_socket().unwrap();
         stack.udp_socket(udp).bind(5555, ListenSocketAddr::UNSPECIFIED).unwrap();
 
-        // Two datagrams park on the unresolved neighbor. Only the ARP request
-        // reaches the wire.
+        // Two datagrams park on two unresolved neighbors. Only the ARP requests
+        // reach the wire.
         room.set(Some(2));
         stack.udp_socket(udp).send_slice(b"one", (REMOTE_V4, 1000)).unwrap();
-        stack.udp_socket(udp).send_slice(b"two", (REMOTE_V4, 1000)).unwrap();
-        assert_eq!(tx.borrow().len(), 1);
-        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
+        stack.udp_socket(udp).send_slice(b"two", (OTHER_V4, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 2);
+        assert!(tx.borrow().iter().all(|f| ethertype_of(f) == EthernetProtocol::Arp));
 
-        // The neighbor resolves while the device is full: nothing is flushed and
-        // nothing is lost. (The ARP reply we owe is best-effort and is dropped.)
+        // The neighbors resolve while the device is full: nothing is flushed and
+        // nothing is lost. (The ARP replies we owe are best-effort and are dropped.)
         room.set(Some(0));
         inject(&mut stack, &rx, arp_request_from(remote_hw, REMOTE_V4));
-        assert_eq!(tx.borrow().len(), 1);
+        inject(&mut stack, &rx, arp_request_from(other_hw, OTHER_V4));
+        assert_eq!(tx.borrow().len(), 2);
 
-        // Room for one: the first parked datagram goes out, the second waits.
+        // Room for one: one parked datagram goes out, the other waits.
         room.set(Some(1));
         stack.poll(Instant::ZERO);
-        assert_eq!(tx.borrow().len(), 2);
-        assert_eq!(ethertype_of(&tx.borrow()[1]), EthernetProtocol::Ipv4);
-        assert!(tx.borrow()[1].ends_with(b"one"));
+        assert_eq!(tx.borrow().len(), 3);
+        assert_eq!(ethertype_of(&tx.borrow()[2]), EthernetProtocol::Ipv4);
+        assert!(tx.borrow()[2].ends_with(b"one"));
 
         room.set(None);
         stack.poll(Instant::ZERO);
-        assert_eq!(tx.borrow().len(), 3);
-        assert!(tx.borrow()[2].ends_with(b"two"));
+        assert_eq!(tx.borrow().len(), 4);
+        assert!(tx.borrow()[3].ends_with(b"two"));
     }
 
     /// TCP holds a segment back while the device is full, leaving the socket as
@@ -6345,7 +6396,14 @@ pub(crate) mod test {
 
                 let mut cx = stack.tx_context();
                 let route = cx.route(IfaceBinding::Any, &REMOTE_V4.into()).unwrap();
-                cx.transmit_ip(&route, buf, OUR_V4.into(), REMOTE_V4.into(), IpProtocol::Udp, 64);
+                let _ = cx.transmit_ip(
+                    &route,
+                    buf,
+                    OUR_V4.into(),
+                    REMOTE_V4.into(),
+                    IpProtocol::Udp,
+                    64,
+                );
 
                 let frames = tx.borrow();
                 assert!(!frames.is_empty(), "ip_packet_len: {}", ip_packet_len);
@@ -8396,7 +8454,6 @@ pub(crate) mod test {
     }
 
     /// How many of `frames` carry IPv4.
-    #[cfg(feature = "multicast")]
     fn ipv4_frames(frames: &Sent) -> usize {
         frames
             .borrow()
@@ -8489,5 +8546,112 @@ pub(crate) mod test {
         room.set(None);
         assert_eq!(stack.poll(t), idle_deadline(t));
         assert_eq!(ipv4_frames(&tx), 1);
+    }
+
+    /// A neighbor being resolved holds one parked packet, and nothing is dropped
+    /// to make room. A socket whose packet finds it taken is held back, and its
+    /// packet goes once the resolution ends. Other neighbors park theirs.
+    #[test]
+    fn test_neighbor_holds_sockets_back() {
+        static POOL: SmallPool<16> = crate::StaticPool::new();
+        let (mut stack, rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        let key = (IfaceHandle::new(0), REMOTE_V4.into());
+
+        stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        assert!(stack.inner.neighbor_cache.has_parked(&key));
+        assert_eq!(
+            stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)),
+            Err(crate::udp::SendError::DeviceBusy)
+        );
+        assert_eq!(tx.borrow().len(), 1, "one ARP request");
+
+        #[cfg(feature = "async")]
+        let wakes = {
+            let (wakes, waker) = WakeCount::new();
+            stack.udp_socket(udp).register_send_waker(&waker);
+            stack.poll(Instant::ZERO);
+            assert_eq!(wakes.take(), 0);
+            wakes
+        };
+
+        // Another neighbor has a slot of its own.
+        let other = Ipv4Addr::new(192, 168, 1, 100);
+        let udp2 = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp2).bind(1001, ListenSocketAddr::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp2).send_slice(b"hi", (other, 1000)).unwrap();
+        assert!(
+            stack
+                .inner
+                .neighbor_cache
+                .has_parked(&(IfaceHandle::new(0), other.into()))
+        );
+        tx.borrow_mut().clear();
+
+        // A TCP connection to the first neighbor: its SYN is held back too, not
+        // built and dropped.
+        let tcp = stack
+            .add_tcp_socket_with_bufs(vec![0; 1024].leak(), vec![0; 1024].leak())
+            .unwrap();
+        stack
+            .tcp_socket(tcp)
+            .connect(SocketAddr::new(REMOTE_V4.into(), 80), 50000u16)
+            .unwrap();
+        stack.poll(Instant::ZERO);
+        assert_eq!(tx.borrow().len(), 0);
+        assert_eq!(stack.tcp_socket(tcp).state(), TcpState::SynSent);
+
+        // The neighbor answers: the parked datagram goes out, then the SYN, in the
+        // same poll, and the socket is woken to send its second.
+        inject(&mut stack, &rx, arp_request_from(OTHER_HW, REMOTE_V4));
+        assert_eq!(ipv4_frames(&tx), 2);
+        assert!(!stack.inner.neighbor_cache.has_parked(&key));
+        #[cfg(feature = "async")]
+        assert_eq!(wakes.take(), 1);
+        stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(ipv4_frames(&tx), 3);
+    }
+
+    /// Replies to neighbors that never answer each park on their own neighbor,
+    /// and leave the others to the sockets.
+    #[test]
+    #[cfg(feature = "icmp-ping-reply")]
+    fn test_replies_park_on_their_neighbor() {
+        static POOL: SmallPool<16> = crate::StaticPool::new();
+        let (mut stack, rx, _tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+
+        // Pings from on-link addresses. Their replies wait for those to be
+        // resolved.
+        for host in 0..4 {
+            let src = Ipv4Addr::new(192, 168, 1, 100 + host);
+            let echo = icmpv4_echo(Icmpv4Message::EchoRequest, 1, 1, b"ping");
+            inject(
+                &mut stack,
+                &rx,
+                eth_frame_from(
+                    OTHER_HW,
+                    OUR_HW,
+                    EthernetProtocol::Ipv4,
+                    &ipv4_packet(src, OUR_V4, IpProtocol::Icmp, &echo),
+                ),
+            );
+            assert!(
+                stack
+                    .inner
+                    .neighbor_cache
+                    .has_parked(&(IfaceHandle::new(0), src.into()))
+            );
+        }
+
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        assert!(
+            stack
+                .inner
+                .neighbor_cache
+                .has_parked(&(IfaceHandle::new(0), REMOTE_V4.into()))
+        );
     }
 }

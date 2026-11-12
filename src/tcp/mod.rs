@@ -2392,7 +2392,9 @@ pub(crate) fn process_icmp_error(
 /// Transmit a TCP packet. Passed as the closure to [`dispatch`](TcpSocketState::dispatch).
 ///
 /// A segment the device has no room for, or no packet buffer is free for, is held
-/// back: `dispatch` stops, and the socket is left as if it had never tried.
+/// back: `dispatch` stops, and the socket is left as if it had never tried. So
+/// is one whose neighbor is being resolved, and already holds a packet waiting
+/// for that.
 pub(crate) fn transmit(
     cx: &mut TxContext<'_, '_>,
     route: Option<EgressRoute>,
@@ -2420,8 +2422,18 @@ pub(crate) fn transmit(
         trace!("no packet buffer for segment to {}, holding it back", dst_addr);
         return Err(Blocked::NoBuffer);
     };
-    cx.transmit_ip(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit);
-    Ok(())
+    cx.transmit_ip(
+        &route,
+        buf,
+        src_addr,
+        dst_addr,
+        IpProtocol::Tcp,
+        hop_limit,
+    )
+    .map_err(|(blocked, _)| {
+        trace!("segment to {} would have to wait and can't, holding it back", dst_addr);
+        blocked
+    })
 }
 
 /// A Transmission Control Protocol socket, borrowed from a [`Stack`] by

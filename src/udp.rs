@@ -17,7 +17,9 @@ use crate::driver::PacketMeta;
 use crate::error::IcmpError;
 use crate::error::InvalidHopLimit;
 use crate::iface::IfaceHandle;
-use crate::stack::{EgressRoute, IfaceBinding, Stack, TxContext, addr_score, alloc_ephemeral_port};
+#[cfg(feature = "async")]
+use crate::stack::TxWait;
+use crate::stack::{Blocked, EgressRoute, IfaceBinding, Stack, TxContext, addr_score, alloc_ephemeral_port};
 use crate::storage::Slab;
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -114,10 +116,12 @@ pub enum SendError {
     ///
     /// Retry later. Note the socket's send waker is **not** woken when a buffer is freed.
     NoBuffer,
-    /// The interface the packet would go out of has no room for it right now.
+    /// The interface the packet would go out of has no room for it right now. Or
+    /// its neighbor is being resolved, and already holds a packet waiting for
+    /// that.
     ///
-    /// Retry once it has room. With the `async` feature, the socket's send
-    /// waker is woken when room becomes available.
+    /// Retry once there is room. With the `async` feature, a [`Stack::poll`]
+    /// wakes the socket's send waker then.
     DeviceBusy,
 }
 
@@ -134,6 +138,16 @@ impl fmt::Display for SendError {
 }
 
 impl core::error::Error for SendError {}
+
+impl SendError {
+    /// The error for a datagram the egress path handed back.
+    fn from_blocked(blocked: Blocked) -> Self {
+        match blocked {
+            Blocked::NoBuffer => SendError::NoBuffer,
+            _ => SendError::DeviceBusy,
+        }
+    }
+}
 
 /// Error returned by [`UdpSocket::recv`] and the peek methods.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -197,10 +211,10 @@ pub(crate) struct UdpSocketState {
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
     pub(crate) tx_waker: WakerRegistration,
-    /// The interface the last send found busy. `Stack::poll` wakes `tx_waker` once
-    /// it has room.
+    /// What the last refused send waits for. `Stack::poll` wakes `tx_waker` once
+    /// it is there.
     #[cfg(feature = "async")]
-    pub(crate) tx_blocked_on: Option<IfaceHandle>,
+    pub(crate) tx_wait: TxWait,
 }
 
 impl UdpSocketState {
@@ -219,7 +233,7 @@ impl UdpSocketState {
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
-            tx_blocked_on: None,
+            tx_wait: TxWait::None,
         }
     }
 
@@ -603,7 +617,7 @@ impl UdpSocket<'_, '_> {
         // Wake the tasks waiting, so they can notice the socket is closed.
         #[cfg(feature = "async")]
         {
-            state.tx_blocked_on = None;
+            state.tx_wait = TxWait::None;
             state.rx_waker.wake();
             state.tx_waker.wake();
         }
@@ -638,7 +652,9 @@ impl UdpSocket<'_, '_> {
     /// The waker is woken on state changes that might affect the return value of
     /// `send` calls, such as:
     /// - the socket is bound or closed.
-    /// - A send failed with [`SendError::DeviceBusy`] and the driver becomes no longer busy.
+    /// - A send failed with [`SendError::DeviceBusy`], and there is room for the
+    ///   datagram now. The waker is woken by a later [`Stack::poll`], not when
+    ///   the room appears.
     ///
     /// It is not woken when a packet buffer is freed after
     /// [`SendError::NoBuffer`]. Retry that on your own.
@@ -806,7 +822,10 @@ impl UdpSocket<'_, '_> {
     /// - `BufferFull`: if the payload cannot fit in a packet buffer.
     /// - `NoBuffer`: if every packet buffer is in use.
     /// - `DeviceBusy`: if the interface the datagram would go out of has no room
-    ///   for it right now.
+    ///   for it right now. Also if its neighbor is being resolved, and already
+    ///   holds a packet waiting for that.
+    ///
+    /// `NoBuffer` and `DeviceBusy` send nothing. Try again later.
     pub fn send_with(
         &mut self,
         max_size: usize,
@@ -817,8 +836,7 @@ impl UdpSocket<'_, '_> {
         let size = f(&mut buf);
         assert!(size <= max_size);
         buf.set_len(size);
-        self.transmit_datagram(egress, buf);
-        Ok(())
+        self.transmit_datagram(egress, buf).map_err(|(err, _)| err)
     }
 
     /// Allocate an empty UDP payload buffer with headroom for the headers.
@@ -850,8 +868,9 @@ impl UdpSocket<'_, '_> {
     /// packet metadata come from `meta`, as in [`send_with`](Self::send_with),
     /// replacing the buffer's metadata.
     ///
-    /// Errors return the buffer unchanged. Errors match [`send_with`](Self::send_with),
-    /// except this method allocates no payload buffer and never returns [`SendError::NoBuffer`].
+    /// Errors return the buffer, with its payload and metadata unchanged. Errors
+    /// match [`send_with`](Self::send_with), except this method allocates no
+    /// payload buffer and never returns [`SendError::NoBuffer`].
     /// Success transfers ownership to the stack; it does not guarantee delivery.
     pub fn send_packet(&mut self, buf: PacketBuf, meta: impl Into<UdpMetadata>) -> Result<(), (SendError, PacketBuf)> {
         self.send_packet_meta(buf, meta.into())
@@ -867,6 +886,7 @@ impl UdpSocket<'_, '_> {
         if !buf.ensure_headroom(send_headroom(route.ip_headroom, meta.remote_addr.addr.version())) {
             return Err((SendError::BufferFull, buf));
         }
+        let old_meta = buf.meta();
         buf.set_meta(meta.meta);
         let egress = DatagramEgress {
             route,
@@ -874,8 +894,10 @@ impl UdpSocket<'_, '_> {
             dst: meta.remote_addr,
             hop_limit,
         };
-        self.transmit_datagram(egress, buf);
-        Ok(())
+        self.transmit_datagram(egress, buf).map_err(|(err, mut buf)| {
+            buf.set_meta(old_meta);
+            (err, buf)
+        })
     }
 
     /// Check and route a datagram to send, and allocate its packet buffer, with
@@ -979,7 +1001,7 @@ impl UdpSocket<'_, '_> {
             // `Stack::poll` wakes the socket once the interface has room.
             #[cfg(feature = "async")]
             {
-                self.inner_mut().tx_blocked_on = Some(route.iface);
+                self.inner_mut().tx_wait = TxWait::Iface(route.iface);
             }
             return Err(SendError::DeviceBusy);
         }
@@ -988,7 +1010,10 @@ impl UdpSocket<'_, '_> {
     }
 
     /// Prepend the UDP header to a datagram's payload and send it.
-    fn transmit_datagram(&mut self, egress: DatagramEgress, mut buf: PacketBuf) {
+    ///
+    /// A datagram that would have to wait inside the stack and can't is handed
+    /// back, with only its payload in the buffer again.
+    fn transmit_datagram(&mut self, egress: DatagramEgress, mut buf: PacketBuf) -> Result<(), (SendError, PacketBuf)> {
         let DatagramEgress {
             route,
             src,
@@ -1013,8 +1038,32 @@ impl UdpSocket<'_, '_> {
 
         trace!("udp:{}:{}: sending {} octets", src, dst, size);
 
-        self.tx
-            .transmit_ip(&route, buf, src.addr, dst.addr, IpProtocol::Udp, hop_limit);
+        let (blocked, mut buf) = match self.tx.transmit_ip(
+            &route,
+            buf,
+            src.addr,
+            dst.addr,
+            IpProtocol::Udp,
+            hop_limit,
+        ) {
+            Ok(()) => {
+                // Whatever an earlier send waited for, the socket doesn't any more.
+                #[cfg(feature = "async")]
+                {
+                    self.inner_mut().tx_wait = TxWait::None;
+                }
+                return Ok(());
+            }
+            Err(refused) => refused,
+        };
+        // Take the headers off again.
+        buf.pull_front(send_headroom(0, dst.addr.version()));
+        // `Stack::poll` wakes the socket once the datagram can go.
+        #[cfg(feature = "async")]
+        {
+            self.inner_mut().tx_wait = TxWait::blocked(blocked, &route);
+        }
+        Err((SendError::from_blocked(blocked), buf))
     }
 }
 

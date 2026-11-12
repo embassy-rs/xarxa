@@ -205,7 +205,8 @@ impl StackInner {
         if !more_frags {
             iface.fragmenter = Fragmenter::Idle;
         }
-        self.dispatch_ip(iface, dst_addr, next_hop, tx_buffer, EthernetProtocol::Ipv4);
+        // A fragment its neighbor can't park is lost.
+        let _ = self.dispatch_ip(iface, dst_addr, next_hop, tx_buffer, EthernetProtocol::Ipv4);
     }
 }
 

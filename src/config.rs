@@ -76,16 +76,11 @@ pub const SIXLOWPAN_ADDRESS_CONTEXT_COUNT: usize = raw::SIXLOWPAN_ADDRESS_CONTEX
 /// The cache holds the hardware address of each neighbor, learned from ARP or
 /// NDISC. When it is full, learning a neighbor evicts another one.
 ///
+/// Each entry also holds one packet for its neighbor while it is resolved, so
+/// this bounds the packets waiting for resolution too.
+///
 /// This is a limit with and without `alloc`. Default: 8.
 pub const NEIGHBOR_CACHE_COUNT: usize = raw::NEIGHBOR_CACHE_COUNT;
-
-/// Max packets in the "pending neighbor" queue.
-///
-/// When sending packets to an unresolved neighbor, they get parked in
-/// this queue temporarily while ARP or NDISC resolves.
-///
-/// This is a limit with and without `alloc`. Default: 16.
-pub const PENDING_QUEUE_COUNT: usize = raw::PENDING_QUEUE_COUNT;
 
 /// TX timestamps queued per stack with `packetmeta-timestamp`.
 ///

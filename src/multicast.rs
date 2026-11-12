@@ -433,7 +433,8 @@ impl IfaceState<'_> {
             ),
             Err(_) => return,
         };
-        inner.transmit_ip(self, dst_addr, dst_addr, buf, ethertype);
+        // Multicast goes straight to the device.
+        let _ = inner.transmit_ip(self, dst_addr, dst_addr, buf, ethertype);
     }
 
     /// Host duties of the **IGMPv2** protocol.

@@ -20,6 +20,10 @@ use crate::iface::IfaceHandle;
 #[cfg(feature = "raw-ethernet")]
 use crate::iface::Medium;
 use crate::pool::PoolRef;
+#[cfg(feature = "raw-ip")]
+use crate::stack::Blocked;
+#[cfg(feature = "async")]
+use crate::stack::TxWait;
 use crate::stack::{IfaceBinding, Stack, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -106,10 +110,12 @@ pub enum SendError {
     ///
     /// Retry later. Note the socket's send waker is **not** woken when a buffer is freed.
     NoBuffer,
-    /// The interface the packet would go out of has no room for it right now.
+    /// The interface the packet would go out of has no room for it right now. Or
+    /// its neighbor is being resolved, and already holds a packet waiting for
+    /// that.
     ///
-    /// Retry once it has room. With the `async` feature, the socket's send
-    /// waker is woken when room becomes available.
+    /// Retry once there is room. With the `async` feature, a [`Stack::poll`]
+    /// wakes the socket's send waker then.
     DeviceBusy,
     /// The packet fails basic validation (too short for an Ethernet header in
     /// Ethernet mode, malformed IP header in IP mode), or does not match the
@@ -131,6 +137,17 @@ impl fmt::Display for SendError {
 }
 
 impl core::error::Error for SendError {}
+
+#[cfg(feature = "raw-ip")]
+impl SendError {
+    /// The error for a packet the egress path handed back.
+    fn from_blocked(blocked: Blocked) -> Self {
+        match blocked {
+            Blocked::NoBuffer => SendError::NoBuffer,
+            _ => SendError::DeviceBusy,
+        }
+    }
+}
 
 /// Error returned by [`RawSocket::recv`] and the peek methods.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -168,10 +185,10 @@ pub(crate) struct RawSocketState {
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
     pub(crate) tx_waker: WakerRegistration,
-    /// The interface the last send found busy. `Stack::poll` wakes `tx_waker` once
-    /// it has room.
+    /// What the last refused send waits for. `Stack::poll` wakes `tx_waker` once
+    /// it is there.
     #[cfg(feature = "async")]
-    pub(crate) tx_blocked_on: Option<IfaceHandle>,
+    pub(crate) tx_wait: TxWait,
 }
 
 impl RawSocketState {
@@ -186,7 +203,7 @@ impl RawSocketState {
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
-            tx_blocked_on: None,
+            tx_wait: TxWait::None,
         }
     }
 
@@ -325,7 +342,7 @@ impl RawSocket<'_, '_> {
         // Wake the tasks waiting, so they can notice the socket is closed.
         #[cfg(feature = "async")]
         {
-            self.state.tx_blocked_on = None;
+            self.state.tx_wait = TxWait::None;
             self.state.rx_waker.wake();
             self.state.tx_waker.wake();
         }
@@ -360,7 +377,9 @@ impl RawSocket<'_, '_> {
     /// The waker is woken on state changes that might affect the return value of
     /// `send` calls, such as:
     /// - the socket is bound or closed.
-    /// - A send failed with [`SendError::DeviceBusy`] and the driver becomes no longer busy.
+    /// - A send failed with [`SendError::DeviceBusy`], and there is room for the
+    ///   packet now. The waker is woken by a later [`Stack::poll`], not when the
+    ///   room appears.
     ///
     /// It is not woken when a packet buffer is freed after
     /// [`SendError::NoBuffer`]. Retry that on your own.
@@ -497,7 +516,10 @@ impl RawSocket<'_, '_> {
     /// - `BufferFull`: if the packet cannot fit in a packet buffer.
     /// - `NoBuffer`: if every packet buffer is in use.
     /// - `DeviceBusy`: if the interface the packet would go out of has no room
-    ///   for it right now.
+    ///   for it right now. Also if the neighbor of an IP packet is being
+    ///   resolved, and already holds a packet waiting for that.
+    ///
+    /// `NoBuffer` and `DeviceBusy` send nothing. Try again later.
     ///
     /// # Panics
     /// Panics if the socket is bound to an interface that has been removed.
@@ -559,6 +581,7 @@ impl RawSocket<'_, '_> {
             check_ethernet(&mut buf, ethertype)?;
             trace!("raw: sending {} octet frame", buf.len());
             self.tx.transmit_ethernet(iface, buf);
+            self.send_done();
             return Ok(());
         }
         self.send_packet(buf).map_err(|(err, _)| err)
@@ -588,12 +611,21 @@ impl RawSocket<'_, '_> {
         Ok(iface)
     }
 
+    /// A send went through: whatever an earlier one waited for, the socket
+    /// doesn't any more.
+    fn send_done(&mut self) {
+        #[cfg(feature = "async")]
+        {
+            self.state.tx_wait = TxWait::None;
+        }
+    }
+
     fn check_send_ready(&mut self, iface: IfaceHandle) -> Result<(), SendError> {
         if self.tx.can_transmit(iface).is_err() {
             // Stack::poll wakes this socket when the interface has room.
             #[cfg(feature = "async")]
             {
-                self.state.tx_blocked_on = Some(iface);
+                self.state.tx_wait = TxWait::Iface(iface);
             }
             return Err(SendError::DeviceBusy);
         }
@@ -629,7 +661,7 @@ impl RawSocket<'_, '_> {
     /// [`send_headroom`](Self::send_headroom) to avoid moving it.
     ///
     /// Errors return the buffer unchanged. Errors match [`send_with`](Self::send_with),
-    /// except this method allocates no payload buffer and never returns [`SendError::NoBuffer`].
+    /// except this method allocates no buffer and never returns [`SendError::NoBuffer`].
     /// Success transfers ownership to the stack; it does not guarantee delivery.
     pub fn send_packet(&mut self, mut buf: PacketBuf) -> Result<(), (SendError, PacketBuf)> {
         let Some(mode) = self.state.mode else {
@@ -650,6 +682,7 @@ impl RawSocket<'_, '_> {
                 }
                 trace!("raw: sending {} octet frame", buf.len());
                 self.tx.transmit_ethernet(iface, buf);
+                self.send_done();
                 Ok(())
             }
             #[cfg(feature = "raw-ip")]
@@ -675,8 +708,20 @@ impl RawSocket<'_, '_> {
                     return Err((SendError::BufferFull, buf));
                 }
                 trace!("raw: sending {} octets to {}", buf.len(), dst_addr);
-                self.tx.transmit_raw_ip(&route, buf, dst_addr);
-                Ok(())
+                match self.tx.transmit_raw_ip(&route, buf, dst_addr) {
+                    Ok(()) => {
+                        self.send_done();
+                        Ok(())
+                    }
+                    Err((blocked, buf)) => {
+                        // `Stack::poll` wakes the socket once the packet can go.
+                        #[cfg(feature = "async")]
+                        {
+                            self.state.tx_wait = TxWait::blocked(blocked, &route);
+                        }
+                        Err((SendError::from_blocked(blocked), buf))
+                    }
+                }
             }
         }
     }

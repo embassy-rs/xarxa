@@ -18,7 +18,7 @@ use crate::driver::{PacketBuf, RawPacketBuf};
 
 /// Packet pool trait.
 ///
-/// You mist likely don't want to implement this trait, instead use one of the ready-made
+/// You most likely don't want to implement this trait, instead use one of the ready-made
 /// implementations provided by this crate:
 /// - [`StaticPool`]: a fixed number of buffers, in a `static`. Needs no heap.
 /// - `AllocPool`: buffers allocated from the heap, up to a limit. Needs the

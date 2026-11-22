@@ -67,6 +67,50 @@ open_enum! {
     }
 }
 
+/// The [scope] of an IPv6 multicast group: its `scop` field. Unicast addresses
+/// are given a scope by [RFC 6724 §3.1]: link-local for fe80::/10 and the
+/// loopback address, global for the rest.
+///
+/// [scope]: https://www.rfc-editor.org/rfc/rfc4291#section-2.7
+/// [RFC 6724 §3.1]: https://www.rfc-editor.org/rfc/rfc6724#section-3.1
+#[allow(dead_code)] // which ones are used depends on the features
+pub(crate) mod scope {
+    /// Interface-local: never leaves the node (ff01::/16). Scope 0 (ff00::/16)
+    /// is reserved, and below it.
+    pub(crate) const INTERFACE_LOCAL: u8 = 0x1;
+    /// Link-local.
+    pub(crate) const LINK_LOCAL: u8 = 0x2;
+    /// Global.
+    pub(crate) const GLOBAL: u8 = 0xE;
+}
+
+/// What an address is, by its value alone. The one classifier every address
+/// check is built on.
+///
+/// What the stack knows on top (which addresses are ours, which are the
+/// broadcast addresses of our subnets) is the stack's to add: see
+/// `Stack::is_own_or_broadcast`.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // which ones are made depends on the IP versions
+pub(crate) enum AddrClass {
+    /// `0.0.0.0` or `::`: no address at all. Only a source, of a host that has
+    /// no address yet (DHCP, DAD).
+    Unspecified,
+    /// `127.0.0.0/8` or `::1`. Never seen on a link.
+    Loopback,
+    /// The rest of `0.0.0.0/8` ("this network") and of `240.0.0.0/4`
+    /// (reserved). Never valid on a link either.
+    Martian,
+    /// `255.255.255.255`, the limited broadcast address.
+    Broadcast,
+    /// A multicast group, with its [`scope`]. IPv4 groups have no scope field,
+    /// and are given the global one.
+    Multicast(u8),
+    /// A unicast address, with its [`scope`]. All IPv4 ones are global.
+    Unicast(u8),
+}
+
 /// An internetworking address.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
@@ -103,14 +147,25 @@ impl Address {
         }
     }
 
-    /// Query whether the address is a valid unicast address.
-    pub fn is_unicast(&self) -> bool {
+    /// Classify the address. See [`AddrClass`].
+    pub(crate) fn class(&self) -> AddrClass {
         match self {
             #[cfg(feature = "ipv4")]
-            Address::V4(addr) => addr.x_is_unicast(),
+            Address::V4(addr) => addr.x_class(),
             #[cfg(feature = "ipv6")]
-            Address::V6(addr) => addr.x_is_unicast(),
+            Address::V6(addr) => addr.x_class(),
         }
+    }
+
+    /// Query whether the address is a valid unicast address: one that can name a
+    /// host on a link. Loopback addresses, `0.0.0.0/8` and `240.0.0.0/4` are not.
+    pub fn is_unicast(&self) -> bool {
+        matches!(self.class(), AddrClass::Unicast(_))
+    }
+
+    /// Query whether the address is a loopback address: `127.0.0.0/8` or `::1`.
+    pub fn is_loopback(&self) -> bool {
+        self.class() == AddrClass::Loopback
     }
 
     /// Query whether the address is a valid multicast address.

@@ -134,6 +134,12 @@ icmp-ping-reply = []
 ## Bind sockets to an interface with `bind_to_iface`. A bound socket only
 ## receives packets that arrive on that interface, and only sends out of it.
 iface-bind = []
+## Deliver packets to the stack's own addresses locally, instead of refusing to
+## send them: the loopback addresses (`127.0.0.0/8`, `::1`) and the addresses
+## assigned to the interfaces. They are received at the next `Stack::poll`, as
+## if they had arrived on an interface: the one the sending socket is bound to,
+## else the first one. So the stack needs at least one interface for it.
+loopback = []
 ## Deliver incoming ICMP error messages (destination unreachable, packet too big, ...) to
 ## the sockets that provoked them.
 icmp-errors = []
@@ -268,6 +274,18 @@ tx-timestamp-queue-count-8 = []
 tx-timestamp-queue-count-16 = []
 tx-timestamp-queue-count-32 = []
 tx-timestamp-queue-count-64 = []
+
+loopback-queue-count-1 = []
+loopback-queue-count-2 = []
+loopback-queue-count-3 = []
+loopback-queue-count-4 = [] # Default
+loopback-queue-count-5 = []
+loopback-queue-count-6 = []
+loopback-queue-count-7 = []
+loopback-queue-count-8 = []
+loopback-queue-count-16 = []
+loopback-queue-count-32 = []
+loopback-queue-count-64 = []
 
 udp-socket-count-1 = []
 udp-socket-count-2 = []

@@ -2346,6 +2346,9 @@ impl<'d> TcpSocketState<'d> {
             );
             None
         };
+        // A loopback address is ours, but only to talk to ourselves.
+        #[cfg(feature = "loopback")]
+        let route = route.filter(|route| route.loopback || !tuple.local.addr.is_loopback());
         if let Some(route) = &route {
             self.ip_mtu = route.ip_mtu;
         } else {
@@ -2774,7 +2777,7 @@ pub(crate) fn transmit(
         debug!("no route to {}, dropping packet", dst_addr);
         return Ok(());
     };
-    if let Err(blocked) = cx.can_transmit(route.iface) {
+    if let Err(blocked) = cx.can_transmit_route(&route) {
         trace!("interface has no room for segment to {}, holding it back", dst_addr);
         return Err(blocked);
     }
@@ -2784,7 +2787,7 @@ pub(crate) fn transmit(
         &repr,
         &src_addr,
         &dst_addr,
-        &cx.checksum_caps(route.iface),
+        &cx.checksum_caps(&route),
     ) else {
         trace!("no packet buffer for segment to {}, holding it back", dst_addr);
         return Err(Blocked::NoBuffer);
@@ -3075,9 +3078,11 @@ impl<'d> TcpSocket<'_, 'd> {
     ///   [is_open](#method.is_open)), including in `TIME-WAIT` and while it
     ///   owes a reset.
     /// - `Unaddressable`: if the remote port is zero, the remote address is
-    ///   unspecified, there is no route to the remote address, the interface
-    ///   the route goes out of has no address to send from, or `local` is an
-    ///   unspecified address of the other IP version.
+    ///   not a host's (unspecified, multicast, a broadcast address, or one that
+    ///   never leaves the host: a loopback address or one of ours, unless the
+    ///   `loopback` feature is on), there is no route to the remote address,
+    ///   the interface the route goes out of has no address to send from, or
+    ///   `local` is an unspecified address of the other IP version.
     /// - `NoFreePorts`: if the ephemeral range is exhausted.
     /// - `InUse`: if another TCP socket already holds the identical 4-tuple.
     pub fn connect(
@@ -3091,7 +3096,9 @@ impl<'d> TcpSocket<'_, 'd> {
         if self.is_open() {
             return Err(ConnectError::InvalidState);
         }
-        if remote.port == 0 || remote.addr.is_unspecified() {
+        // The remote must be a host: not unspecified, a group, a broadcast
+        // address, or an address that never leaves the host.
+        if remote.port == 0 || !self.tx.is_remote_host(&remote.addr) {
             return Err(ConnectError::Unaddressable);
         }
 
@@ -3564,7 +3571,9 @@ mod test {
     use crate::stack::Stack;
     use crate::test_device::TestDevice;
     use crate::time::{MAX_POLL_DELAY, idle_deadline};
-    use crate::wire::{HardwareAddress, IpCidr, Ipv4Addr, Ipv6Addr};
+    #[cfg(feature = "tcp-listener")]
+    use crate::wire::Ipv4Addr;
+    use crate::wire::{HardwareAddress, IpCidr, Ipv6Addr};
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
 
@@ -3821,10 +3830,7 @@ mod test {
         let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
-            .set_ip_addrs([
-                IpCidr::new(LOCAL_ADDR.into(), 24),
-                IpCidr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8),
-            ])
+            .set_ip_addrs([IpCidr::new(LOCAL_ADDR.into(), 24)])
             .unwrap();
         stack
     }

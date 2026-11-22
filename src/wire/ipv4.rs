@@ -2,7 +2,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
 use crate::error::Malformed;
-use crate::wire::ip::checksum;
+use crate::wire::ip::{AddrClass, checksum, scope};
 
 pub use super::IpProtocol as Protocol;
 
@@ -39,7 +39,12 @@ pub const MULTICAST_ALL_ROUTERS: Address = Address::new(224, 0, 0, 2);
 pub use core::net::Ipv4Addr as Address;
 
 pub(crate) trait AddressExt {
-    /// Query whether the address is an unicast address.
+    /// Classify the address. See [`AddrClass`](crate::wire::ip::AddrClass).
+    fn x_class(&self) -> AddrClass;
+
+    /// Query whether the address is an unicast address: of class
+    /// [`Unicast`](AddrClass::Unicast), so not loopback, `0.0.0.0/8` or
+    /// `240.0.0.0/4` either.
     ///
     /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
     fn x_is_unicast(&self) -> bool;
@@ -60,9 +65,19 @@ pub(crate) trait AddressExt {
 }
 
 impl AddressExt for Address {
-    /// Query whether the address is an unicast address.
+    fn x_class(&self) -> AddrClass {
+        match self.octets()[0] {
+            0 if self.is_unspecified() => AddrClass::Unspecified,
+            127 => AddrClass::Loopback,
+            224..=239 => AddrClass::Multicast(scope::GLOBAL),
+            _ if self.is_broadcast() => AddrClass::Broadcast,
+            0 | 240..=255 => AddrClass::Martian,
+            _ => AddrClass::Unicast(scope::GLOBAL),
+        }
+    }
+
     fn x_is_unicast(&self) -> bool {
-        !(self.is_broadcast() || self.is_multicast() || self.is_unspecified())
+        matches!(self.x_class(), AddrClass::Unicast(_))
     }
 
     #[cfg(feature = "medium-ethernet")]
@@ -611,6 +626,34 @@ pub(crate) mod test {
         assert!(!Address::BROADCAST.is_multicast());
         assert!(!Address::BROADCAST.is_link_local());
         assert!(!Address::BROADCAST.is_loopback());
+    }
+
+    #[test]
+    fn test_class() {
+        use crate::wire::ip::{AddrClass, scope};
+        let class = |a, b, c, d| Address::new(a, b, c, d).x_class();
+        assert_eq!(class(0, 0, 0, 0), AddrClass::Unspecified);
+        assert_eq!(class(0, 1, 2, 3), AddrClass::Martian);
+        assert_eq!(class(127, 0, 0, 1), AddrClass::Loopback);
+        assert_eq!(class(127, 255, 255, 255), AddrClass::Loopback);
+        assert_eq!(class(224, 0, 0, 1), AddrClass::Multicast(scope::GLOBAL));
+        assert_eq!(class(239, 255, 255, 255), AddrClass::Multicast(scope::GLOBAL));
+        assert_eq!(class(240, 0, 0, 1), AddrClass::Martian);
+        assert_eq!(class(255, 255, 255, 254), AddrClass::Martian);
+        assert_eq!(class(255, 255, 255, 255), AddrClass::Broadcast);
+        assert_eq!(class(1, 0, 0, 0), AddrClass::Unicast(scope::GLOBAL));
+        assert_eq!(class(126, 255, 255, 255), AddrClass::Unicast(scope::GLOBAL));
+        assert_eq!(class(128, 0, 0, 0), AddrClass::Unicast(scope::GLOBAL));
+        assert_eq!(class(223, 255, 255, 255), AddrClass::Unicast(scope::GLOBAL));
+        for first in 0..=255 {
+            for addr in [Address::new(first, 0, 0, 0), Address::new(first, 255, 255, 255)] {
+                assert_eq!(
+                    addr.x_is_unicast(),
+                    matches!(addr.x_class(), AddrClass::Unicast(_)),
+                    "{addr}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -107,6 +107,7 @@ pub use self::dhcpv4::{
 };
 
 pub use self::ip::checksum;
+pub(crate) use self::ip::{AddrClass, scope as ip_scope};
 pub use self::ip::{
     Address as IpAddr, Cidr as IpCidr, ListenSocketAddr, Protocol as IpProtocol, SocketAddr, Version as IpVersion,
 };
@@ -122,14 +123,14 @@ pub use self::ipv4::{
 pub(crate) use self::ipv4::AddressExt as Ipv4AddrExt;
 
 #[cfg(feature = "ipv6")]
+pub(crate) use self::ipv6::AddressExt as Ipv6AddrExt;
+#[cfg(feature = "ipv6")]
 pub use self::ipv6::{
     Address as Ipv6Addr, Cidr as Ipv6Cidr, HEADER_LEN as IPV6_HEADER_LEN,
     LINK_LOCAL_ALL_MLDV2_ROUTERS as IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS,
     LINK_LOCAL_ALL_NODES as IPV6_LINK_LOCAL_ALL_NODES, LINK_LOCAL_ALL_ROUTERS as IPV6_LINK_LOCAL_ALL_ROUTERS,
     MIN_MTU as IPV6_MIN_MTU, Packet as Ipv6Packet,
 };
-#[cfg(feature = "ipv6")]
-pub(crate) use self::ipv6::{AddressExt as Ipv6AddrExt, MulticastScope as Ipv6MulticastScope};
 
 #[cfg(feature = "ipv6")]
 pub use self::ipv6ext::{

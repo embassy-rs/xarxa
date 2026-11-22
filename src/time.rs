@@ -227,6 +227,12 @@ impl Clock {
         self.next = self.next.min(deadline);
     }
 
+    /// Ask to be polled again right away, for work queued for the next poll.
+    #[cfg(feature = "loopback")]
+    pub(crate) fn poll_again(&mut self) {
+        self.next = self.now;
+    }
+
     /// Set a timer `delay` from now. Returns its deadline, which counts toward
     /// the next one.
     #[track_caller]

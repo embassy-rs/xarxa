@@ -2,6 +2,8 @@
 
 use crate::Pool;
 use crate::config::IFACE_COUNT;
+#[cfg(feature = "loopback")]
+use crate::config::LOOPBACK_QUEUE_COUNT;
 #[cfg(feature = "_raw")]
 use crate::config::RAW_SOCKET_COUNT;
 #[cfg(feature = "tcp-listener")]
@@ -39,7 +41,7 @@ use crate::raw::{RawHandle, RawSocket, RawSocketIter, RawSocketState};
 #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
 use crate::reassembly::FragmentsBuffer;
 use crate::route::Routes;
-#[cfg(feature = "packetmeta-timestamp")]
+#[cfg(any(feature = "packetmeta-timestamp", feature = "loopback"))]
 use crate::storage::BoundedDeque;
 use crate::storage::{MaybeBox, Slab, Vec};
 #[cfg(feature = "tcp")]
@@ -98,6 +100,21 @@ pub(crate) struct StackInner {
     /// The stack's hostname. Empty when unset.
     #[cfg(feature = "hostname")]
     pub(crate) hostname: heapless::String<HOSTNAME_MAX_LEN>,
+    /// Packets sent to the stack itself, IP header included, with the interface
+    /// they are received on. [`Stack::poll`] receives them.
+    #[cfg(feature = "loopback")]
+    pub(crate) loopback: BoundedDeque<(IfaceHandle, Buf), LOOPBACK_QUEUE_COUNT>,
+    /// Set while ingress processes a packet the stack made for itself: one sent
+    /// over loopback, or a local resolution failure error. Its addresses are
+    /// ours, which the admission checks for packets from a link refuse.
+    #[cfg(any(
+        feature = "loopback",
+        all(
+            any(feature = "medium-ethernet", feature = "medium-ieee802154"),
+            feature = "icmp-errors"
+        )
+    ))]
+    pub(crate) local_ingress: bool,
 }
 
 /// Maximum hostname length, in bytes. The DNS label limit (RFC 1035 §2.3.4).
@@ -132,6 +149,28 @@ impl TxTimestampQueue {
 }
 
 impl StackInner {
+    /// Whether the packet ingress is processing is one the stack made for
+    /// itself. See [`local_ingress`](Self::local_ingress).
+    #[inline(always)]
+    pub(crate) fn local_ingress(&self) -> bool {
+        #[cfg(any(
+            feature = "loopback",
+            all(
+                any(feature = "medium-ethernet", feature = "medium-ieee802154"),
+                feature = "icmp-errors"
+            )
+        ))]
+        return self.local_ingress;
+        #[cfg(not(any(
+            feature = "loopback",
+            all(
+                any(feature = "medium-ethernet", feature = "medium-ieee802154"),
+                feature = "icmp-errors"
+            )
+        )))]
+        false
+    }
+
     /// The hostname to send in outgoing DHCP messages. `None` when unset.
     #[cfg(all(feature = "dhcpv4", feature = "hostname"))]
     pub(crate) fn hostname(&self) -> Option<&str> {
@@ -140,6 +179,17 @@ impl StackInner {
         } else {
             Some(&self.hostname)
         }
+    }
+
+    /// Queue a packet sent to the stack itself, IP header included, to be
+    /// received on `iface` at the next poll. It waits, so only with a buffer to
+    /// spare.
+    #[cfg(feature = "loopback")]
+    pub(crate) fn loop_back(&mut self, iface: IfaceHandle, buf: DriverBuf) -> TxResult {
+        let buf = self.buffers.keep(buf).map_err(|buf| (Blocked::NoBuffer, buf))?;
+        self.loopback
+            .push_back((iface, buf))
+            .map_err(|(_, buf)| (Blocked::NoBuffer, buf.into_driver_buf()))
     }
 
     /// Forget everything the link layer learned about an interface: its neighbor
@@ -350,6 +400,56 @@ pub(crate) struct EgressRoute {
     /// The headroom the IP packet needs on the egress interface: the driver's
     /// plus the link-layer header.
     pub(crate) ip_headroom: usize,
+    /// The destination is the stack itself: the packet is received on `iface`
+    /// instead of going out of it. Its size and headroom are `iface`'s all the
+    /// same, and `next_hop` is the destination.
+    #[cfg(feature = "loopback")]
+    pub(crate) loopback: bool,
+}
+
+impl EgressRoute {
+    /// A route out of `iface` to `next_hop`.
+    fn new(iface: &IfaceState<'_>, next_hop: IpAddr) -> Self {
+        EgressRoute {
+            iface: iface.handle,
+            next_hop,
+            ip_mtu: iface.ip_mtu,
+            ip_headroom: iface.ip_headroom,
+            #[cfg(feature = "loopback")]
+            loopback: false,
+        }
+    }
+
+    /// A route to the stack itself, received on `iface`.
+    #[cfg(feature = "loopback")]
+    fn looped(iface: &IfaceState<'_>, dst_addr: IpAddr) -> Self {
+        EgressRoute {
+            loopback: true,
+            ..Self::new(iface, dst_addr)
+        }
+    }
+
+    /// Whether the destination is the stack itself.
+    #[inline(always)]
+    pub(crate) fn is_loopback(&self) -> bool {
+        #[cfg(feature = "loopback")]
+        return self.loopback;
+        #[cfg(not(feature = "loopback"))]
+        false
+    }
+}
+
+/// Whether `addr` names this host or one of its links: an address assigned to
+/// an interface, or the broadcast address of an interface's subnet.
+///
+/// A packet from the network with such a source is spoofed or looped, and
+/// answering it would talk to ourselves or broadcast. Every interface counts, not
+/// only the one the packet arrived on.
+#[inline(never)] // helps code size
+pub(crate) fn is_own_or_broadcast(ifaces: &Slab<IfaceState<'_>, IFACE_COUNT>, addr: &IpAddr) -> bool {
+    ifaces
+        .iter()
+        .any(|(_, iface)| iface.has_ip_addr(*addr) || iface.is_broadcast(addr))
 }
 
 impl TxContext<'_, '_> {
@@ -359,10 +459,39 @@ impl TxContext<'_, '_> {
         &mut self.inner.rand
     }
 
-    /// Check whether any interface has the given IP address assigned.
-    #[cfg(any(feature = "udp", feature = "tcp"))]
+    /// Check whether the given IP address is ours: assigned to any interface, or
+    /// with `loopback`, a loopback address.
     pub(crate) fn has_ip_addr(&self, addr: IpAddr) -> bool {
+        #[cfg(feature = "loopback")]
+        if addr.is_loopback() {
+            return true;
+        }
         self.ifaces.iter().any(|(_, iface)| iface.has_ip_addr(addr))
+    }
+
+    /// Whether `addr` can be the remote end of a connection: a unicast address
+    /// that is not ours, nor a broadcast address of one of our subnets. With
+    /// `loopback`, also a loopback address or one of ours.
+    #[cfg(feature = "tcp")]
+    pub(crate) fn is_remote_host(&self, addr: &IpAddr) -> bool {
+        #[cfg(feature = "loopback")]
+        if self.has_ip_addr(*addr) {
+            return true;
+        }
+        addr.is_unicast() && !is_own_or_broadcast(self.ifaces, addr)
+    }
+
+    /// Whether `src_addr` may be the source of a packet sent over `route`: it
+    /// is ours, and a loopback address only goes to the stack itself.
+    #[cfg(feature = "udp")]
+    pub(crate) fn is_source_for(&self, src_addr: IpAddr, route: &EgressRoute) -> bool {
+        #[cfg(feature = "loopback")]
+        if src_addr.is_loopback() && !route.loopback {
+            return false;
+        }
+        #[cfg(not(feature = "loopback"))]
+        let _ = route;
+        self.has_ip_addr(src_addr)
     }
 
     /// Whether a socket may bind its local address to this address.
@@ -376,7 +505,11 @@ impl TxContext<'_, '_> {
     /// Wildcards (absent or unspecified addresses) never reach here.
     #[cfg(feature = "udp")]
     pub(crate) fn is_bindable_addr(&self, addr: &IpAddr) -> bool {
-        addr.is_multicast() || self.has_ip_addr(*addr) || self.ifaces.iter().any(|(_, iface)| iface.is_broadcast(addr))
+        #[cfg(feature = "loopback")]
+        if addr.is_loopback() {
+            return true;
+        }
+        addr.is_multicast() || is_own_or_broadcast(self.ifaces, addr)
     }
 
     /// Get a source address for sending to the given destination, selected from the
@@ -385,13 +518,19 @@ impl TxContext<'_, '_> {
     #[cfg(any(feature = "udp", feature = "tcp"))]
     pub(crate) fn get_source_address(&self, binding: IfaceBinding, dst_addr: &IpAddr) -> Option<IpAddr> {
         let route = self.route(binding, dst_addr)?;
+        if route.is_loopback() {
+            return Some(*dst_addr);
+        }
         self.ifaces.get(route.iface.index()).get_source_address(dst_addr)
     }
 
     /// A source address for sending to `dst_addr` out of the interface `route`
-    /// names.
+    /// names. A packet to the stack itself is sent from the destination.
     #[cfg(feature = "udp")]
     pub(crate) fn get_source_address_routed(&self, route: &EgressRoute, dst_addr: &IpAddr) -> Option<IpAddr> {
+        if route.is_loopback() {
+            return Some(*dst_addr);
+        }
         self.ifaces.get(route.iface.index()).get_source_address(dst_addr)
     }
 
@@ -403,19 +542,40 @@ impl TxContext<'_, '_> {
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
-    #[cfg(any(feature = "udp", feature = "tcp", feature = "_raw"))]
+    #[cfg(feature = "raw-ethernet")]
     pub(crate) fn can_transmit(&mut self, iface: IfaceHandle) -> Result<(), Blocked> {
         self.ifaces.get_mut(iface.index()).can_transmit_new_packet()
     }
 
-    /// Which checksums the egress interface computes itself, so the stack
-    /// doesn't do it in software.
+    /// Whether `route` can take one more packet right now: room in its
+    /// interface, or for a packet to the stack itself, in the loopback queue.
+    /// See [`can_transmit`](Self::can_transmit).
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
-    #[cfg(any(feature = "udp", feature = "tcp"))]
-    pub(crate) fn checksum_caps(&self, iface: IfaceHandle) -> ChecksumCapabilities {
-        self.ifaces.get(iface.index()).checksum_caps()
+    #[cfg(any(feature = "udp", feature = "tcp", feature = "raw-ip"))]
+    pub(crate) fn can_transmit_route(&mut self, route: &EgressRoute) -> Result<(), Blocked> {
+        #[cfg(feature = "loopback")]
+        if route.loopback {
+            return match self.inner.loopback.len() < LOOPBACK_QUEUE_COUNT {
+                true => Ok(()),
+                false => Err(Blocked::NoBuffer),
+            };
+        }
+        self.ifaces.get_mut(route.iface.index()).can_transmit_new_packet()
+    }
+
+    /// Which checksums the egress interface computes itself, so the stack
+    /// doesn't do it in software. None for a packet to the stack itself: the
+    /// interface it is received on checks them like any other.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the interface was removed).
+    pub(crate) fn checksum_caps(&self, route: &EgressRoute) -> ChecksumCapabilities {
+        if route.is_loopback() {
+            return ChecksumCapabilities::default();
+        }
+        self.ifaces.get(route.iface.index()).checksum_caps()
     }
 
     /// The headroom the driver of the interface needs in front of a frame.
@@ -453,42 +613,51 @@ impl TxContext<'_, '_> {
     /// destination must be on-link for it or have a route through it, and
     /// broadcast/multicast destinations go straight out of it. A binding whose
     /// interface was removed routes nothing.
+    ///
+    /// Destinations that must never leave the host have no route: loopback
+    /// addresses, our own addresses, `0.0.0.0/8`, `240.0.0.0/4` and the
+    /// interface-local multicast scopes (ff00::/16, ff01::/16). With `loopback`,
+    /// loopback addresses and our own are routed to the stack itself instead.
     pub(crate) fn route(&self, binding: IfaceBinding, dst_addr: &IpAddr) -> Option<EgressRoute> {
         // The interfaces the packet may go out of: the bound one, or all of
         // them. The routing-table lookup applies the same constraint.
         let mut candidates = self.ifaces.iter().filter(|(_, iface)| binding.matches(iface.handle));
 
-        if !dst_addr.is_unicast() {
+        match dst_addr.class() {
+            AddrClass::Unicast(_) => {}
             // Broadcast and multicast destinations carry nothing to route on, so
             // they go out the first interface (for a bound socket, its own). The
             // next hop is the destination itself, resolved to a
             // broadcast/multicast hardware address.
             // TODO: let the send API pick the interface for unbound sockets.
-            return candidates.next().map(|(_, iface)| EgressRoute {
-                iface: iface.handle,
-                next_hop: *dst_addr,
-                ip_mtu: iface.ip_mtu,
-                ip_headroom: iface.ip_headroom,
-            });
+            AddrClass::Broadcast => return candidates.next().map(|(_, iface)| EgressRoute::new(iface, *dst_addr)),
+            AddrClass::Multicast(scope) if scope > ip_scope::INTERFACE_LOCAL => {
+                return candidates.next().map(|(_, iface)| EgressRoute::new(iface, *dst_addr));
+            }
+            #[cfg(feature = "loopback")]
+            AddrClass::Loopback => {
+                return candidates
+                    .next()
+                    .map(|(_, iface)| EgressRoute::looped(iface, *dst_addr));
+            }
+            _ => return None,
+        }
+
+        if self.has_ip_addr(*dst_addr) {
+            #[cfg(feature = "loopback")]
+            return candidates
+                .next()
+                .map(|(_, iface)| EgressRoute::looped(iface, *dst_addr));
+            #[cfg(not(feature = "loopback"))]
+            return None;
         }
 
         if let Some((_, iface)) = candidates.find(|(_, iface)| iface.in_same_network(dst_addr)) {
-            return Some(EgressRoute {
-                iface: iface.handle,
-                next_hop: *dst_addr,
-                ip_mtu: iface.ip_mtu,
-                ip_headroom: iface.ip_headroom,
-            });
+            return Some(EgressRoute::new(iface, *dst_addr));
         }
 
         let route = self.inner.routes.lookup(binding, dst_addr)?;
-        let iface = self.ifaces.get(route.iface.index());
-        Some(EgressRoute {
-            iface: route.iface,
-            next_hop: route.via_router,
-            ip_mtu: iface.ip_mtu,
-            ip_headroom: iface.ip_headroom,
-        })
+        Some(EgressRoute::new(self.ifaces.get(route.iface.index()), route.via_router))
     }
 
     /// The first Ethernet-medium interface, for unbound Ethernet-mode raw
@@ -513,17 +682,17 @@ impl TxContext<'_, '_> {
         #[cfg(not(feature = "ipv6"))]
         let _ = arrival;
 
+        // A reply to a packet the stack sent itself goes back the same way.
+        #[cfg(feature = "loopback")]
+        if self.inner.local_ingress {
+            return Some(EgressRoute::looped(self.ifaces.get(arrival.index()), *dst_addr));
+        }
+
         #[cfg(feature = "ipv6")]
         if let IpAddr::V6(dst) = dst_addr
             && dst.is_link_local()
         {
-            let iface = self.ifaces.get(arrival.index());
-            return Some(EgressRoute {
-                iface: arrival,
-                next_hop: *dst_addr,
-                ip_mtu: iface.ip_mtu,
-                ip_headroom: iface.ip_headroom,
-            });
+            return Some(EgressRoute::new(self.ifaces.get(arrival.index()), *dst_addr));
         }
 
         self.route(IfaceBinding::Any, dst_addr)
@@ -545,9 +714,8 @@ impl TxContext<'_, '_> {
         next_header: IpProtocol,
         hop_limit: u8,
     ) -> TxResult {
-        let iface = self.ifaces.get_mut(route.iface.index());
         #[cfg(feature = "ipv4")]
-        let checksum_caps = iface.checksum_caps();
+        let checksum_caps = self.checksum_caps(route);
         let ethertype = match (src_addr, dst_addr) {
             #[cfg(feature = "ipv4")]
             (IpAddr::V4(src), IpAddr::V4(dst)) => {
@@ -565,6 +733,11 @@ impl TxContext<'_, '_> {
                 return Ok(());
             }
         };
+        #[cfg(feature = "loopback")]
+        if route.loopback {
+            return self.inner.loop_back(route.iface, buf);
+        }
+        let iface = self.ifaces.get_mut(route.iface.index());
         self.inner
             .transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype)
     }
@@ -584,6 +757,10 @@ impl TxContext<'_, '_> {
     /// A packet that would have to wait and can't is handed back unchanged.
     #[cfg(feature = "raw-ip")]
     pub(crate) fn transmit_raw_ip(&mut self, route: &EgressRoute, buf: DriverBuf, dst_addr: IpAddr) -> TxResult {
+        #[cfg(feature = "loopback")]
+        if route.loopback {
+            return self.inner.loop_back(route.iface, buf);
+        }
         let iface = self.ifaces.get_mut(route.iface.index());
         let ethertype = match dst_addr {
             #[cfg(feature = "ipv4")]
@@ -691,6 +868,16 @@ impl<'d> Stack<'d> {
                 ipv4_id,
                 #[cfg(feature = "hostname")]
                 hostname: heapless::String::new(),
+                #[cfg(feature = "loopback")]
+                loopback: BoundedDeque::new(),
+                #[cfg(any(
+                    feature = "loopback",
+                    all(
+                        any(feature = "medium-ethernet", feature = "medium-ieee802154"),
+                        feature = "icmp-errors"
+                    )
+                ))]
+                local_ingress: false,
             },
             ifaces: Slab::new(),
             sockets: Sockets {
@@ -939,6 +1126,8 @@ impl<'d> Stack<'d> {
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         self.inner.neighbor_cache.clear_iface(handle);
         self.inner.routes.purge_iface(handle);
+        #[cfg(feature = "loopback")]
+        self.inner.loopback.retain(|(iface, _)| *iface != handle);
         // Sockets waiting for room on the interface would wait forever. Their retry
         // routes again.
         #[cfg(all(feature = "async", feature = "udp"))]
@@ -1370,6 +1559,17 @@ impl<'d> Stack<'d> {
             self.ifaces.get_mut(index).multicast_egress(&mut self.inner, &mut clock);
         }
 
+        // Receive what the stack sent itself, as if it had arrived on the interface
+        // it was routed to. Only what was queued before: what that sends in turn
+        // is received at the next poll, which is due right away.
+        #[cfg(feature = "loopback")]
+        for _ in 0..self.inner.loopback.len() {
+            let Some((iface, buf)) = self.inner.loopback.pop_front() else {
+                break;
+            };
+            self.process_looped(iface, buf.into_driver_buf(), now);
+        }
+
         // Drive TCP egress: this both acknowledges what ingress just delivered and
         // advances the TCP timers (retransmissions, delayed ACKs, keep-alives,
         // zero-window probes, ...).
@@ -1422,6 +1622,12 @@ impl<'d> Stack<'d> {
         #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
         self.fragments.assembler.remove_expired(&mut clock);
 
+        // What the poll sent itself is received by the next, right away.
+        #[cfg(feature = "loopback")]
+        if !self.inner.loopback.is_empty() {
+            clock.poll_again();
+        }
+
         clock.next()
     }
 }
@@ -1449,6 +1655,25 @@ impl<'d> Stack<'d> {
             #[cfg(feature = "medium-ieee802154")]
             Medium::Ieee802154 => self.process_ieee802154(iface, buf, now),
         }
+    }
+
+    /// Receive a packet the stack sent itself, IP header included, on `iface`.
+    #[cfg(feature = "loopback")]
+    fn process_looped(&mut self, iface: IfaceHandle, #[allow(unused_mut)] mut buf: DriverBuf, now: Instant) {
+        #[cfg(feature = "packet-log")]
+        {
+            trace!("looped back on iface {}", iface.index());
+            crate::packet_log::log_packet(&mut buf, crate::packet_log::Layer::Ip);
+        }
+        self.inner.local_ingress = true;
+        match IpVersion::of_packet(&buf) {
+            #[cfg(feature = "ipv4")]
+            Ok(IpVersion::V4) => self.process_ipv4(iface, None, buf, now),
+            #[cfg(feature = "ipv6")]
+            Ok(IpVersion::V6) => self.process_ipv6(iface, None, buf, now),
+            Err(_) => {}
+        }
+        self.inner.local_ingress = false;
     }
 
     #[cfg(feature = "medium-ethernet")]
@@ -1605,14 +1830,19 @@ impl<'d> Stack<'d> {
             }
         }
 
-        {
-            let iface = self.ifaces.get(iface.index());
-            if !iface.is_unicast_v4(src_addr) && !src_addr.is_unspecified() {
-                // Discard packets with non-unicast source addresses but allow unspecified
-                debug!("non-unicast or unspecified source address");
+        // A packet the stack made for itself has our addresses on both ends, and
+        // no link to check them against.
+        if !self.inner.local_ingress() {
+            // Discard packets whose source can't be a remote host, but allow
+            // unspecified (a host that has no address yet).
+            if !src_addr.is_unspecified()
+                && (!src_addr.x_is_unicast() || is_own_or_broadcast(&self.ifaces, &IpAddr::V4(src_addr)))
+            {
+                debug!("ipv4: invalid source address");
                 return;
             }
 
+            let iface = self.ifaces.get(iface.index());
             if !iface.accepts_v4_dst(dst_addr) {
                 // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
                 trace!("Rejecting IPv4 packet; not for us");
@@ -1621,7 +1851,7 @@ impl<'d> Stack<'d> {
 
             #[cfg(feature = "medium-ethernet")]
             if let Some(eth_src) = eth_src
-                && iface.is_unicast_v4(dst_addr)
+                && iface.has_ip_addr(dst_addr.into())
             {
                 self.inner.neighbor_cache.reset_expiry_if_existing(
                     (iface.handle, IpAddr::V4(src_addr)),
@@ -1807,16 +2037,18 @@ impl<'d> Stack<'d> {
             (Icmpv4Message::EchoRequest, 0) => {
                 let reply_src = {
                     let iface = self.ifaces.get(iface.index());
-                    // Do not send ICMP replies to non-unicast sources.
-                    if !iface.is_unicast_v4(src_addr) {
+                    // Ingress let only unicast sources through, and the unspecified
+                    // one, which can't be answered.
+                    if src_addr.is_unspecified() {
                         return;
                     }
-                    // Reply as normal when src_addr and dst_addr are both unicast; only
-                    // reply to broadcasts for echo replies and not other ICMP messages.
-                    let dst_is_broadcast = iface.is_broadcast_v4(dst_addr);
-                    if dst_addr.x_is_unicast() && !dst_is_broadcast {
+                    // The destination is ours: one of our addresses, a broadcast
+                    // address or a group. Reply from it if it is an address; only
+                    // reply to broadcasts for echo replies and not other ICMP
+                    // messages, and never to groups.
+                    if self.inner.local_ingress() || iface.has_ip_addr(dst_addr.into()) {
                         dst_addr
-                    } else if dst_is_broadcast {
+                    } else if iface.is_broadcast_v4(dst_addr) {
                         match iface.ipv4_addr() {
                             Some(addr) => addr,
                             None => return,
@@ -1923,18 +2155,17 @@ impl<'d> Stack<'d> {
         let next_header = ipv6_packet.next_header();
         let payload_len = ipv6_packet.payload_len() as usize;
 
-        if !src_addr.x_is_unicast() {
-            // Discard packets with non-unicast source addresses.
-            debug!("non-unicast source address");
-            return;
-        }
+        // A packet the stack made for itself has our addresses on both ends, and
+        // no link to check them against.
+        if !self.inner.local_ingress() {
+            // Discard packets whose source can't be a remote host.
+            if !src_addr.x_is_unicast() || is_own_or_broadcast(&self.ifaces, &IpAddr::V6(src_addr)) {
+                debug!("ipv6: invalid source address");
+                return;
+            }
 
-        {
             let iface = self.ifaces.get(iface.index());
-            if !iface.has_ip_addr(dst_addr.into())
-                && !iface.has_multicast_group(dst_addr.into())
-                && !dst_addr.is_loopback()
-            {
+            if !iface.has_ip_addr(dst_addr.into()) && !iface.has_multicast_group(dst_addr.into()) {
                 trace!("Rejecting IPv6 packet; not for us");
                 return;
             }
@@ -2062,7 +2293,9 @@ impl<'d> Stack<'d> {
             // Respond to echo requests.
             #[cfg(feature = "icmp-ping-reply")]
             Icmpv6Message::EchoRequest => {
-                let reply_src = if dst_addr.x_is_unicast() {
+                // The destination is one of our addresses or a group. Reply from
+                // it if it is an address.
+                let reply_src = if !dst_addr.is_multicast() {
                     dst_addr
                 } else {
                     self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
@@ -2215,15 +2448,12 @@ impl<'d> Stack<'d> {
                 {
                     return;
                 }
-                let reply_src = {
-                    let iface = self.ifaces.get(iface.index());
-                    if !iface.is_unicast_v4(src_addr) {
-                        return;
-                    }
-                    match iface.get_source_address_ipv4(&src_addr) {
-                        Some(addr) => addr,
-                        None => return,
-                    }
+                // The source is ours, or unspecified (DHCP).
+                if !src_addr.x_is_unicast() {
+                    return;
+                }
+                let Some(reply_src) = self.ifaces.get(iface.index()).get_source_address_ipv4(&src_addr) else {
+                    return;
                 };
                 // The error is fed back through local ingress processing rather
                 // than transmitted, so no device is going to fill its checksums in.
@@ -2239,7 +2469,9 @@ impl<'d> Stack<'d> {
                     return;
                 }
                 push_ipv4_header(&mut orig, reply_src, src_addr, IpProtocol::Icmp, 64, &checksum_caps);
+                self.inner.local_ingress = true;
                 self.process_ipv4(iface, None, orig, now);
+                self.inner.local_ingress = false;
             }
             #[cfg(feature = "ipv6")]
             Ok(IpVersion::V6) => {
@@ -2275,7 +2507,9 @@ impl<'d> Stack<'d> {
                     return;
                 }
                 push_ipv6_header(&mut orig, reply_src, src_addr, IpProtocol::Icmpv6, 64);
+                self.inner.local_ingress = true;
                 self.process_ipv6(iface, None, orig, now);
+                self.inner.local_ingress = false;
             }
             Err(_) => {}
         }
@@ -2287,7 +2521,8 @@ impl<'d> Stack<'d> {
     ///
     /// Errors are only sent when both the source and the destination of the
     /// offending packet are unicast (RFC 1122 §3.2.2): none about broadcast or
-    /// multicast traffic, and none to non-unicast senders.
+    /// multicast traffic, and none to non-unicast senders. Ingress let only
+    /// unicast sources through, and the unspecified one.
     #[cfg(feature = "ipv4")]
     pub(crate) fn transmit_icmpv4_error(
         &mut self,
@@ -2300,11 +2535,12 @@ impl<'d> Stack<'d> {
             let packet = Ipv4Packet::new_unchecked(&mut orig);
             (packet.src_addr(), packet.dst_addr())
         };
+        // The destination is ours: one of our addresses, a broadcast address or a
+        // group. A packet the stack sent itself is to one of our addresses.
+        if src_addr.is_unspecified()
+            || !(self.inner.local_ingress() || self.ifaces.get(iface.index()).has_ip_addr(dst_addr.into()))
         {
-            let iface = self.ifaces.get(iface.index());
-            if !iface.is_unicast_v4(src_addr) || !iface.is_unicast_v4(dst_addr) {
-                return;
-            }
+            return;
         }
         let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddr::V4(src_addr)) else {
             return;
@@ -2328,7 +2564,8 @@ impl<'d> Stack<'d> {
     ///
     /// Errors are never sent to non-unicast sources, nor about multicast-destined
     /// packets (RFC 4443 §2.4). The exception is an unrecognized hop-by-hop option
-    /// whose type demands the error even then (`allow_multicast_dst`).
+    /// whose type demands the error even then (`allow_multicast_dst`). Ingress let
+    /// only unicast sources through.
     #[cfg(feature = "ipv6")]
     pub(crate) fn transmit_icmpv6_error(
         &mut self,
@@ -2343,13 +2580,10 @@ impl<'d> Stack<'d> {
             let packet = Ipv6Packet::new_unchecked(&mut orig);
             (packet.src_addr(), packet.dst_addr())
         };
-        if !src_addr.x_is_unicast() {
-            return;
-        }
         if dst_addr.is_multicast() && !allow_multicast_dst {
             return;
         }
-        let reply_src = if dst_addr.x_is_unicast() {
+        let reply_src = if !dst_addr.is_multicast() {
             dst_addr
         } else {
             self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
@@ -2395,7 +2629,7 @@ impl<'d> Stack<'d> {
                 return None;
             }
         };
-        let checksum_caps = self.ifaces.get(route.iface.index()).checksum_caps();
+        let checksum_caps = self.tx_context().checksum_caps(&route);
         Some((route, checksum_caps))
     }
 
@@ -6845,6 +7079,10 @@ pub(crate) mod test {
 
         // A raw socket can send from any source address: build the datagram as
         // if the remote had sent it to us, so the fragments can be fed back in.
+        // The packet itself goes to the remote, since there is no route to
+        // ourselves, and each fragment gets its addresses swapped back. That
+        // leaves the UDP checksum valid: the pseudo-header sum doesn't depend
+        // on their order.
         let raw = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(raw)
@@ -6855,7 +7093,7 @@ pub(crate) mod test {
             .unwrap();
         let payload: Vec<u8> = (0..1400u32).map(|i| i as u8).collect();
         let datagram = udp_datagram(REMOTE_V4.into(), 1000, OUR_V4.into(), 5555, &payload);
-        let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram);
+        let packet = ipv4_packet(OUR_V4, REMOTE_V4, IpProtocol::Udp, &datagram);
         stack.raw_socket(raw).send_slice(&packet).unwrap();
 
         let frames = tx.borrow().clone();
@@ -6865,7 +7103,12 @@ pub(crate) mod test {
         // Nothing arrives until the last fragment does.
         for frame in frames.iter().rev() {
             assert!(!stack.udp_socket(udp).can_recv());
-            inject(&mut stack, &rx, frame.clone());
+            let mut frame = frame.clone();
+            let mut packet = Ipv4Packet::new_unchecked(&mut frame[..]);
+            packet.set_src_addr(REMOTE_V4);
+            packet.set_dst_addr(OUR_V4);
+            packet.fill_checksum();
+            inject(&mut stack, &rx, frame);
         }
         let mut got = vec![0; 2048];
         let (len, meta) = stack.udp_socket(udp).recv_slice(&mut got).unwrap();
@@ -8448,7 +8691,6 @@ pub(crate) mod test {
     }
 
     /// A TCP segment (header only) with the given flags, checksummed for `src`/`dst`.
-    #[cfg(feature = "tcp-listener")]
     fn tcp_segment(src: IpAddr, src_port: u16, dst: IpAddr, dst_port: u16, syn: bool) -> Vec<u8> {
         let mut segment = vec![0u8; TCP_HEADER_LEN];
         {
@@ -9387,5 +9629,502 @@ pub(crate) mod test {
                 .neighbor_cache
                 .has_parked(&(IfaceHandle::new(0), REMOTE_V4.into()))
         );
+    }
+
+    /// Address classification at the edges of the stack (root cause #1 of the
+    /// 2026-09 audit): what never leaves the host, what the network can't send
+    /// us, and what can't be assigned or connected to.
+    mod addr_class {
+        use super::*;
+        use crate::iface::AddrError;
+        use crate::udp::SendError as UdpSendError;
+
+        /// Destinations that must never go on a link have no route: no packet
+        /// goes out, not even via a default gateway, and the send says so.
+        #[test]
+        fn test_never_leave_host_destinations() {
+            let (mut stack, _rx, tx) = test_stack(Medium::Ip);
+            stack
+                .routes_mut()
+                .add_default_ipv4_route(REMOTE_V4, IfaceHandle::new(0))
+                .unwrap();
+            stack
+                .routes_mut()
+                .add_default_ipv6_route(REMOTE_V6, IfaceHandle::new(0))
+                .unwrap();
+            let udp = stack.add_udp_socket().unwrap();
+            stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+
+            #[allow(unused_mut)]
+            let mut never: Vec<IpAddr> = vec![
+                Ipv4Addr::new(0, 1, 2, 3).into(),
+                Ipv4Addr::new(240, 0, 0, 1).into(),
+                Ipv4Addr::new(255, 255, 255, 254).into(),
+                Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 1).into(),
+                Ipv6Addr::new(0xff01, 0, 0, 0, 0, 0, 0, 1).into(),
+            ];
+            // Without loopback, nor do the loopback addresses or our own.
+            #[cfg(not(feature = "loopback"))]
+            never.extend([
+                IpAddr::from(Ipv4Addr::new(127, 0, 0, 1)),
+                Ipv4Addr::new(127, 1, 2, 3).into(),
+                Ipv6Addr::LOCALHOST.into(),
+                OUR_V4.into(),
+                OUR_V6.into(),
+            ]);
+            for dst in never {
+                assert_eq!(
+                    stack.udp_socket(udp).send_slice(b"hi", (dst, 1000)),
+                    Err(UdpSendError::Unaddressable),
+                    "{dst}"
+                );
+                assert!(stack.tx_context().route(IfaceBinding::Any, &dst).is_none(), "{dst}");
+            }
+            stack.poll(Instant::ZERO);
+            assert!(tx.borrow().is_empty());
+
+            // Multicast of link scope and up still goes out.
+            let dst = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x1234);
+            stack.udp_socket(udp).send_slice(b"hi", (dst, 1000)).unwrap();
+            assert_eq!(tx.borrow().len(), 1);
+        }
+
+        /// A TCP connection can't be opened to an address that never leaves the
+        /// host, nor to a group or a broadcast address.
+        #[test]
+        fn test_tcp_connect_non_host_remote() {
+            let (mut stack, _rx, tx) = test_stack(Medium::Ip);
+            let tcp = stack
+                .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+                .unwrap();
+            #[allow(unused_mut)]
+            let mut refused: Vec<IpAddr> = vec![
+                Ipv4Addr::UNSPECIFIED.into(),
+                Ipv4Addr::new(224, 0, 0, 1).into(),
+                Ipv4Addr::BROADCAST.into(),
+                Ipv4Addr::new(192, 168, 1, 255).into(),
+                Ipv4Addr::new(240, 0, 0, 1).into(),
+                Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1).into(),
+            ];
+            #[cfg(not(feature = "loopback"))]
+            refused.extend([
+                IpAddr::from(Ipv4Addr::new(127, 0, 0, 1)),
+                Ipv6Addr::LOCALHOST.into(),
+                OUR_V4.into(),
+            ]);
+            for remote in refused {
+                assert_eq!(
+                    stack.tcp_socket(tcp).connect((remote, 80), 0),
+                    Err(crate::tcp::ConnectError::Unaddressable),
+                    "{remote}"
+                );
+                // An explicit local address doesn't skip the check.
+                assert_eq!(
+                    stack.tcp_socket(tcp).connect((remote, 80), (OUR_V4, 1000)),
+                    Err(crate::tcp::ConnectError::Unaddressable),
+                    "{remote}"
+                );
+            }
+            stack.poll(Instant::ZERO);
+            assert!(tx.borrow().is_empty());
+        }
+
+        /// Packets from a source that can't be a remote host are dropped before
+        /// anything answers them: no echo reply, no ICMP error, no RST, and no
+        /// socket gets them.
+        #[test]
+        fn test_ingress_drops_invalid_sources() {
+            let (mut stack, rx, tx) = test_stack(Medium::Ip);
+            let udp = stack.add_udp_socket().unwrap();
+            stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+
+            for src in [
+                Ipv4Addr::new(127, 0, 0, 1),
+                Ipv4Addr::new(0, 1, 2, 3),
+                Ipv4Addr::new(240, 0, 0, 1),
+                Ipv4Addr::new(192, 168, 1, 255),
+                OUR_V4,
+            ] {
+                let echo = icmpv4_echo(Icmpv4Message::EchoRequest, 1, 1, b"ping");
+                inject(&mut stack, &rx, ipv4_packet(src, OUR_V4, IpProtocol::Icmp, &echo));
+                let datagram = udp_datagram(src.into(), 2000, OUR_V4.into(), 1000, b"hi");
+                inject(&mut stack, &rx, ipv4_packet(src, OUR_V4, IpProtocol::Udp, &datagram));
+                let datagram = udp_datagram(src.into(), 2000, OUR_V4.into(), 1001, b"hi");
+                inject(&mut stack, &rx, ipv4_packet(src, OUR_V4, IpProtocol::Udp, &datagram));
+                let segment = tcp_segment(src.into(), 2000, OUR_V4.into(), 80, true);
+                inject(&mut stack, &rx, ipv4_packet(src, OUR_V4, IpProtocol::Tcp, &segment));
+                assert!(tx.borrow().is_empty(), "{src}");
+                assert!(!stack.udp_socket(udp).can_recv(), "{src}");
+            }
+
+            for src in [Ipv6Addr::LOCALHOST, OUR_V6] {
+                let echo = icmpv6_echo(Icmpv6Message::EchoRequest, 1, 1, b"ping", src, OUR_V6);
+                inject(&mut stack, &rx, ipv6_packet(src, OUR_V6, IpProtocol::Icmpv6, &echo));
+                let datagram = udp_datagram(src.into(), 2000, OUR_V6.into(), 1000, b"hi");
+                inject(&mut stack, &rx, ipv6_packet(src, OUR_V6, IpProtocol::Udp, &datagram));
+                assert!(tx.borrow().is_empty(), "{src}");
+                assert!(!stack.udp_socket(udp).can_recv(), "{src}");
+            }
+
+            // The same from a real remote is answered, so the drops above are
+            // what kept the device quiet.
+            let echo = icmpv4_echo(Icmpv4Message::EchoRequest, 1, 1, b"ping");
+            inject(&mut stack, &rx, ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &echo));
+            assert_eq!(tx.borrow().len(), 1);
+        }
+
+        /// The loopback address is never a destination from the network.
+        #[test]
+        fn test_ingress_drops_loopback_destination() {
+            let (mut stack, rx, tx) = test_stack(Medium::Ip);
+            let udp = stack.add_udp_socket().unwrap();
+            stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+
+            let dst = Ipv6Addr::LOCALHOST;
+            let echo = icmpv6_echo(Icmpv6Message::EchoRequest, 1, 1, b"ping", REMOTE_V6, dst);
+            inject(&mut stack, &rx, ipv6_packet(REMOTE_V6, dst, IpProtocol::Icmpv6, &echo));
+            let datagram = udp_datagram(REMOTE_V6.into(), 2000, dst.into(), 1000, b"hi");
+            inject(&mut stack, &rx, ipv6_packet(REMOTE_V6, dst, IpProtocol::Udp, &datagram));
+            let dst = Ipv4Addr::new(127, 0, 0, 1);
+            let datagram = udp_datagram(REMOTE_V4.into(), 2000, dst.into(), 1000, b"hi");
+            inject(&mut stack, &rx, ipv4_packet(REMOTE_V4, dst, IpProtocol::Udp, &datagram));
+
+            assert!(tx.borrow().is_empty());
+            assert!(!stack.udp_socket(udp).can_recv());
+        }
+
+        /// The broadcast address of another interface's subnet is no source either:
+        /// answering it would broadcast on that interface.
+        #[test]
+        fn test_ingress_drops_other_iface_broadcast_source() {
+            let (mut stack, rx, tx) = test_stack_two_ifaces();
+            let src = Ipv4Addr::new(10, 0, 0, 255);
+            let echo = icmpv4_echo(Icmpv4Message::EchoRequest, 1, 1, b"ping");
+            inject(&mut stack, &rx[0], ipv4_packet(src, OUR_V4, IpProtocol::Icmp, &echo));
+            let datagram = udp_datagram(src.into(), 2000, OUR_V4.into(), 1001, b"hi");
+            inject(&mut stack, &rx[0], ipv4_packet(src, OUR_V4, IpProtocol::Udp, &datagram));
+            assert!(tx[0].borrow().is_empty());
+            assert!(tx[1].borrow().is_empty());
+        }
+
+        /// A local resolution failure error reaches the socket whose source is
+        /// another interface's address: the error is ours, so it skips the check
+        /// that a destination belongs to the arrival interface.
+        #[test]
+        #[cfg(feature = "icmp-errors")]
+        fn test_neighbor_failure_source_on_other_iface() {
+            let (mut stack, _rx, _tx) = test_stack(Medium::Ethernet);
+            let other_v6 = Ipv6Addr::new(0xfdbb, 0, 0, 0, 0, 0, 0, 1);
+            let driver = TestDevice::new(Medium::Ip);
+            let other = driver.install(&mut stack, HardwareAddress::Ip);
+            stack
+                .iface(other)
+                .set_ip_addrs([IpCidr::new(OUR_V4_B.into(), 24), IpCidr::new(other_v6.into(), 64)])
+                .unwrap();
+
+            let dead: [(IpAddr, IpAddr); 2] = [
+                (OUR_V4_B.into(), Ipv4Addr::new(192, 168, 1, 99).into()),
+                (other_v6.into(), Ipv6Addr::new(0xfdaa, 0, 0, 0, 0, 0, 0, 0x99).into()),
+            ];
+            for (local, dead) in dead {
+                let udp = stack.add_udp_socket().unwrap();
+                stack
+                    .udp_socket(udp)
+                    .bind((local, 5555), ListenSocketAddr::UNSPECIFIED)
+                    .unwrap();
+                stack.udp_socket(udp).send_slice(b"anyone?", (dead, 1000)).unwrap();
+                for secs in 1..=4 {
+                    stack.poll(Instant::ZERO + Duration::from_secs(secs));
+                }
+                assert_eq!(
+                    stack.udp_socket(udp).take_icmp_error(),
+                    Some((IcmpError::HostUnreachable, SocketAddr::new(dead, 1000))),
+                    "{local}"
+                );
+                stack.remove_udp_socket(udp);
+            }
+        }
+
+        /// An interface address must be able to name this host.
+        #[test]
+        fn test_iface_reject_unassignable_ip_addr() {
+            let (mut stack, _rx, _tx) = test_stack(Medium::Ip);
+            let mut iface = stack.iface(IfaceHandle::new(0));
+            for cidr in [
+                IpCidr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8),
+                IpCidr::new(Ipv6Addr::LOCALHOST.into(), 128),
+                IpCidr::new(Ipv4Addr::new(0, 1, 2, 3).into(), 8),
+                IpCidr::new(Ipv4Addr::new(240, 0, 0, 1).into(), 4),
+                // The network and broadcast addresses of their own subnet.
+                IpCidr::new(Ipv4Addr::new(192, 168, 2, 0).into(), 24),
+                IpCidr::new(Ipv4Addr::new(192, 168, 2, 255).into(), 24),
+                IpCidr::new(Ipv4Addr::new(10, 0, 0, 0).into(), 30),
+                IpCidr::new(Ipv4Addr::new(10, 0, 0, 3).into(), 30),
+            ] {
+                assert_eq!(iface.add_ip_addr(cidr), Err(AddrError::NotUnicast), "{cidr}");
+                assert_eq!(
+                    iface.set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), cidr]),
+                    Err(AddrError::NotUnicast),
+                    "{cidr}"
+                );
+            }
+            // /31 and /32 subnets have no network or broadcast address, and a
+            // subnet's broadcast address is a host in a larger one.
+            for cidr in [
+                IpCidr::new(Ipv4Addr::new(10, 0, 0, 0).into(), 31),
+                IpCidr::new(Ipv4Addr::new(10, 0, 0, 3).into(), 31),
+                IpCidr::new(Ipv4Addr::new(10, 1, 0, 0).into(), 32),
+                IpCidr::new(Ipv4Addr::new(10, 2, 0, 255).into(), 16),
+            ] {
+                assert_eq!(iface.add_ip_addr(cidr), Ok(None), "{cidr}");
+                iface.remove_ip_addr(cidr.address());
+            }
+        }
+    }
+
+    /// The `loopback` feature: packets to ourselves are received at the next
+    /// poll instead of being refused.
+    #[cfg(feature = "loopback")]
+    mod loopback {
+        use super::*;
+        use crate::udp::{RecvError as UdpRecvError, SendError as UdpSendError};
+
+        fn udp_pair(stack: &mut Stack<'static>) -> (UdpHandle, UdpHandle) {
+            let a = stack.add_udp_socket().unwrap();
+            stack.udp_socket(a).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+            let b = stack.add_udp_socket().unwrap();
+            stack.udp_socket(b).bind(2000, ListenSocketAddr::UNSPECIFIED).unwrap();
+            (a, b)
+        }
+
+        /// A datagram to a loopback address or one of ours is received at the
+        /// next poll, from that same address, and nothing goes on the wire.
+        #[test]
+        fn test_udp() {
+            let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
+            let (a, b) = udp_pair(&mut stack);
+            for dst in [
+                IpAddr::from(Ipv4Addr::new(127, 0, 0, 1)),
+                Ipv4Addr::new(127, 1, 2, 3).into(),
+                Ipv6Addr::LOCALHOST.into(),
+                OUR_V4.into(),
+                OUR_V6.into(),
+            ] {
+                stack.udp_socket(a).send_slice(b"hello", (dst, 2000)).unwrap();
+                assert!(!stack.udp_socket(b).can_recv());
+                stack.poll(Instant::ZERO);
+                let mut buf = [0; 16];
+                let (len, meta) = stack.udp_socket(b).recv_slice(&mut buf).unwrap();
+                assert_eq!(&buf[..len], b"hello");
+                assert_eq!(meta.remote_addr, SocketAddr::new(dst, 1000), "{dst}");
+                assert_eq!(meta.local_addr, Some(dst), "{dst}");
+
+                // And back.
+                stack.udp_socket(b).send_slice(b"world", meta.remote_addr).unwrap();
+                stack.poll(Instant::ZERO);
+                let (len, meta) = stack.udp_socket(a).recv_slice(&mut buf).unwrap();
+                assert_eq!(&buf[..len], b"world");
+                assert_eq!(meta.remote_addr, SocketAddr::new(dst, 2000), "{dst}");
+            }
+            assert!(tx.borrow().is_empty());
+        }
+
+        /// A socket can bind to a loopback address, but can't send from it to
+        /// anyone else.
+        #[test]
+        fn test_udp_loopback_source() {
+            let (mut stack, _rx, tx) = test_stack(Medium::Ip);
+            let udp = stack.add_udp_socket().unwrap();
+            stack
+                .udp_socket(udp)
+                .bind((Ipv4Addr::new(127, 0, 0, 1), 1000), ListenSocketAddr::UNSPECIFIED)
+                .unwrap();
+            assert_eq!(
+                stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)),
+                Err(UdpSendError::Unaddressable)
+            );
+            stack.poll(Instant::ZERO);
+            assert!(tx.borrow().is_empty());
+        }
+
+        /// Packets wait in a queue of [`LOOPBACK_QUEUE_COUNT`] until the next
+        /// poll, and a send that finds it full is refused, not lost.
+        #[test]
+        fn test_udp_queue_full() {
+            let (mut stack, _rx, _tx) = test_stack(Medium::Ip);
+            let (a, b) = udp_pair(&mut stack);
+            let dst = (Ipv4Addr::new(127, 0, 0, 1), 2000);
+            for _ in 0..LOOPBACK_QUEUE_COUNT {
+                stack.udp_socket(a).send_slice(b"hi", dst).unwrap();
+            }
+            assert!(stack.udp_socket(a).send_slice(b"hi", dst).is_err());
+            // The next poll receives them all.
+            stack.poll(Instant::ZERO);
+            let mut count = 0;
+            while stack.udp_socket(b).recv_slice(&mut [0; 16]).is_ok() {
+                count += 1;
+            }
+            assert_eq!(count, LOOPBACK_QUEUE_COUNT);
+            stack.udp_socket(a).send_slice(b"hi", dst).unwrap();
+        }
+
+        /// A datagram to a closed port gets a port unreachable error back over
+        /// loopback.
+        #[test]
+        #[cfg(feature = "icmp-errors")]
+        fn test_udp_port_unreachable() {
+            for dst in [IpAddr::from(Ipv4Addr::new(127, 0, 0, 1)), Ipv6Addr::LOCALHOST.into()] {
+                let (mut stack, _rx, _tx) = test_stack(Medium::Ip);
+                let udp = stack.add_udp_socket().unwrap();
+                stack.udp_socket(udp).bind(1000, (dst, 3000)).unwrap();
+                stack.udp_socket(udp).send_slice(b"hi", (dst, 3000)).unwrap();
+                // The datagram, then the error it provokes, which the first poll
+                // asks to be received right away.
+                assert_eq!(stack.poll(Instant::ZERO), Instant::ZERO);
+                stack.poll(Instant::ZERO);
+                assert!(
+                    matches!(
+                        stack.udp_socket(udp).recv_slice(&mut [0; 16]),
+                        Err(UdpRecvError::IcmpError { .. })
+                    ),
+                    "{dst}"
+                );
+            }
+        }
+
+        /// A raw socket pings ourselves, and the stack answers over loopback.
+        #[test]
+        #[cfg(feature = "icmp-ping-reply")]
+        fn test_ping() {
+            let (mut stack, _rx, tx) = test_stack(Medium::Ip);
+            let raw = stack.add_raw_socket().unwrap();
+            stack
+                .raw_socket(raw)
+                .bind(RawMode::Ip {
+                    version: Some(IpVersion::V4),
+                    protocol: Some(IpProtocol::Icmp),
+                })
+                .unwrap();
+            let dst = Ipv4Addr::new(127, 0, 0, 1);
+            let echo = icmpv4_echo(Icmpv4Message::EchoRequest, 7, 1, b"ping");
+            stack
+                .raw_socket(raw)
+                .send_slice(&ipv4_packet(dst, dst, IpProtocol::Icmp, &echo))
+                .unwrap();
+            // The request (which the raw socket sees too), then the reply.
+            stack.poll(Instant::ZERO);
+            stack.poll(Instant::ZERO);
+            let _request = stack.raw_socket(raw).recv().unwrap();
+            let mut reply = stack.raw_socket(raw).recv().unwrap().to_vec();
+            let (msg_type, _, _) = parse_icmpv4_reply(&reply, dst, dst);
+            assert_eq!(msg_type, Icmpv4Message::EchoReply);
+            let _ = &mut reply;
+            assert!(tx.borrow().is_empty());
+        }
+
+        /// A TCP connection to ourselves: handshake, data both ways, close.
+        #[test]
+        #[cfg(feature = "tcp-listener")]
+        fn test_tcp() {
+            for dst in [
+                IpAddr::from(Ipv4Addr::new(127, 0, 0, 1)),
+                Ipv6Addr::LOCALHOST.into(),
+                OUR_V4.into(),
+            ] {
+                let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
+                let listener = stack.add_tcp_listener().unwrap();
+                stack.tcp_listener(listener).listen(80).unwrap();
+                let client = stack
+                    .add_tcp_socket_with_bufs(vec![0; 256].leak(), vec![0; 256].leak())
+                    .unwrap();
+                stack.tcp_socket(client).connect((dst, 80), 0).unwrap();
+
+                let server = stack
+                    .add_tcp_socket_with_bufs(vec![0; 256].leak(), vec![0; 256].leak())
+                    .unwrap();
+                let mut now = Instant::ZERO;
+                let mut accepted = false;
+                for _ in 0..10 {
+                    stack.poll(now);
+                    now += Duration::from_millis(1);
+                    if !accepted && let Some(token) = stack.tcp_listener(listener).accept() {
+                        stack.tcp_socket(server).accept(token).unwrap();
+                        accepted = true;
+                    }
+                }
+                assert_eq!(stack.tcp_socket(client).state(), TcpState::Established, "{dst}");
+                assert_eq!(stack.tcp_socket(server).state(), TcpState::Established, "{dst}");
+
+                stack.tcp_socket(client).send_slice(b"hello").unwrap();
+                stack.tcp_socket(server).send_slice(b"world").unwrap();
+                for _ in 0..10 {
+                    stack.poll(now);
+                    now += Duration::from_millis(1);
+                }
+                let mut buf = [0; 16];
+                let len = stack.tcp_socket(server).recv_slice(&mut buf).unwrap();
+                assert_eq!(&buf[..len], b"hello");
+                let len = stack.tcp_socket(client).recv_slice(&mut buf).unwrap();
+                assert_eq!(&buf[..len], b"world");
+
+                stack.tcp_socket(client).close();
+                stack.tcp_socket(server).close();
+                for _ in 0..10 {
+                    stack.poll(now);
+                    now += Duration::from_millis(1);
+                }
+                assert!(
+                    matches!(stack.tcp_socket(server).state(), TcpState::Closed | TcpState::TimeWait),
+                    "{dst}"
+                );
+                assert!(tx.borrow().is_empty(), "{dst}");
+            }
+        }
+
+        /// A connection to a closed port is reset over loopback.
+        #[test]
+        fn test_tcp_rst() {
+            let (mut stack, _rx, _tx) = test_stack(Medium::Ip);
+            let client = stack
+                .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+                .unwrap();
+            stack
+                .tcp_socket(client)
+                .connect((Ipv4Addr::new(127, 0, 0, 1), 80), 0)
+                .unwrap();
+            for _ in 0..4 {
+                stack.poll(Instant::ZERO);
+            }
+            assert_eq!(stack.tcp_socket(client).state(), TcpState::Closed);
+        }
+
+        /// Without an interface there is nothing to receive on, so no loopback.
+        #[test]
+        fn test_needs_an_iface() {
+            let mut stack = Stack::new(crate::buffers::test_pool(), 1);
+            let (a, _b) = udp_pair(&mut stack);
+            assert_eq!(
+                stack
+                    .udp_socket(a)
+                    .send_slice(b"hi", (Ipv4Addr::new(127, 0, 0, 1), 2000)),
+                Err(UdpSendError::Unaddressable)
+            );
+        }
+
+        /// Packets waiting to be received on an interface go away with it.
+        #[test]
+        fn test_remove_iface() {
+            let (mut stack, _rx, _tx) = test_stack(Medium::Ip);
+            let (a, b) = udp_pair(&mut stack);
+            stack
+                .udp_socket(a)
+                .send_slice(b"hi", (Ipv4Addr::new(127, 0, 0, 1), 2000))
+                .unwrap();
+            assert_eq!(stack.inner.loopback.len(), 1);
+            stack.remove_iface(IfaceHandle::new(0));
+            assert_eq!(stack.inner.loopback.len(), 0);
+            stack.poll(Instant::ZERO);
+            assert!(!stack.udp_socket(b).can_recv());
+        }
     }
 }

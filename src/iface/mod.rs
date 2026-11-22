@@ -86,11 +86,35 @@ impl core::error::Error for AddIfaceError {}
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrError {
-    /// The address is not unicast: it is unspecified, multicast or broadcast.
+    /// The address can't name this host: it is unspecified, multicast, a
+    /// broadcast address, a loopback address, in `0.0.0.0/8` or `240.0.0.0/4`,
+    /// or the network or broadcast address of its own subnet (for IPv4 prefixes
+    /// shorter than /31).
     NotUnicast,
     /// The interface has no room for another address. Only possible without
     /// the `alloc` feature, where the limit is [`IFACE_ADDR_COUNT`].
     Full,
+}
+
+/// Check that an address can be assigned to an interface: it is unicast, and not
+/// the network or broadcast address of its own subnet. /31 and /32 subnets have
+/// neither (RFC 3021).
+#[inline(never)] // helps code size
+fn check_assignable(cidr: &IpCidr) -> Result<(), AddrError> {
+    let ok = cidr.address().is_unicast()
+        && match cidr {
+            #[cfg(feature = "ipv4")]
+            IpCidr::V4(cidr) => {
+                cidr.prefix_len() >= 31 || {
+                    let host_mask = u32::MAX >> cidr.prefix_len();
+                    let host = cidr.address().to_bits() & host_mask;
+                    host != 0 && host != host_mask
+                }
+            }
+            #[cfg(feature = "ipv6")]
+            IpCidr::V6(_) => true,
+        };
+    if ok { Ok(()) } else { Err(AddrError::NotUnicast) }
 }
 
 impl From<Full> for AddrError {
@@ -476,14 +500,13 @@ impl<'d> Iface<'_, 'd> {
     /// subnet.
     ///
     /// # Errors
-    /// - `NotUnicast`: if the address is not unicast.
+    /// - `NotUnicast`: if the address can't name this host. See
+    ///   [`AddrError::NotUnicast`].
     /// - `Full`: if the interface has no room for another address. Only possible
     ///   without the `alloc` feature, where the limit is
     ///   [`IFACE_ADDR_COUNT`].
     pub fn add_ip_addr(&mut self, cidr: IpCidr) -> Result<Option<IpCidr>, AddrError> {
-        if !cidr.address().is_unicast() {
-            return Err(AddrError::NotUnicast);
-        }
+        check_assignable(&cidr)?;
 
         let ip_addrs = &mut self.state_mut().ip_addrs;
         match ip_addrs.iter().position(|old| old.cidr.address() == cidr.address()) {
@@ -520,16 +543,15 @@ impl<'d> Iface<'_, 'd> {
     /// On error the interface is left unchanged.
     ///
     /// # Errors
-    /// - `NotUnicast`: if any of the addresses is not unicast.
+    /// - `NotUnicast`: if any of the addresses can't name this host. See
+    ///   [`AddrError::NotUnicast`].
     /// - `Full`: if the addresses do not fit. Only possible without the `alloc`
     ///   feature, where the limit is [`IFACE_ADDR_COUNT`].
     pub fn set_ip_addrs(&mut self, new_addrs: impl IntoIterator<Item = IpCidr>) -> Result<(), AddrError> {
         #[allow(unused_mut)]
         let mut addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT> = Vec::new();
         for cidr in new_addrs {
-            if !cidr.address().is_unicast() {
-                return Err(AddrError::NotUnicast);
-            }
+            check_assignable(&cidr)?;
             addrs.push(IfaceAddr::manual(cidr)).map_err(|_| AddrError::Full)?;
         }
         #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
@@ -947,7 +969,6 @@ impl IfaceState<'_> {
 
     /// Checks if an address is broadcast, taking into account ipv4 subnet-local
     /// broadcast addresses.
-    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154", feature = "udp"))]
     pub(crate) fn is_broadcast(&self, address: &IpAddr) -> bool {
         match address {
             #[cfg(feature = "ipv4")]
@@ -965,13 +986,16 @@ impl IfaceState<'_> {
             return true;
         }
 
-        self.cidrs()
-            .filter_map(|own_cidr| match own_cidr {
-                IpCidr::V4(own_ip) => Some(own_ip.broadcast()?),
-                #[cfg(feature = "ipv6")]
-                IpCidr::V6(_) => None,
-            })
-            .any(|broadcast_address| address == broadcast_address)
+        // The broadcast address of a subnet is its address with all host bits set.
+        // /31 and /32 subnets have none (RFC 3021).
+        self.cidrs().any(|own_cidr| match own_cidr {
+            IpCidr::V4(own_ip) => {
+                own_ip.prefix_len() < 31
+                    && address.to_bits() == own_ip.address().to_bits() | u32::MAX >> own_ip.prefix_len()
+            }
+            #[cfg(feature = "ipv6")]
+            IpCidr::V6(_) => false,
+        })
     }
 
     /// Whether an IPv4 packet to `dst_addr` is for this interface: to one of its
@@ -980,13 +1004,6 @@ impl IfaceState<'_> {
     #[cfg_attr(not(any(feature = "medium-ethernet", feature = "medium-ip")), allow(dead_code))]
     pub(crate) fn accepts_v4_dst(&self, dst_addr: Ipv4Addr) -> bool {
         self.has_ip_addr(dst_addr.into()) || self.has_multicast_group(dst_addr.into()) || self.is_broadcast_v4(dst_addr)
-    }
-
-    /// Checks if an ipv4 address is unicast, taking into account subnet broadcast addresses
-    #[cfg(feature = "ipv4")]
-    #[inline(never)] // helps code size
-    pub(crate) fn is_unicast_v4(&self, address: Ipv4Addr) -> bool {
-        address.x_is_unicast() && !self.is_broadcast_v4(address)
     }
 
     /// Determine if the given `Ipv6Addr` is the solicited node
@@ -998,11 +1015,12 @@ impl IfaceState<'_> {
     pub(crate) fn has_solicited_node(&self, addr: Ipv6Addr) -> bool {
         self.cidrs().any(|cidr| {
             match *cidr {
-                IpCidr::V6(cidr) if cidr.address() != Ipv6Addr::LOCALHOST => {
+                IpCidr::V6(cidr) => {
                     // Take the lower order 24 bits of the IPv6 address and
                     // append those bits to FF02:0:0:0:0:1:FF00::/104.
                     addr.is_solicited_node_multicast() && addr.octets()[13..] == cidr.address().octets()[13..]
                 }
+                #[allow(unreachable_patterns)]
                 _ => false,
             }
         })
@@ -1057,9 +1075,7 @@ impl IfaceState<'_> {
         #[cfg(feature = "ipv6")]
         for cidr in self.cidrs() {
             #[allow(irrefutable_let_patterns)]
-            if let IpCidr::V6(cidr) = cidr
-                && cidr.address() != Ipv6Addr::LOCALHOST
-            {
+            if let IpCidr::V6(cidr) = cidr {
                 push(cidr.address().solicited_node().multicast_ethernet_addr());
             }
         }
@@ -1098,22 +1114,8 @@ impl IfaceState<'_> {
                 return false;
             }
 
-            if dst_addr.is_multicast()
-                && matches!(dst_addr.x_multicast_scope(), Ipv6MulticastScope::LinkLocal)
-                && src_addr.is_multicast()
-                && !matches!(src_addr.x_multicast_scope(), Ipv6MulticastScope::LinkLocal)
-            {
-                return false;
-            }
-
-            // Unspecified addresses and multicast address can not be in the candidate source address
-            // list. Except when the destination multicast address has a link-local scope, then the
-            // source address can also be link-local multicast.
-            if src_addr.is_unspecified() || src_addr.is_multicast() {
-                return false;
-            }
-
-            true
+            // Only unicast addresses can be sources.
+            src_addr.x_is_unicast()
         }
 
         // See RFC 6724 Section 2.2: Common Prefix Length
@@ -1172,9 +1174,9 @@ impl IfaceState<'_> {
             }
 
             // Rule 2: prefer appropriate scope.
-            let candidate_scope = candidate_cidr.address().x_multicast_scope() as u8;
-            let addr_scope = cidr.address().x_multicast_scope() as u8;
-            let dst_scope = dst_addr.x_multicast_scope() as u8;
+            let candidate_scope = candidate_cidr.address().x_scope();
+            let addr_scope = cidr.address().x_scope();
+            let dst_scope = dst_addr.x_scope();
             if candidate_scope != addr_scope {
                 return if addr_scope < candidate_scope {
                     addr_scope >= dst_scope

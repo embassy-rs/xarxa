@@ -88,6 +88,14 @@ pub const NEIGHBOR_CACHE_COUNT: usize = raw::NEIGHBOR_CACHE_COUNT;
 /// Default: 4.
 pub const TX_TIMESTAMP_QUEUE_COUNT: usize = raw::TX_TIMESTAMP_QUEUE_COUNT;
 
+/// Packets sent to the stack itself queued with `loopback`, until the next
+/// [`Stack::poll`](crate::Stack::poll) receives them.
+///
+/// A send that finds the queue full waits, like for a busy device. Each queued
+/// packet holds a buffer of the pool. Always bounded, including with `alloc`.
+/// Default: 4.
+pub const LOOPBACK_QUEUE_COUNT: usize = raw::LOOPBACK_QUEUE_COUNT;
+
 // ======== Sockets
 
 /// Max UDP sockets a [`Stack`](crate::Stack) can hold.

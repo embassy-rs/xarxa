@@ -92,6 +92,8 @@ EXTRAS = [
     "multicast",
     "multicast,defmt",
     "multicast,icmp-errors,icmp-ping-reply",
+    "loopback",
+    "loopback,defmt",
     "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,tcp-sack,"
     "packet-log,dhcpv4,dhcpv4-options,dhcpv4-server,multicast,ipv4-fragmentation,ipv4-reassembly,"
     "medium-ieee802154,sixlowpan-fragmentation,sixlowpan-reassembly,slaac",
@@ -102,7 +104,7 @@ FULL = (
     "medium-ethernet,medium-ip,medium-ieee802154,ipv4,ipv6,raw-ethernet,raw-ip,udp,tcp,tcp-listener,"
     "std,log,async,icmp-errors,icmp-ping-reply,iface-bind,multicast,slaac,dhcpv4,dhcpv4-options,dhcpv4-server,"
     "dns,mdns,packetmeta-timestamp,tcp-timestamps,tcp-sack,ipv4-fragmentation,ipv4-reassembly,"
-    "sixlowpan-fragmentation,sixlowpan-reassembly,serde"
+    "sixlowpan-fragmentation,sixlowpan-reassembly,loopback,serde"
 )
 
 
@@ -182,6 +184,8 @@ def collect():
                 for alloc in ["", "alloc"]:
                     cmds.check(join(features, alloc))
                     cmds.check(join(features, COMBO_EXTRAS, alloc))
+                # `loopback` adds a path into ingress from every kind of egress.
+                cmds.check(join(features, COMBO_EXTRAS, "loopback"))
 
     # `xarxa-driver` on its own, every feature combination it has (it has few).
     # The combinations above only build it with the features xarxa forwards.

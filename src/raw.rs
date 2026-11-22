@@ -609,7 +609,8 @@ impl RawSocket<'_, '_> {
     #[cfg(feature = "raw-ethernet")]
     fn prepare_ethernet_send(&mut self) -> Result<IfaceHandle, SendError> {
         let iface = self.ethernet_iface().ok_or(SendError::Unaddressable)?;
-        self.check_send_ready(iface)?;
+        let ready = self.tx.can_transmit(iface).is_ok();
+        self.check_send_ready(ready, iface)?;
         Ok(iface)
     }
 
@@ -622,8 +623,11 @@ impl RawSocket<'_, '_> {
         }
     }
 
-    fn check_send_ready(&mut self, iface: IfaceHandle) -> Result<(), SendError> {
-        if self.tx.can_transmit(iface).is_err() {
+    /// Turn whether `iface` can take the packet now into the send's answer.
+    fn check_send_ready(&mut self, ready: bool, iface: IfaceHandle) -> Result<(), SendError> {
+        #[cfg(not(feature = "async"))]
+        let _ = iface;
+        if !ready {
             // Stack::poll wakes this socket when the interface has room.
             #[cfg(feature = "async")]
             {
@@ -729,7 +733,8 @@ impl RawSocket<'_, '_> {
                 let Some(route) = self.tx.route(self.state.binding, &dst_addr) else {
                     return Err((SendError::Unaddressable, buf));
                 };
-                if let Err(err) = self.check_send_ready(route.iface) {
+                let ready = self.tx.can_transmit_route(&route).is_ok();
+                if let Err(err) = self.check_send_ready(ready, route.iface) {
                     return Err((err, buf));
                 }
                 if !buf.ensure_headroom(route.ip_headroom) {

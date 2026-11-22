@@ -4,6 +4,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
 use crate::error::Malformed;
+use crate::wire::ip::{AddrClass, scope};
 
 pub use super::IpProtocol as Protocol;
 
@@ -32,59 +33,22 @@ pub const LINK_LOCAL_ALL_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 
 /// [all MLVDv2-capable routers multicast address]: https://tools.ietf.org/html/rfc3810#section-11
 pub const LINK_LOCAL_ALL_MLDV2_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16);
 
-/// The [scope] of an address.
-///
-/// [scope]: https://www.rfc-editor.org/rfc/rfc4291#section-2.7
-#[repr(u8)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MulticastScope {
-    /// Interface Local scope
-    InterfaceLocal = 0x1,
-    /// Link local scope
-    LinkLocal = 0x2,
-    /// Administratively configured
-    AdminLocal = 0x4,
-    /// Single site scope
-    SiteLocal = 0x5,
-    /// Organization scope
-    OrganizationLocal = 0x8,
-    /// Global scope
-    Global = 0xE,
-    /// Unknown scope
-    Unknown = 0xFF,
-}
-
-impl From<u8> for MulticastScope {
-    fn from(value: u8) -> Self {
-        match value {
-            0x1 => Self::InterfaceLocal,
-            0x2 => Self::LinkLocal,
-            0x4 => Self::AdminLocal,
-            0x5 => Self::SiteLocal,
-            0x8 => Self::OrganizationLocal,
-            0xE => Self::Global,
-            _ => Self::Unknown,
-        }
-    }
-}
-
 pub use core::net::Ipv6Addr as Address;
 
 pub(crate) trait AddressExt {
-    /// Query whether the IPv6 address is an [unicast address].
+    /// Classify the address. See [`AddrClass`](crate::wire::ip::AddrClass).
+    fn x_class(&self) -> AddrClass;
+
+    /// Query whether the IPv6 address is an [unicast address], other than the
+    /// loopback address.
     ///
     /// [unicast address]: https://tools.ietf.org/html/rfc4291#section-2.5
     ///
     /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
     fn x_is_unicast(&self) -> bool;
 
-    /// Query whether the IPv6 address is a [global unicast address].
-    ///
-    /// [global unicast address]: https://datatracker.ietf.org/doc/html/rfc3587
-    fn is_global_unicast(&self) -> bool;
-
-    /// Query whether the IPv6 address is in the [link-local] scope.
+    /// Query whether the IPv6 address is a [link-local] unicast address, in
+    /// fe80::/10.
     ///
     /// [link-local]: https://tools.ietf.org/html/rfc4291#section-2.5.6
     fn is_link_local(&self) -> bool;
@@ -113,10 +77,10 @@ pub(crate) trait AddressExt {
     #[cfg(feature = "medium-ethernet")]
     fn multicast_ethernet_addr(&self) -> super::EthernetAddress;
 
-    /// Return the scope of the address.
-    ///
-    /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
-    fn x_multicast_scope(&self) -> MulticastScope;
+    /// The [scope](crate::wire::ip::scope) of the address, by RFC 6724 §3.1:
+    /// a multicast group's own, link-local for fe80::/10 and the loopback
+    /// address, global for any other unicast address.
+    fn x_scope(&self) -> u8;
 
     /// Query whether the IPv6 address is a [solicited-node multicast address].
     ///
@@ -129,16 +93,30 @@ pub(crate) trait AddressExt {
 }
 
 impl AddressExt for Address {
-    fn x_is_unicast(&self) -> bool {
-        !(self.is_multicast() || self.is_unspecified())
+    fn x_class(&self) -> AddrClass {
+        let octets = self.octets();
+        if octets[0] == 0xff {
+            AddrClass::Multicast(octets[1] & 0x0f)
+        } else if self.is_unspecified() {
+            AddrClass::Unspecified
+        } else if self.is_loopback() {
+            AddrClass::Loopback
+        } else if self.is_link_local() {
+            AddrClass::Unicast(scope::LINK_LOCAL)
+        } else {
+            AddrClass::Unicast(scope::GLOBAL)
+        }
     }
 
-    fn is_global_unicast(&self) -> bool {
-        (self.octets()[0] >> 5) == 0b001
+    fn x_is_unicast(&self) -> bool {
+        // `matches!(self.x_class(), AddrClass::Unicast(_))`: neither `::`, `::1`
+        // nor multicast.
+        self.to_bits() > 1 && self.octets()[0] != 0xff
     }
 
     fn is_link_local(&self) -> bool {
-        self.octets()[0..8] == [0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        let octets = self.octets();
+        octets[0] == 0xfe && octets[1] & 0xc0 == 0x80
     }
 
     fn mask(&self, mask: u8) -> [u8; ADDR_SIZE] {
@@ -172,19 +150,11 @@ impl AddressExt for Address {
         super::EthernetAddress([0x33, 0x33, b[12], b[13], b[14], b[15]])
     }
 
-    fn x_multicast_scope(&self) -> MulticastScope {
-        if self.is_multicast() {
-            return MulticastScope::from(self.octets()[1] & 0b1111);
-        }
-
-        if self.is_link_local() {
-            MulticastScope::LinkLocal
-        } else if self.is_unique_local() || self.is_global_unicast() {
-            // ULA are considered global scope
-            // https://www.rfc-editor.org/rfc/rfc6724#section-3.1
-            MulticastScope::Global
-        } else {
-            MulticastScope::Unknown
+    #[inline(never)] // helps code size
+    fn x_scope(&self) -> u8 {
+        match self.x_class() {
+            AddrClass::Multicast(scope) | AddrClass::Unicast(scope) => scope,
+            _ => scope::LINK_LOCAL,
         }
     }
 
@@ -551,14 +521,12 @@ pub(crate) mod test {
         assert!(!LINK_LOCAL_ALL_ROUTERS.is_link_local());
         assert!(!LINK_LOCAL_ALL_ROUTERS.is_loopback());
         assert!(!LINK_LOCAL_ALL_ROUTERS.is_unique_local());
-        assert!(!LINK_LOCAL_ALL_ROUTERS.is_global_unicast());
         assert!(!LINK_LOCAL_ALL_ROUTERS.is_solicited_node_multicast());
         assert!(!LINK_LOCAL_ALL_NODES.is_unspecified());
         assert!(LINK_LOCAL_ALL_NODES.is_multicast());
         assert!(!LINK_LOCAL_ALL_NODES.is_link_local());
         assert!(!LINK_LOCAL_ALL_NODES.is_loopback());
         assert!(!LINK_LOCAL_ALL_NODES.is_unique_local());
-        assert!(!LINK_LOCAL_ALL_NODES.is_global_unicast());
         assert!(!LINK_LOCAL_ALL_NODES.is_solicited_node_multicast());
     }
 
@@ -569,7 +537,6 @@ pub(crate) mod test {
         assert!(LINK_LOCAL_ADDR.is_link_local());
         assert!(!LINK_LOCAL_ADDR.is_loopback());
         assert!(!LINK_LOCAL_ADDR.is_unique_local());
-        assert!(!LINK_LOCAL_ADDR.is_global_unicast());
         assert!(!LINK_LOCAL_ADDR.is_solicited_node_multicast());
     }
 
@@ -580,7 +547,6 @@ pub(crate) mod test {
         assert!(!Address::LOCALHOST.is_link_local());
         assert!(Address::LOCALHOST.is_loopback());
         assert!(!Address::LOCALHOST.is_unique_local());
-        assert!(!Address::LOCALHOST.is_global_unicast());
         assert!(!Address::LOCALHOST.is_solicited_node_multicast());
     }
 
@@ -591,7 +557,6 @@ pub(crate) mod test {
         assert!(!UNIQUE_LOCAL_ADDR.is_link_local());
         assert!(!UNIQUE_LOCAL_ADDR.is_loopback());
         assert!(UNIQUE_LOCAL_ADDR.is_unique_local());
-        assert!(!UNIQUE_LOCAL_ADDR.is_global_unicast());
         assert!(!UNIQUE_LOCAL_ADDR.is_solicited_node_multicast());
     }
 
@@ -602,7 +567,6 @@ pub(crate) mod test {
         assert!(!GLOBAL_UNICAST_ADDR.is_link_local());
         assert!(!GLOBAL_UNICAST_ADDR.is_loopback());
         assert!(!GLOBAL_UNICAST_ADDR.is_unique_local());
-        assert!(GLOBAL_UNICAST_ADDR.is_global_unicast());
         assert!(!GLOBAL_UNICAST_ADDR.is_solicited_node_multicast());
     }
 
@@ -613,7 +577,6 @@ pub(crate) mod test {
         assert!(!TEST_SOL_NODE_MCAST_ADDR.is_link_local());
         assert!(!TEST_SOL_NODE_MCAST_ADDR.is_loopback());
         assert!(!TEST_SOL_NODE_MCAST_ADDR.is_unique_local());
-        assert!(!TEST_SOL_NODE_MCAST_ADDR.is_global_unicast());
         assert!(TEST_SOL_NODE_MCAST_ADDR.is_solicited_node_multicast());
     }
 
@@ -759,41 +722,38 @@ pub(crate) mod test {
     #[test]
     fn test_scope() {
         use super::*;
-        assert_eq!(
-            Address::new(0xff01, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::InterfaceLocal
-        );
-        assert_eq!(
-            Address::new(0xff02, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::LinkLocal
-        );
-        assert_eq!(
-            Address::new(0xff03, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::Unknown
-        );
-        assert_eq!(
-            Address::new(0xff04, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::AdminLocal
-        );
-        assert_eq!(
-            Address::new(0xff05, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::SiteLocal
-        );
-        assert_eq!(
-            Address::new(0xff08, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::OrganizationLocal
-        );
-        assert_eq!(
-            Address::new(0xff0e, 0, 0, 0, 0, 0, 0, 1).x_multicast_scope(),
-            MulticastScope::Global
-        );
+        // A multicast group's scope is its scop field, whatever the value.
+        for scop in 0..16u16 {
+            assert_eq!(Address::new(0xff00 | scop, 0, 0, 0, 0, 0, 0, 1).x_scope(), scop as u8);
+        }
+        assert_eq!(LINK_LOCAL_ALL_NODES.x_scope(), scope::LINK_LOCAL);
 
-        assert_eq!(LINK_LOCAL_ALL_NODES.x_multicast_scope(), MulticastScope::LinkLocal);
+        // For source address selection, unicast addresses also have a scope
+        // (RFC 6724 §3.1): link-local for fe80::/10 and ::1, global otherwise.
+        assert_eq!(LINK_LOCAL_ADDR.x_scope(), scope::LINK_LOCAL);
+        assert_eq!(Address::new(0xfebf, 0, 0, 0, 0, 0, 0, 1).x_scope(), scope::LINK_LOCAL);
+        assert_eq!(Address::LOCALHOST.x_scope(), scope::LINK_LOCAL);
+        assert_eq!(GLOBAL_UNICAST_ADDR.x_scope(), scope::GLOBAL);
+        assert_eq!(UNIQUE_LOCAL_ADDR.x_scope(), scope::GLOBAL);
+        assert_eq!(Address::new(0x0100, 0, 0, 0, 0, 0, 0, 1).x_scope(), scope::GLOBAL);
+    }
 
-        // For source address selection, unicast addresses also have a scope:
-        assert_eq!(LINK_LOCAL_ADDR.x_multicast_scope(), MulticastScope::LinkLocal);
-        assert_eq!(GLOBAL_UNICAST_ADDR.x_multicast_scope(), MulticastScope::Global);
-        assert_eq!(UNIQUE_LOCAL_ADDR.x_multicast_scope(), MulticastScope::Global);
+    #[test]
+    fn test_class() {
+        use super::*;
+        assert_eq!(Address::UNSPECIFIED.x_class(), AddrClass::Unspecified);
+        assert_eq!(Address::LOCALHOST.x_class(), AddrClass::Loopback);
+        assert_eq!(LINK_LOCAL_ALL_NODES.x_class(), AddrClass::Multicast(scope::LINK_LOCAL));
+        assert_eq!(LINK_LOCAL_ADDR.x_class(), AddrClass::Unicast(scope::LINK_LOCAL));
+        assert_eq!(GLOBAL_UNICAST_ADDR.x_class(), AddrClass::Unicast(scope::GLOBAL));
+        assert!(!Address::LOCALHOST.x_is_unicast());
+        assert!(!Address::UNSPECIFIED.x_is_unicast());
+        assert!(!LINK_LOCAL_ALL_NODES.x_is_unicast());
+        assert!(UNIQUE_LOCAL_ADDR.x_is_unicast());
+        // All of fe80::/10 is link-local, not just fe80::/64.
+        assert!(Address::new(0xfe80, 0, 0, 1, 0, 0, 0, 1).is_link_local());
+        assert!(Address::new(0xfebf, 0, 0, 0, 0, 0, 0, 1).is_link_local());
+        assert!(!Address::new(0xfec0, 0, 0, 0, 0, 0, 0, 1).is_link_local());
     }
 
     static REPR_PACKET_BYTES: [u8; 52] = [

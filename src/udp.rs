@@ -817,14 +817,20 @@ impl UdpSocket<'_, '_> {
     /// # Errors
     /// - `InvalidState`: if the socket is not bound.
     /// - `Unaddressable`: if the destination address or port is still
-    ///   unspecified after defaulting, the destination's address family does not
-    ///   match the source address, no source address is available, or the source
-    ///   address is not assigned to any interface.
+    ///   unspecified after defaulting, there is no route to the destination (an
+    ///   address that never leaves the host has none: a loopback address, one of
+    ///   ours, unless the `loopback` feature is on, `0.0.0.0/8`, `240.0.0.0/4`
+    ///   and interface-local multicast), the destination's address family does
+    ///   not match the source address, no source address is available, or the
+    ///   source address is not assigned to any interface. Also if it is a
+    ///   loopback address and the destination is not ours.
     /// - `BufferFull`: if the payload cannot fit in a packet buffer.
     /// - `NoBuffer`: if every packet buffer is in use.
     /// - `DeviceBusy`: if the interface the datagram would go out of has no room
     ///   for it right now. Also if its neighbor is being resolved, and already
-    ///   holds a packet waiting for that.
+    ///   holds a packet waiting for that. With `loopback`, also if the datagram
+    ///   is to ourselves and [`LOOPBACK_QUEUE_COUNT`](crate::config::LOOPBACK_QUEUE_COUNT)
+    ///   are already waiting for the next poll.
     ///
     /// `NoBuffer` and `DeviceBusy` send nothing. Try again later.
     pub fn send_with(
@@ -1022,11 +1028,11 @@ impl UdpSocket<'_, '_> {
         // the egress one (weak host model). A stack-selected source is ours by
         // construction, this catches an explicit or bound source address that
         // isn't (or no longer is) ours.
-        if !self.tx.has_ip_addr(src_addr) {
+        if !self.tx.is_source_for(src_addr, &route) {
             return Err(SendError::Unaddressable);
         }
 
-        if self.tx.can_transmit(route.iface).is_err() {
+        if self.tx.can_transmit_route(&route).is_err() {
             // `Stack::poll` wakes the socket once the interface has room.
             #[cfg(feature = "async")]
             {
@@ -1056,7 +1062,7 @@ impl UdpSocket<'_, '_> {
             udp.set_src_port(src.port);
             udp.set_dst_port(dst.port);
             udp.set_len((size + UDP_HEADER_LEN) as u16);
-            if !self.tx.checksum_caps(route.iface).udp.tx {
+            if !self.tx.checksum_caps(&route).udp.tx {
                 udp.fill_checksum(&src.addr, &dst.addr);
             } else {
                 // A zero checksum means "no checksum" on UDP-over-IPv4, and is what a

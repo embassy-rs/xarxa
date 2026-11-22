@@ -4,7 +4,7 @@
 
 use super::{AddressContext, DISPATCH_IPHC_HEADER, Malformed, NextHeader};
 use crate::wire::take;
-use crate::wire::{IpProtocol, ieee802154::Address as LlAddress, ipv6, ipv6::AddressExt};
+use crate::wire::{IpProtocol, ieee802154::Address as LlAddress, ipv6};
 
 /// The largest IPHC header: the base, a context identifier, an inline traffic
 /// class and flow label, next header, hop limit, and two full addresses.
@@ -110,13 +110,19 @@ fn compress_iid(octets: &[u8; 16], ll_addr: Option<LlAddress>) -> (u8, [u8; 16],
     }
 }
 
+/// Whether the address is in fe80::/64, the link-local prefix IPHC elides. Only
+/// that exact prefix: the rest of fe80::/10 is link-local too, but carried whole.
+fn is_link_local_64(addr: &ipv6::Address) -> bool {
+    addr.segments()[..4] == [0xfe80, 0, 0, 0]
+}
+
 /// How a source address compresses: the SAC bit, the SAM bits, and the bytes
 /// carried inline.
 fn compress_src(addr: &ipv6::Address, ll_addr: Option<LlAddress>) -> (bool, u8, [u8; 16], usize) {
     let octets = addr.octets();
     if *addr == ipv6::Address::UNSPECIFIED {
         (true, 0b00, octets, 0)
-    } else if addr.is_link_local() {
+    } else if is_link_local_64(addr) {
         let (sam, inline, len) = compress_iid(&octets, ll_addr);
         (false, sam, inline, len)
     } else {
@@ -148,7 +154,7 @@ fn compress_dst(addr: &ipv6::Address, ll_addr: Option<LlAddress>) -> (bool, u8, 
         } else {
             (true, 0b00, octets, 16)
         }
-    } else if addr.is_link_local() {
+    } else if is_link_local_64(addr) {
         let (dam, inline, len) = compress_iid(&octets, ll_addr);
         (false, dam, inline, len)
     } else {

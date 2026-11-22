@@ -1,7 +1,7 @@
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use crate::driver::DriverBuf;
+use crate::driver::{DriverBuf, RxWanted};
 use crate::driver::{Capabilities, Driver};
 use crate::iface::Medium;
 #[cfg(feature = "medium-ethernet")]
@@ -219,8 +219,13 @@ impl Driver for TunTapDriver {
         self.hardware_addr.to_driver().unwrap()
     }
 
-    fn rx_wanted(&mut self) -> usize {
-        self.rx_buf.is_none() as usize
+    fn rx_wanted(&mut self) -> RxWanted {
+        // It reads frames into one buffer, so without it, it can't receive.
+        let starved = self.rx_buf.is_none();
+        RxWanted {
+            count: starved as usize,
+            starved,
+        }
     }
 
     fn rx_give(&mut self, buf: DriverBuf) {

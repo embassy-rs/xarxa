@@ -13,6 +13,8 @@ use crate::driver::DriverBuf;
 use crate::iface::IfaceState;
 #[cfg(feature = "ipv4-fragmentation")]
 use crate::rand::Rand;
+#[cfg(feature = "ipv4-fragmentation")]
+use crate::stack::TxResult;
 use crate::stack::{Blocked, StackInner};
 use crate::wire::*;
 
@@ -96,7 +98,10 @@ impl StackInner {
                 trace!("fragmenter: device has no room, fragments wait");
                 return Err(Blocked::DeviceBusy);
             }
-            let Some(mut tx_buffer) = self.buffers.alloc() else {
+            // Each fragment goes straight to the device, and the packet can't
+            // leave the fragmenter until they have all gone, so they may take
+            // the last free buffer.
+            let Some(mut tx_buffer) = self.buffers.alloc_urgent() else {
                 trace!("fragmenter: no packet buffer, fragments wait");
                 return Err(Blocked::NoBuffer);
             };
@@ -136,7 +141,30 @@ impl StackInner {
 
     /// Fragment an IPv4 packet larger than the interface's MTU, whose next hop
     /// is resolved to `link_dst`, and start transmitting the fragments.
-    pub(crate) fn fragment_ipv4(&mut self, iface: &mut IfaceState<'_>, link_dst: HardwareAddress, mut buf: DriverBuf) {
+    ///
+    /// The packet waits in the fragmenter until its last fragment is out, so it
+    /// only goes in with a buffer to spare. Otherwise it is handed back.
+    pub(crate) fn fragment_ipv4(
+        &mut self,
+        iface: &mut IfaceState<'_>,
+        link_dst: HardwareAddress,
+        buf: DriverBuf,
+    ) -> TxResult {
+        match self.buffers.keep(buf) {
+            Ok(buf) => {
+                self.fragment_ipv4_kept(iface, link_dst, buf);
+                Ok(())
+            }
+            Err(buf) => {
+                trace!("fragmenter: no buffer to spare for the packet");
+                Err((Blocked::NoBuffer, buf))
+            }
+        }
+    }
+
+    /// [`fragment_ipv4`](Self::fragment_ipv4) for a packet that is already
+    /// allowed to wait: one that was parked on its neighbor.
+    pub(crate) fn fragment_ipv4_kept(&mut self, iface: &mut IfaceState<'_>, link_dst: HardwareAddress, mut buf: Buf) {
         debug!("start fragmentation");
 
         if !iface.fragmenter.is_idle() {
@@ -152,7 +180,7 @@ impl StackInner {
 
         // Keep the packet, and where its fragments go.
         iface.fragmenter = Fragmenter::Ipv4(Ipv4Fragmenter {
-            buffer: Buf::from_driver_buf(buf),
+            buffer: buf,
             link_dst,
             ident: self.next_ipv4_frag_ident(),
             frag_offset: 0,

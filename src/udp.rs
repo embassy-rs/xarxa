@@ -842,10 +842,11 @@ impl UdpSocket<'_, '_> {
 
     /// Allocate an empty UDP payload buffer with headroom for the headers.
     ///
-    /// Allocation works before binding. Returns `None` if every packet buffer
-    /// is in use. Set the payload length with [`DriverBuf::set_len`] before writing.
+    /// Allocation works before binding. Returns `None` if the pool has no
+    /// buffer to spare. Set the payload length with
+    /// [`DriverBuf::set_len`] before writing.
     pub fn alloc_buf(&self) -> Option<Buf> {
-        let mut buf = Buf::from_driver_buf(self.tx.inner.buffers.alloc()?);
+        let mut buf = self.tx.inner.buffers.alloc_kept()?;
         buf.reserve(self.send_headroom());
         Some(buf)
     }
@@ -870,8 +871,9 @@ impl UdpSocket<'_, '_> {
     /// replacing the buffer's metadata.
     ///
     /// Errors return the buffer, with its payload and metadata unchanged. Errors
-    /// match [`send_with`](Self::send_with), except this method allocates no
-    /// payload buffer and never returns [`SendError::NoBuffer`].
+    /// match [`send_with`](Self::send_with). `NoBuffer` here means the datagram
+    /// would have to wait inside the stack, and the pool has no buffer to spare
+    /// for that.
     /// Success transfers ownership to the stack; it does not guarantee delivery.
     ///
     /// # Panics
@@ -880,11 +882,31 @@ impl UdpSocket<'_, '_> {
         let buf = buf.into_driver_buf();
         self.tx.inner.buffers.check_owned(&buf);
         self.send_meta(buf, meta.into())
-            .map_err(|(err, buf)| (err, Buf::from_driver_buf(buf)))
+            .map_err(|(err, buf)| (err, Buf::from_refused(buf)))
     }
 
-    /// [`send_buf`](Self::send_buf), with the metadata converted, so that only
-    /// the conversion is compiled per metadata type.
+    /// [`send_buf`](Self::send_buf) for a buffer a driver got from the stack.
+    ///
+    /// For drivers that send what they are given to transmit through a socket,
+    /// like a VPN. The buffer may be one the stack keeps free for urgent packets.
+    /// It goes out if it can go straight to a device. It only waits inside the
+    /// stack, on a neighbor or to be fragmented, if the stack has a buffer to
+    /// spare for that. Otherwise it is handed back with `NoBuffer`: drop it.
+    ///
+    /// # Panics
+    /// Panics if the buffer comes from another stack's pool.
+    pub fn send_driver_buf(
+        &mut self,
+        buf: DriverBuf,
+        meta: impl Into<UdpMetadata>,
+    ) -> Result<(), (SendError, DriverBuf)> {
+        self.tx.inner.buffers.check_owned(&buf);
+        self.send_meta(buf, meta.into())
+    }
+
+    /// [`send_buf`](Self::send_buf) and [`send_driver_buf`](Self::send_driver_buf),
+    /// with the metadata converted, so that only the conversion is compiled per
+    /// metadata type.
     fn send_meta(&mut self, mut buf: DriverBuf, mut meta: UdpMetadata) -> Result<(), (SendError, DriverBuf)> {
         let (route, src, hop_limit) = match self.route_datagram(&mut meta) {
             Ok(routed) => routed,
@@ -1139,7 +1161,11 @@ impl Stack<'_> {
                 "udp:{}: receiving {} octets from {}:{}",
                 socket.local, payload_len, src_addr, src_port
             );
-            socket.rx_enqueue(Buf::from_driver_buf(buf));
+            // It waits for the application, so only with a buffer to spare.
+            match self.inner.buffers.keep(buf) {
+                Ok(buf) => socket.rx_enqueue(buf),
+                Err(_) => trace!("udp: no buffer to spare, dropping packet"),
+            }
             return;
         }
 

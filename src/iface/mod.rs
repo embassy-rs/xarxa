@@ -359,6 +359,9 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) slaac: Option<self::slaac::Slaac>,
     /// Link state at the previous poll, for spotting a change.
     pub(crate) last_link_state: crate::driver::LinkState,
+    /// Whether the driver is starved, as it last said. Counted in the stack's
+    /// [`Buffers`](crate::buffers::Buffers), only change it through them.
+    pub(crate) rx_starved: bool,
     #[cfg(feature = "multicast")]
     pub(crate) multicast: crate::multicast::State,
     #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]

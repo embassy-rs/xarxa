@@ -198,6 +198,21 @@ impl Default for Capabilities {
     }
 }
 
+/// What a driver answers to [`Driver::rx_wanted`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RxWanted {
+    /// How many more empty buffers the driver can take right now.
+    pub count: usize,
+    /// The driver has no buffer to receive a frame into, so it can't receive
+    /// anything until it gets one. The stack keeps a buffer free for each
+    /// starved driver.
+    ///
+    /// `count` may be 0 then, for a driver that only takes a buffer once a frame
+    /// is waiting for it. The buffer is kept free for it all the same.
+    pub starved: bool,
+}
+
 /// A network device driver, sending and receiving raw network frames.
 pub trait Driver {
     /// Get a description of the device's capabilities.
@@ -247,21 +262,35 @@ pub trait Driver {
     }
 
     /// How many more empty buffers the driver can take right now, to receive
-    /// frames into.
+    /// frames into, and whether it can receive at all.
     ///
-    /// The stack asks on poll, and each call to [`receive`](Self::receive), and gives the
-    /// driver up to that many with [`rx_give`](Self::rx_give). It gives fewer if its
-    /// pool runs low.
+    /// The stack asks on poll, after each call to [`receive`](Self::receive),
+    /// and gives the driver up to [`count`](RxWanted::count) buffers with
+    /// [`rx_give`](Self::rx_give). It gives fewer if its pool runs low.
     ///
     /// A driver with a receive ring returns the number of slots that have no
     /// buffer. One that reads frames into a buffer on demand can ask for one.
-    fn rx_wanted(&mut self) -> usize;
+    ///
+    /// Set [`starved`](RxWanted::starved) whenever the driver can't receive a
+    /// frame without another buffer, whether or not a frame is waiting. The
+    /// stack keeps a buffer aside for each starved driver, so that it can always
+    /// give it one, but only one. It must be honest: a driver that says it is
+    /// starved when it isn't takes buffers from the other interfaces, and one
+    /// that doesn't say it when it is can be left with none.
+    fn rx_wanted(&mut self) -> RxWanted;
 
     /// Give the driver an empty buffer to receive a frame into.
     ///
     /// The driver owns it from then on. It hands it back with a frame in it from
-    /// [`receive`](Self::receive). It may also drop it, which gives it back to the
-    /// stack's pool.
+    /// [`receive`](Self::receive).
+    ///
+    /// It shouldn't drop it, except to drop a frame it received into it that it
+    /// doesn't hand back. The stack keeps a buffer free for a driver only while
+    /// the driver is starved, and it learns that from
+    /// [`rx_wanted`](Self::rx_wanted), which it asks after each `receive`. A
+    /// driver that drops its buffers some other way can be left with none to
+    /// receive into while the buffers that are free are all taken, and then
+    /// nothing guarantees it gets one again.
     ///
     /// The stack never gives more buffers than [`rx_wanted`](Self::rx_wanted) asked
     /// for. The buffer has zero headroom and length.
@@ -371,7 +400,7 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     fn register_waker(&mut self, waker: &Waker) -> Result<(), NotSupported> {
         T::register_waker(self, waker)
     }
-    fn rx_wanted(&mut self) -> usize {
+    fn rx_wanted(&mut self) -> RxWanted {
         T::rx_wanted(self)
     }
     fn rx_give(&mut self, buf: DriverBuf) {

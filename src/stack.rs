@@ -32,9 +32,7 @@ use crate::iface::{AddIfaceError, Iface, IfaceHandle, IfaceIter, IfaceState, Med
 use crate::neighbor::NeighborState;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::neighbor::{Answer as NeighborAnswer, Key as NeighborKey, NeighborCache, ProbeEvent};
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-use crate::buffers::Buf;
-use crate::buffers::Buffers;
+use crate::buffers::{Buf, Buffers};
 use crate::rand::Rand;
 #[cfg(feature = "_raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketIter, RawSocketState};
@@ -83,7 +81,8 @@ pub(crate) struct Sockets<'d> {
 /// Separate from `Stack` so that its methods can borrow an interface from `Stack::ifaces`
 /// while taking `&mut self`.
 pub(crate) struct StackInner {
-    /// The pool the stack allocates its packet buffers from.
+    /// The pool the stack allocates its packet buffers from, and how many of
+    /// them are kept free.
     pub(crate) buffers: Buffers,
     /// Size of the storage of each buffer of the pool.
     pub(crate) buf_capacity: usize,
@@ -208,12 +207,16 @@ pub(crate) enum TxWait {
 impl TxWait {
     /// What a packet the egress path handed back waits for. `route` is the way
     /// it was going out.
+    ///
+    /// Nothing signals a freed buffer, so a packet handed back for lack of one
+    /// waits for nothing: the caller tries again, as after any `NoBuffer`.
     #[allow(dead_code)] // only IP packets are handed back
     pub(crate) fn blocked(blocked: Blocked, route: &EgressRoute) -> Self {
         match blocked {
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             Blocked::Neighbor => TxWait::Neighbor((route.iface, route.next_hop)),
-            _ => TxWait::Iface(route.iface),
+            Blocked::NoBuffer => TxWait::None,
+            Blocked::DeviceBusy => TxWait::Iface(route.iface),
         }
     }
 
@@ -232,6 +235,34 @@ impl TxWait {
             *self = TxWait::None;
         }
         over
+    }
+}
+
+/// Give an interface's driver the receive buffers it wants, and record whether
+/// it is left starved.
+///
+/// A starved driver gets its first buffer from the one kept free for it, the
+/// rest only if they are to spare. Nothing signals a freed buffer, so if a
+/// starved driver that wants one gets none, poll again soon.
+fn refill_rx(buffers: &mut Buffers, iface: &mut IfaceState<'_>, clock: &mut Clock) {
+    let wanted = iface.driver.rx_wanted();
+    buffers.set_starved(&mut iface.rx_starved, wanted.starved);
+    for i in 0..wanted.count {
+        let buf = if wanted.starved && i == 0 {
+            buffers.alloc_starved()
+        } else {
+            buffers.alloc()
+        };
+        let Some(buf) = buf else {
+            if wanted.starved && i == 0 {
+                clock.after(POOL_RETRY_DELAY);
+            }
+            break;
+        };
+        iface.driver.rx_give(buf);
+        if i == 0 {
+            buffers.set_starved(&mut iface.rx_starved, false);
+        }
     }
 }
 
@@ -625,7 +656,7 @@ impl<'d> Stack<'d> {
     #[cfg(test)]
     #[allow(dead_code)] // which builds use it depends on the features
     pub(crate) fn test_buf(&self, bytes: &[u8]) -> DriverBuf {
-        let mut buf = self.inner.buffers.alloc().unwrap();
+        let mut buf = self.inner.buffers.alloc_urgent().unwrap();
         buf.set_len(bytes.len());
         buf.copy_from_slice(bytes);
         buf
@@ -810,6 +841,7 @@ impl<'d> Stack<'d> {
             #[cfg(feature = "slaac")]
             slaac: None,
             last_link_state: crate::driver::LinkState::Down,
+            rx_starved: false,
             #[cfg(feature = "multicast")]
             multicast: crate::multicast::State::new(),
             #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
@@ -828,6 +860,9 @@ impl<'d> Stack<'d> {
         }
         #[cfg(feature = "medium-ethernet")]
         self.ifaces.get_mut(index).sync_multicast_filter();
+        // The driver has no buffer yet, so one is kept for it until its first poll.
+        let iface = self.ifaces.get_mut(index);
+        self.inner.buffers.set_starved(&mut iface.rx_starved, true);
         Ok(IfaceHandle::new(index))
     }
 
@@ -861,6 +896,25 @@ impl<'d> Stack<'d> {
         self.inner.tx_timestamps.waker.register(waker);
     }
 
+    /// Let a buffer wait outside the stack, as a [`Buf`].
+    ///
+    /// For drivers that hand what they transmit to something that may take a
+    /// while, like a VPN driver that queues packets for a task that sends them
+    /// through a socket. A [`DriverBuf`](crate::driver::DriverBuf) has to come back
+    /// to the pool in bounded time. A [`Buf`] may wait as long as it likes.
+    ///
+    /// The stack keeps a few buffers free, so that every interface can always
+    /// receive and the stack can always send a neighbor solicitation. This
+    /// refuses if letting the buffer wait would take one of them. The error
+    /// hands the buffer back. Drop it then.
+    ///
+    /// # Panics
+    /// Panics if the buffer comes from another stack's pool.
+    pub fn keep(&self, buf: crate::driver::DriverBuf) -> Result<Buf, crate::driver::DriverBuf> {
+        self.inner.buffers.check_owned(&buf);
+        self.inner.buffers.keep(buf)
+    }
+
     /// Borrow an interface from the stack.
     ///
     /// # Panics
@@ -879,6 +933,8 @@ impl<'d> Stack<'d> {
     /// # Panics
     /// Panics if the handle is stale (the interface was already removed).
     pub fn remove_iface(&mut self, handle: IfaceHandle) {
+        let iface = self.ifaces.get_mut(handle.index());
+        self.inner.buffers.set_starved(&mut iface.rx_starved, false);
         self.ifaces.remove(handle.index());
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         self.inner.neighbor_cache.clear_iface(handle);
@@ -1219,30 +1275,36 @@ impl<'d> Stack<'d> {
             iface.drain_tx_timestamps(&mut self.inner.tx_timestamps);
         }
 
+        // The solicitations due go out before anything else, on every interface.
+        // They may take the last free buffer, and they are what the packets waiting
+        // on a neighbor need to move again, so nothing else gets to take it first.
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+        {
+            let mut next = 0;
+            while let Some(index) = self.ifaces.next_occupied(next) {
+                next = index + 1;
+                self.poll_neighbor_timers(IfaceHandle::new(index), &mut clock);
+            }
+        }
+
         let mut next = 0;
         while let Some(index) = self.ifaces.next_occupied(next) {
             next = index + 1;
             let handle = IfaceHandle::new(index);
 
-            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-            self.poll_neighbor_timers(handle, &mut clock);
-
-            // Give the driver the buffers it wants before each frame, so that it never
-            // runs short while frames are coming in. Nothing signals a freed buffer,
-            // so if the pool runs out first, poll again soon.
+            // Give the driver the buffers it wants before the first frame and after each
+            // one, so that it never runs short while frames are coming in.
+            //
+            // It happens before the frame is processed: if the driver just handed over
+            // its last buffer, the frame may only wait in the stack if a buffer stays
+            // free for the driver.
+            refill_rx(&mut self.inner.buffers, self.ifaces.get_mut(index), &mut clock);
             loop {
-                let buffers = &self.inner.buffers;
-                let driver = &mut self.ifaces.get_mut(index).driver;
-                for _ in 0..driver.rx_wanted() {
-                    let Some(buf) = buffers.alloc() else {
-                        clock.after(POOL_RETRY_DELAY);
-                        break;
-                    };
-                    driver.rx_give(buf);
-                }
+                let iface = self.ifaces.get_mut(index);
                 #[allow(unused_mut)]
-                let Some(mut buf) = driver.receive() else { break };
-                buffers.check_owned(&buf);
+                let Some(mut buf) = iface.driver.receive() else { break };
+                refill_rx(&mut self.inner.buffers, iface, &mut clock);
+                self.inner.buffers.check_owned(&buf);
                 #[cfg(feature = "packet-log")]
                 {
                     trace!("received on iface {}", index);
@@ -2640,7 +2702,7 @@ impl StackInner {
                 // Only IPv4 is parked larger than the MTU, to be fragmented.
                 #[cfg(feature = "ipv4-fragmentation")]
                 if buf.len() > iface.ip_mtu {
-                    return self.fragment_ipv4(iface, HardwareAddress::Ethernet(hardware_addr), buf.into_driver_buf());
+                    return self.fragment_ipv4_kept(iface, HardwareAddress::Ethernet(hardware_addr), buf);
                 }
                 let ethertype = match dst_addr {
                     #[cfg(feature = "ipv4")]
@@ -2650,10 +2712,9 @@ impl StackInner {
                 };
                 self.transmit_ethernet(iface, hardware_addr, buf.into_driver_buf(), ethertype)
             }
+            // It may move on to the fragmenter, where it waits again.
             #[cfg(feature = "medium-ieee802154")]
-            HardwareAddress::Ieee802154(hardware_addr) => {
-                self.dispatch_ieee802154(iface, hardware_addr, buf.into_driver_buf())
-            }
+            HardwareAddress::Ieee802154(hardware_addr) => self.dispatch_ieee802154_kept(iface, hardware_addr, buf),
             #[cfg(feature = "medium-ip")]
             HardwareAddress::Ip => unreachable!(),
         }
@@ -2742,7 +2803,7 @@ impl StackInner {
             return Ok(());
         };
 
-        let mut buf = self.alloc_obligation(&mut *iface.driver)?;
+        let mut buf = self.alloc_probe(&mut *iface.driver)?;
         buf.reserve(iface.caps.tx_headroom + ETHERNET_HEADER_LEN);
         buf.set_len(ARP_BUFFER_LEN);
         {
@@ -2768,7 +2829,7 @@ impl StackInner {
 
         // Neighbor solicit: NS header (24 bytes) plus the source link-layer
         // address option.
-        let mut buf = self.alloc_obligation(&mut *iface.driver)?;
+        let mut buf = self.alloc_probe(&mut *iface.driver)?;
         let opt_len = lladdr_option_len(iface.hardware_addr);
         buf.reserve(iface.ip_headroom + IPV6_HEADER_LEN);
         buf.set_len(24 + opt_len);
@@ -2819,9 +2880,9 @@ impl StackInner {
     }
 
     /// Allocate the buffer for a packet the stack has to send on its own account,
-    /// and that nothing sends again if it is lost: a solicitation, a membership
-    /// report, a DHCP request. It goes straight to the device, so the device is
-    /// asked for room first.
+    /// and that nothing sends again if it is lost: a membership report, a DHCP
+    /// request, a router solicitation. It goes straight to the device, so the
+    /// device is asked for room first.
     ///
     /// The error says what the packet waits for. The caller leaves its state as
     /// it was, so the packet stays due.
@@ -2831,6 +2892,17 @@ impl StackInner {
             return Err(Blocked::DeviceBusy);
         }
         self.buffers.alloc().ok_or(Blocked::NoBuffer)
+    }
+
+    /// [`alloc_obligation`](Self::alloc_obligation) for a neighbor solicitation.
+    /// It may take the last free buffer: the packet parked on the neighbor can't
+    /// move until it has gone out.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    fn alloc_probe(&mut self, driver: &mut dyn Driver) -> Result<DriverBuf, Blocked> {
+        if !driver.can_transmit() {
+            return Err(Blocked::DeviceBusy);
+        }
+        self.buffers.alloc_urgent().ok_or(Blocked::NoBuffer)
     }
 
     /// Transmit a fully-built UDP packet on a given interface as an IPv4 packet from
@@ -2914,8 +2986,7 @@ impl StackInner {
             Medium::Ip => {
                 #[cfg(feature = "ipv4-fragmentation")]
                 if oversized {
-                    self.fragment_ipv4(iface, HardwareAddress::Ip, buf);
-                    return Ok(());
+                    return self.fragment_ipv4(iface, HardwareAddress::Ip, buf);
                 }
                 self.transmit_raw(iface, buf);
                 Ok(())
@@ -2925,8 +2996,7 @@ impl StackInner {
                 NeighborLookup::Found(hardware_addr) => {
                     #[cfg(feature = "ipv4-fragmentation")]
                     if oversized {
-                        self.fragment_ipv4(iface, hardware_addr, buf);
-                        return Ok(());
+                        return self.fragment_ipv4(iface, hardware_addr, buf);
                     }
                     self.transmit_ethernet(iface, hardware_addr.ethernet_or_panic(), buf, ethertype);
                     Ok(())
@@ -2938,8 +3008,7 @@ impl StackInner {
                 // IPv4 was dropped above.
                 match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
                     NeighborLookup::Found(hardware_addr) => {
-                        self.dispatch_ieee802154(iface, hardware_addr.ieee802154_or_panic(), buf);
-                        Ok(())
+                        self.dispatch_ieee802154(iface, hardware_addr.ieee802154_or_panic(), buf)
                     }
                     NeighborLookup::Pending { next_hop } => self.park((iface.handle, next_hop), buf),
                 }
@@ -2948,18 +3017,28 @@ impl StackInner {
     }
 
     /// Park a packet on a neighbor that is being resolved, if it doesn't hold one
-    /// already. Nothing is ever dropped to make room.
+    /// already and the pool has a buffer to spare for it to wait in. Nothing is
+    /// ever dropped to make room.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn park(&mut self, key: NeighborKey, buf: DriverBuf) -> TxResult {
-        match self.neighbor_cache.park(&key, Buf::from_driver_buf(buf)) {
+        if self.neighbor_cache.has_parked(&key) {
+            trace!("neighbor {} pending, and already holds a packet", key.1);
+            return Err((Blocked::Neighbor, buf));
+        }
+        let buf = match self.buffers.keep(buf) {
+            Ok(buf) => buf,
+            Err(buf) => {
+                trace!("neighbor {} pending, and no buffer to spare to park the packet", key.1);
+                return Err((Blocked::NoBuffer, buf));
+            }
+        };
+        match self.neighbor_cache.park(&key, buf) {
             Ok(()) => {
                 debug!("neighbor {} pending, parking packet", key.1);
                 Ok(())
             }
-            Err(buf) => {
-                trace!("neighbor {} pending, and already holds a packet", key.1);
-                Err((Blocked::Neighbor, buf.into_driver_buf()))
-            }
+            // Not reached: the neighbor is being resolved, and holds none.
+            Err(buf) => Err((Blocked::Neighbor, buf.into_driver_buf())),
         }
     }
 
@@ -5627,7 +5706,7 @@ pub(crate) mod test {
         assert_eq!(big.tx.borrow().len(), 1);
 
         // An owned buffer with too little headroom is moved, not refused.
-        let buf = crate::Buf::from_driver_buf(stack.test_buf(&packet));
+        let buf = stack.keep(stack.test_buf(&packet)).unwrap();
         stack
             .raw_socket(handle)
             .send_buf(buf)
@@ -6848,12 +6927,14 @@ pub(crate) mod test {
         let udp = stack.add_udp_socket().unwrap();
         stack.udp_socket(udp).bind(5555, ListenSocketAddr::UNSPECIFIED).unwrap();
 
-        // The datagram takes the last free buffer: none is left for fragments.
+        // The datagram takes the last buffer to spare: only the two kept free
+        // (one for the interface, which holds none, one to send) are left for
+        // fragments.
         let mut held = Vec::new();
         while let Some(buf) = POOL.alloc() {
             held.push(buf);
         }
-        drop(held.pop());
+        held.truncate(held.len() - 3);
         let remote = SocketAddr::new(REMOTE_V4.into(), 1000);
         assert_eq!(stack.udp_socket(udp).send_slice(&[0xab; 1400], remote), Ok(()));
         drop(held);
@@ -8405,12 +8486,14 @@ pub(crate) mod test {
     }
 
     /// The replies to received packets are built in the buffer the packet came
-    /// in, so one free buffer is enough to receive a packet and answer it.
+    /// in, so one buffer is enough to receive a packet and answer it. Two are
+    /// left free: the one the interface receives into, and the one kept for
+    /// sending, which no reply takes.
     #[test]
     fn test_replies_need_no_other_buffer() {
         static POOL: SmallPool<8> = crate::StaticPool::new();
         let (mut stack, rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
-        let _held = hold_all_but(&POOL, 1);
+        let _held = hold_all_but(&POOL, 2);
 
         // An ARP request, and its reply.
         inject(&mut stack, &rx, arp_request_from(OTHER_HW, REMOTE_V4));
@@ -8461,9 +8544,9 @@ pub(crate) mod test {
             assert!(rst.verify_checksum(&OUR_V4.into(), &REMOTE_V4.into()));
         }
 
-        // The one buffer is free again.
+        // Both buffers are free again.
         let free: Vec<DriverBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
-        assert_eq!(free.len(), 1);
+        assert_eq!(free.len(), 2);
     }
 
     /// How many of `frames` carry IPv4.
@@ -8473,6 +8556,423 @@ pub(crate) mod test {
             .iter()
             .filter(|frame| ethertype_of(frame) == EthernetProtocol::Ipv4)
             .count()
+    }
+
+    /// Take every buffer the application can get, through a UDP socket.
+    fn take_spare(stack: &mut Stack, udp: crate::udp::UdpHandle) -> Vec<Buf> {
+        core::iter::from_fn(|| stack.udp_socket(udp).alloc_buf()).collect()
+    }
+
+    /// The application keeping every buffer it can get doesn't keep a packet
+    /// parked on a neighbor from going out: the solicitations take the buffer
+    /// kept free for them, and the answer is received in the one kept free for
+    /// the interface.
+    #[test]
+    fn test_resolution_completes_while_the_application_holds_the_pool() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 1, "the first ARP request");
+        let t = stack.poll(Instant::ZERO);
+
+        // 8 buffers, 1 parked, 2 kept free.
+        let held = take_spare(&mut stack, udp);
+        assert_eq!(held.len(), 5);
+
+        // The retransmission goes out.
+        tx.borrow_mut().clear();
+        stack.poll(t);
+        assert_eq!(tx.borrow().len(), 1);
+        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
+
+        // The neighbor answers, and the parked datagram goes.
+        tx.borrow_mut().clear();
+        inject(&mut stack, &rx, arp_request_from(OTHER_HW, REMOTE_V4));
+        assert_eq!(ipv4_frames(&tx), 1);
+        drop(held);
+    }
+
+    /// A packet only parks on a neighbor with a buffer to spare. Otherwise it
+    /// is handed back, and the resolution starts all the same.
+    #[test]
+    fn test_park_needs_a_buffer_to_spare() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        let mut buf = stack.udp_socket(udp).alloc_buf().unwrap();
+        buf.set_len(2);
+        buf.copy_from_slice(b"hi");
+
+        // One buffer free, where the stack keeps two.
+        let mut held = hold_all_but(&POOL, 1);
+        let (err, buf) = stack.udp_socket(udp).send_buf(buf, (REMOTE_V4, 1000)).unwrap_err();
+        assert_eq!(err, crate::udp::SendError::NoBuffer);
+        assert_eq!(&buf[..], b"hi");
+        assert_eq!(tx.borrow().len(), 1);
+        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
+        assert!(
+            !stack
+                .inner
+                .neighbor_cache
+                .has_parked(&(IfaceHandle::new(0), REMOTE_V4.into()))
+        );
+
+        // With the two free, it parks.
+        drop(held.pop());
+        stack.udp_socket(udp).send_buf(buf, (REMOTE_V4, 1000)).unwrap();
+        assert!(
+            stack
+                .inner
+                .neighbor_cache
+                .has_parked(&(IfaceHandle::new(0), REMOTE_V4.into()))
+        );
+    }
+
+    /// A packet only enters the fragmenter with a buffer to spare. Otherwise it
+    /// is handed back unchanged.
+    #[test]
+    #[cfg(feature = "ipv4-fragmentation")]
+    fn test_fragmenter_needs_a_buffer_to_spare() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, tx, _) = small_pool_stack(&POOL, Medium::Ip, 600);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        let mut buf = stack.udp_socket(udp).alloc_buf().unwrap();
+        buf.set_len(800);
+        buf.fill(0xab);
+
+        let mut held = hold_all_but(&POOL, 1);
+        let (err, buf) = stack
+            .udp_socket(udp)
+            .send_buf(buf, (REMOTE_V4, 1000))
+            .unwrap_err();
+        assert_eq!(err, crate::udp::SendError::NoBuffer);
+        assert_eq!(buf.len(), 800);
+        assert!(buf.iter().all(|&b| b == 0xab));
+        assert!(stack.ifaces.get(0).fragmenter.is_idle());
+        assert!(tx.borrow().is_empty());
+
+        // With the two free, it is fragmented, with the one kept for sending.
+        drop(held.pop());
+        stack.udp_socket(udp).send_buf(buf, (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 2);
+    }
+
+    /// A TCP segment held back behind fragments that wait for a buffer waits for
+    /// a buffer too. It is retried soon even if the fragments get their buffer
+    /// later in the same poll: the device never said no, so no wakeup would
+    /// bring a poll.
+    #[test]
+    #[cfg(feature = "ipv4-fragmentation")]
+    fn test_held_back_behind_fragments_waiting_for_a_buffer() {
+        use crate::driver::{Capabilities, Driver, RxWanted};
+
+        /// Hands the stack one junk frame, which it drops. That frees a buffer in
+        /// the middle of a poll, as a driver reclaiming a sent frame would.
+        struct Junk(Option<DriverBuf>);
+        impl Driver for Junk {
+            fn capabilities(&self) -> Capabilities {
+                let mut caps = Capabilities::default();
+                caps.medium = crate::driver::Medium::Ip;
+                caps
+            }
+            fn hardware_address(&self) -> crate::driver::HardwareAddress {
+                crate::driver::HardwareAddress::Ip
+            }
+            // It has its one frame already, and wants no buffers.
+            fn rx_wanted(&mut self) -> RxWanted {
+                RxWanted::default()
+            }
+            fn rx_give(&mut self, _buf: DriverBuf) {}
+            fn receive(&mut self) -> Option<DriverBuf> {
+                self.0.take()
+            }
+            fn can_transmit(&mut self) -> bool {
+                true
+            }
+            fn transmit(&mut self, _buf: DriverBuf) -> Result<(), DriverBuf> {
+                Ok(())
+            }
+        }
+
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, tx, room) = small_pool_stack(&POOL, Medium::Ip, 600);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        let tcp = stack
+            .add_tcp_socket_with_bufs(vec![0; 1024].leak(), vec![0; 1024].leak())
+            .unwrap();
+
+        // The device takes the first fragment and has no room for the second.
+        // Then no buffer is free for it.
+        room.set(Some(1));
+        stack
+            .udp_socket(udp)
+            .send_slice(&[0; 800], (REMOTE_V4, 1000))
+            .unwrap();
+        assert_eq!(tx.borrow().len(), 1);
+        let mut held = hold_all_but(&POOL, 0);
+        room.set(None);
+        stack.tcp_socket(tcp).connect((REMOTE_V4, 80), 0).unwrap();
+
+        // The second interface is polled after the first one's fragments tried and
+        // failed, and before they try again at the end of the poll.
+        let junk = Junk(Some(held.pop().unwrap()));
+        stack.add_iface_borrowed(std::boxed::Box::leak(std::boxed::Box::new(junk))).unwrap();
+
+        let now = Instant::from_secs(1);
+        let retry = now + Duration::from_millis(1);
+        assert_eq!(stack.poll(now), retry);
+        assert_eq!(tx.borrow().len(), 2);
+
+        // The retry sends the SYN.
+        drop(held);
+        stack.poll(retry);
+        assert_eq!(tx.borrow().len(), 3);
+    }
+
+    /// A driver's buffer sent with `send_driver_buf` goes straight to the device,
+    /// even with only the buffers the stack keeps free left: it is the urgent
+    /// packet of an interface above, like a VPN's.
+    #[test]
+    fn test_send_driver_buf_goes_straight_out() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        inject(&mut stack, &rx, arp_request_from(OTHER_HW, REMOTE_V4));
+        tx.borrow_mut().clear();
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+
+        let mut buf = stack.test_buf(b"hi");
+        buf.ensure_headroom(64);
+        let _held = hold_all_but(&POOL, 0);
+        stack.udp_socket(udp).send_driver_buf(buf, (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(ipv4_frames(&tx), 1);
+    }
+
+    /// A driver's buffer only parks on a neighbor with a buffer to spare, like
+    /// any other. Below that it is handed back, and the resolution starts all
+    /// the same.
+    #[test]
+    fn test_send_driver_buf_parks_only_with_a_buffer_to_spare() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+
+        // One buffer free, where the stack keeps two.
+        let buf = stack.test_buf(b"hi");
+        let mut held = hold_all_but(&POOL, 1);
+        let (err, buf) = stack
+            .udp_socket(udp)
+            .send_driver_buf(buf, (REMOTE_V4, 1000))
+            .unwrap_err();
+        assert_eq!(err, crate::udp::SendError::NoBuffer);
+        assert_eq!(&buf[..], b"hi");
+        assert!(
+            !stack
+                .inner
+                .neighbor_cache
+                .has_parked(&(IfaceHandle::new(0), REMOTE_V4.into()))
+        );
+        assert_eq!(tx.borrow().len(), 1);
+        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
+
+        // With the two free, it parks.
+        drop(held.pop());
+        stack.udp_socket(udp).send_driver_buf(buf, (REMOTE_V4, 1000)).unwrap();
+        assert!(
+            stack
+                .inner
+                .neighbor_cache
+                .has_parked(&(IfaceHandle::new(0), REMOTE_V4.into()))
+        );
+    }
+
+    /// A driver's buffer only enters the fragmenter with a buffer to spare.
+    #[test]
+    #[cfg(feature = "ipv4-fragmentation")]
+    fn test_send_driver_buf_fragments_only_with_a_buffer_to_spare() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, tx, _) = small_pool_stack(&POOL, Medium::Ip, 600);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        let mut buf = stack.test_buf(&[0xab; 800]);
+        buf.ensure_headroom(64);
+
+        let mut held = hold_all_but(&POOL, 1);
+        let (err, buf) = stack
+            .udp_socket(udp)
+            .send_driver_buf(buf, (REMOTE_V4, 1000))
+            .unwrap_err();
+        assert_eq!(err, crate::udp::SendError::NoBuffer);
+        assert_eq!(buf.len(), 800);
+        assert!(stack.ifaces.get(0).fragmenter.is_idle());
+        assert!(tx.borrow().is_empty());
+
+        drop(held.pop());
+        stack.udp_socket(udp).send_driver_buf(buf, (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 2);
+    }
+
+    /// A raw socket's `send_driver_buf` only parks an IP packet with a buffer
+    /// to spare, as UDP's does.
+    #[test]
+    fn test_raw_send_driver_buf_parks_only_with_a_buffer_to_spare() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (mut stack, _rx, _tx, _) = small_pool_stack(&POOL, Medium::Ethernet, 1514);
+        let raw = stack.add_raw_socket().unwrap();
+        stack
+            .raw_socket(raw)
+            .bind(RawMode::Ip {
+                version: None,
+                protocol: None,
+            })
+            .unwrap();
+        let packet = ipv4_packet(OUR_V4, REMOTE_V4, IpProtocol(99), b"hi");
+        let buf = stack.test_buf(&packet);
+        let mut held = hold_all_but(&POOL, 1);
+        let (err, buf) = stack.raw_socket(raw).send_driver_buf(buf).unwrap_err();
+        assert_eq!(err, crate::raw::SendError::NoBuffer);
+        assert_eq!(&buf[..], &packet[..]);
+        assert!(
+            !stack
+                .inner
+                .neighbor_cache
+                .has_parked(&(IfaceHandle::new(0), REMOTE_V4.into()))
+        );
+
+        drop(held.pop());
+        stack.raw_socket(raw).send_driver_buf(buf).unwrap();
+        assert!(
+            stack
+                .inner
+                .neighbor_cache
+                .has_parked(&(IfaceHandle::new(0), REMOTE_V4.into()))
+        );
+    }
+
+    /// `Stack::keep` lets a buffer wait while the stack has the buffers it
+    /// keeps free.
+    #[test]
+    fn test_keep() {
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let (stack, _rx, _tx, _) = small_pool_stack(&POOL, Medium::Ip, 1500);
+        // The stack keeps 2 free: for its one interface, which holds none, and
+        // to send.
+        let a = POOL.alloc().unwrap();
+        let mut held = hold_all_but(&POOL, 2);
+        let _a = stack.keep(a).unwrap();
+        let b = held.pop().unwrap();
+        let _c = POOL.alloc().unwrap();
+        let _b = stack.keep(b).unwrap_err();
+    }
+
+    /// A driver that hands over its last buffer with a frame is starved by the
+    /// time the frame is processed. The frame only waits in a socket if a buffer
+    /// stays free for the driver. Otherwise it is dropped, and the driver gets
+    /// its buffer back.
+    #[test]
+    fn test_last_rx_buffer_waits_only_with_one_kept_for_the_driver() {
+        use crate::driver::{Capabilities, Driver, RxWanted};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        /// One slot, which it receives the queued frames into.
+        struct OneSlot(Rc<RefCell<Option<DriverBuf>>>, Queue);
+        impl Driver for OneSlot {
+            fn capabilities(&self) -> Capabilities {
+                let mut caps = Capabilities::default();
+                caps.medium = crate::driver::Medium::Ip;
+                caps
+            }
+            fn hardware_address(&self) -> crate::driver::HardwareAddress {
+                crate::driver::HardwareAddress::Ip
+            }
+            fn rx_wanted(&mut self) -> RxWanted {
+                let starved = self.0.borrow().is_none();
+                RxWanted {
+                    count: starved as usize,
+                    starved,
+                }
+            }
+            fn rx_give(&mut self, buf: DriverBuf) {
+                *self.0.borrow_mut() = Some(buf);
+            }
+            fn receive(&mut self) -> Option<DriverBuf> {
+                if self.0.borrow().is_none() {
+                    return None;
+                }
+                let bytes = self.1.borrow_mut().pop_front()?;
+                let mut buf = self.0.borrow_mut().take().unwrap();
+                buf.set_len(bytes.len());
+                buf.copy_from_slice(&bytes);
+                Some(buf)
+            }
+            fn can_transmit(&mut self) -> bool {
+                true
+            }
+            fn transmit(&mut self, _buf: DriverBuf) -> Result<(), DriverBuf> {
+                Ok(())
+            }
+        }
+
+        static POOL: SmallPool<8> = crate::StaticPool::new();
+        let slot = Rc::new(RefCell::new(None));
+        let rx = Queue::default();
+        let mut stack = Stack::new_shared(&POOL, 0x1234_5678_dead_beef);
+        let driver = OneSlot(slot.clone(), rx.clone());
+        let iface = stack
+            .add_iface_borrowed(std::boxed::Box::leak(std::boxed::Box::new(driver)))
+            .unwrap();
+        stack
+            .iface(iface)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)])
+            .unwrap();
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        let now = Instant::from_secs(1);
+        stack.poll(now);
+        assert!(slot.borrow().is_some());
+
+        // The driver holds its buffer, so only the one for sending is kept free.
+        let mut held = take_spare(&mut stack, udp);
+        assert_eq!(held.len(), 6);
+        assert!(POOL.has_free(1) && !POOL.has_free(2));
+
+        // It receives a datagram into its last buffer, and nothing is free to give
+        // it another. The datagram would take the one free buffer from it, so it
+        // is dropped, and the driver gets its buffer back at the retry.
+        let datagram = udp_datagram(REMOTE_V4.into(), 4000, OUR_V4.into(), 1000, b"hi");
+        rx.borrow_mut()
+            .push_back(ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram));
+        let retry = now + Duration::from_millis(1);
+        assert_eq!(stack.poll(now), retry);
+        assert!(slot.borrow().is_none());
+        assert!(!stack.udp_socket(udp).can_recv());
+        assert!(POOL.has_free(2) && !POOL.has_free(3));
+        stack.poll(retry);
+        assert!(slot.borrow().is_some());
+
+        // With a buffer to spare, the driver gets it as soon as it hands over its
+        // last one, and the datagram waits in the socket.
+        drop(held.pop());
+        rx.borrow_mut()
+            .push_back(ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram));
+        stack.poll(retry);
+        assert!(slot.borrow().is_some());
+        assert_eq!(&stack.udp_socket(udp).recv().unwrap()[..], b"hi");
+    }
+
+    /// A stack only takes buffers of its own pool.
+    #[test]
+    #[should_panic(expected = "another stack's pool")]
+    fn test_keep_foreign_buffer() {
+        let stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
+        let _ = stack.keep(crate::buffers::test_buf());
     }
 
     /// A socket only sends buffers of its stack's pool.

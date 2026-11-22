@@ -42,6 +42,11 @@ pub trait Pool: Sync {
     /// may hold data from earlier packets.
     fn alloc(&'static self) -> Option<DriverBuf>;
 
+    /// Whether at least `count` buffers are free.
+    ///
+    /// The stack asks before it lets a buffer wait, to keep some free.
+    fn has_free(&self, count: usize) -> bool;
+
     /// Size of the storage of each buffer, in bytes.
     fn buf_capacity(&self) -> usize;
 }

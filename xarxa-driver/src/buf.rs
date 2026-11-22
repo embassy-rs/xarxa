@@ -45,6 +45,12 @@ pub struct RawDriverBuf {
 /// ```
 ///
 /// Dropping it gives it back to the pool it came from.
+///
+/// A driver must not keep one for long, unless it sits in its receive ring.
+/// A buffer from [`Driver::transmit`](crate::Driver::transmit) must be sent and
+/// dropped, dropped, or handed back to the network stack, in bounded time,
+/// without waiting for the network or the application. The network stack keeps
+/// buffers free for what has to go out, and counts on getting them back.
 pub struct DriverBuf {
     raw: NonNull<RawDriverBuf>,
 }

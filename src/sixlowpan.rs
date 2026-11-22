@@ -7,7 +7,6 @@
 //! written into the space the uncompressed one occupied, and the other way
 //! around, with the headroom taking up the difference.
 
-#[cfg(feature = "sixlowpan-fragmentation")]
 use crate::buffers::Buf;
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::driver::DriverBuf;
@@ -16,7 +15,7 @@ use crate::error::{Full, Malformed};
 use crate::fragmentation::{Fragmenter, SixlowpanFragmenter};
 use crate::iface::{Iface, IfaceHandle, IfaceState};
 use crate::rand::Rand;
-use crate::stack::{Stack, StackInner};
+use crate::stack::{Blocked, Stack, StackInner, TxResult};
 use crate::storage::Vec;
 use crate::time::Instant;
 use crate::wire::ip::checksum;
@@ -584,16 +583,48 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut DriverBuf, ieee_repr: &Ieee802154Repr)
 // Egress.
 impl StackInner {
     /// Send an IPv6 packet to `ll_dst_a` on an IEEE 802.15.4 interface.
+    ///
+    /// A packet that may not fit one frame may have to wait in the fragmenter,
+    /// so it only goes on with a buffer to spare. Otherwise it is handed back,
+    /// unchanged.
     pub(crate) fn dispatch_ieee802154(
         &mut self,
         iface: &mut IfaceState<'_>,
         ll_dst_a: Ieee802154Address,
         buf: DriverBuf,
-    ) {
+    ) -> TxResult {
+        let ieee_repr = Self::ieee802154_repr(iface, ll_dst_a);
+        // Compression never makes a packet bigger, so one that fits a frame
+        // uncompressed needs no fragmenting.
+        if buf.len() + ieee_repr.buffer_len() <= iface.caps.max_transmission_unit {
+            self.dispatch_sixlowpan(iface, buf, ieee_repr);
+            return Ok(());
+        }
+        match self.buffers.keep(buf) {
+            Ok(buf) => {
+                self.dispatch_sixlowpan_kept(iface, buf, ieee_repr);
+                Ok(())
+            }
+            Err(buf) => {
+                trace!("6LoWPAN: no buffer to spare for a packet that may need fragmenting");
+                Err((Blocked::NoBuffer, buf))
+            }
+        }
+    }
+
+    /// [`dispatch_ieee802154`](Self::dispatch_ieee802154) for a packet that is
+    /// already allowed to wait: one that was parked on its neighbor.
+    pub(crate) fn dispatch_ieee802154_kept(&mut self, iface: &mut IfaceState<'_>, ll_dst_a: Ieee802154Address, buf: Buf) {
+        let ieee_repr = Self::ieee802154_repr(iface, ll_dst_a);
+        self.dispatch_sixlowpan_kept(iface, buf, ieee_repr);
+    }
+
+    /// The MAC header of a data frame from this interface to `ll_dst_a`.
+    fn ieee802154_repr(iface: &mut IfaceState<'_>, ll_dst_a: Ieee802154Address) -> Ieee802154Repr {
         let ll_src_a = iface.ieee802154_addr();
 
         // Create the IEEE802.15.4 header.
-        let ieee_repr = Ieee802154Repr {
+        Ieee802154Repr {
             frame_type: Ieee802154FrameType::Data,
             security_enabled: false,
             frame_pending: false,
@@ -605,12 +636,34 @@ impl StackInner {
             dst_addr: Some(ll_dst_a),
             src_pan_id: iface.sixlowpan.pan_id,
             src_addr: Some(ll_src_a),
-        };
-
-        self.dispatch_sixlowpan(iface, buf, ieee_repr);
+        }
     }
 
+    /// Compress a packet that fits one frame and transmit it.
     fn dispatch_sixlowpan(&mut self, iface: &mut IfaceState<'_>, mut buf: DriverBuf, ieee_repr: Ieee802154Repr) {
+        if ipv6_to_sixlowpan(&mut buf, &ieee_repr).is_err() {
+            debug!("6LoWPAN: compression failed, dropping");
+            return;
+        }
+        self.transmit_sixlowpan_frame(iface, buf, ieee_repr);
+    }
+
+    /// Put the MAC header on a compressed packet that fits one frame, and
+    /// transmit it.
+    fn transmit_sixlowpan_frame(&mut self, iface: &mut IfaceState<'_>, mut buf: DriverBuf, ieee_repr: Ieee802154Repr) {
+        let ieee_len = ieee_repr.buffer_len();
+        if !buf.ensure_headroom(iface.caps.tx_headroom + ieee_len) {
+            debug!("6LoWPAN: no room for the MAC header, dropping");
+            return;
+        }
+        buf.push_front(ieee_len);
+        ieee_repr.emit(&mut buf[..ieee_len]);
+        self.transmit_raw(iface, buf);
+    }
+
+    /// Compress a packet that may need fragmenting, and transmit it, or its
+    /// fragments.
+    fn dispatch_sixlowpan_kept(&mut self, iface: &mut IfaceState<'_>, mut buf: Buf, ieee_repr: Ieee802154Repr) {
         let header_diff = match ipv6_to_sixlowpan(&mut buf, &ieee_repr) {
             Ok(header_diff) => header_diff,
             Err(_) => {
@@ -627,18 +680,12 @@ impl StackInner {
 
         if total_size + ieee_len > mtu {
             #[cfg(feature = "sixlowpan-fragmentation")]
-            self.fragment_sixlowpan(iface, Buf::from_driver_buf(buf), ieee_repr, header_diff);
+            self.fragment_sixlowpan(iface, buf, ieee_repr, header_diff);
 
             #[cfg(not(feature = "sixlowpan-fragmentation"))]
             debug!("Enable the `sixlowpan-fragmentation` feature for fragmentation support.");
         } else {
-            if !buf.ensure_headroom(iface.caps.tx_headroom + ieee_len) {
-                debug!("6LoWPAN: no room for the MAC header, dropping");
-                return;
-            }
-            buf.push_front(ieee_len);
-            ieee_repr.emit(&mut buf[..ieee_len]);
-            self.transmit_raw(iface, buf);
+            self.transmit_sixlowpan_frame(iface, buf.into_driver_buf(), ieee_repr);
         }
     }
 }

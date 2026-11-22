@@ -114,12 +114,14 @@ fn alloc_limit() {
 }
 
 /// The stack gives a driver the receive buffers it wants at the first poll,
-/// not when the interface is added. When the pool can't top the driver up, it
-/// asks to be polled again soon.
+/// not when the interface is added. A driver with none to receive into gets
+/// one from the buffers kept free for it, the rest only from the buffers to
+/// spare. If it gets none, the stack asks to be polled again soon. Once it
+/// holds a buffer, none is kept free for it.
 #[cfg(feature = "medium-ip")]
 fn check_rx_refill(pool: &'static impl Pool) {
     use crate::Stack;
-    use crate::driver::{Capabilities, Driver, HardwareAddress, Medium};
+    use crate::driver::{Capabilities, Driver, HardwareAddress, Medium, RxWanted};
     use crate::time::{Duration, Instant, idle_deadline};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -135,8 +137,12 @@ fn check_rx_refill(pool: &'static impl Pool) {
         fn hardware_address(&self) -> HardwareAddress {
             HardwareAddress::Ip
         }
-        fn rx_wanted(&mut self) -> usize {
-            4 - self.0.borrow().len()
+        fn rx_wanted(&mut self) -> RxWanted {
+            let held = self.0.borrow().len();
+            RxWanted {
+                count: 4 - held,
+                starved: held == 0,
+            }
         }
         fn rx_give(&mut self, buf: DriverBuf) {
             self.0.borrow_mut().push(buf);
@@ -157,27 +163,39 @@ fn check_rx_refill(pool: &'static impl Pool) {
     stack
         .add_iface_borrowed(std::boxed::Box::leak(std::boxed::Box::new(Ring(ring.clone()))))
         .unwrap();
-    assert_eq!(ring.borrow().len(), 0);
 
-    let now = Instant::from_secs(1);
-    assert_eq!(stack.poll(now), idle_deadline(now));
-    assert_eq!(ring.borrow().len(), 4);
-
-    // The driver drops a buffer, and the pool has none to replace it.
+    // The pool has only one free. That one is the one kept for sending: the
+    // driver gets nothing, and the stack polls again soon.
     let mut held = Vec::new();
     while let Some(buf) = pool.alloc() {
         held.push(buf);
     }
-    drop(ring.borrow_mut().pop());
-    held.push(pool.alloc().unwrap());
+    drop(held.pop());
+    let now = Instant::from_secs(1);
     assert_eq!(stack.poll(now), now + Duration::from_millis(1));
-    assert_eq!(ring.borrow().len(), 3);
+    assert_eq!(ring.borrow().len(), 0);
 
-    // A buffer is free by the retry.
+    // With one more free, the driver gets one to receive into, and no more:
+    // the rest are kept free.
     drop(held.pop());
     let retry = now + Duration::from_millis(1);
     assert_eq!(stack.poll(retry), idle_deadline(retry));
+    assert_eq!(ring.borrow().len(), 1);
+
+    // Once there are buffers to spare, the ring is filled.
+    held.clear();
+    assert_eq!(stack.poll(retry), idle_deadline(retry));
     assert_eq!(ring.borrow().len(), 4);
+
+    // The driver holds buffers, so only the one for sending is kept free.
+    let mut kept = Vec::new();
+    while let Some(buf) = pool.alloc() {
+        match stack.keep(buf) {
+            Ok(buf) => kept.push(buf),
+            Err(_) => break,
+        }
+    }
+    assert!(pool.has_free(1) && !pool.has_free(2));
 }
 
 #[cfg(feature = "medium-ip")]

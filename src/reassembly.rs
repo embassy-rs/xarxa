@@ -58,7 +58,8 @@ pub(crate) struct Fragment<'a, K> {
 ///
 /// The fragments are assembled into a buffer, taken from the pool when the
 /// first one arrives and handed out whole by [`assemble`](Self::assemble). It
-/// waits for the other fragments, so it is a [`Buf`].
+/// waits for the other fragments, so it is a [`Buf`]: it is only taken while
+/// the pool has one to spare.
 #[derive(Debug)]
 pub struct PacketAssembler<K> {
     key: Option<K>,
@@ -93,7 +94,7 @@ impl<K> PacketAssembler<K> {
     /// The buffer the fragments are assembled into, taken from the pool on first use.
     fn buffer(&mut self, buffers: &Buffers) -> Result<&mut Buf, AssemblerError> {
         if self.buffer.is_none() {
-            self.buffer = Some(Buf::from_driver_buf(buffers.alloc().ok_or(AssemblerError)?));
+            self.buffer = Some(buffers.alloc_kept().ok_or(AssemblerError)?);
         }
         // NOTE(unwrap): filled in just above.
         Ok(unwrap!(self.buffer.as_mut()))

@@ -19,7 +19,7 @@ use std::vec::Vec;
 
 use xarxa::Stack;
 use xarxa::driver::Capabilities;
-use xarxa::driver::DriverBuf;
+use xarxa::driver::{DriverBuf, RxWanted};
 #[cfg(feature = "packetmeta-id")]
 use xarxa::driver::PacketMeta;
 use xarxa::driver::{ChecksumCapabilities, Driver, LinkState};
@@ -197,9 +197,14 @@ impl Driver for TestDevice {
     }
 
     // A buffer only when there is a frame to put in it, so a device with nothing
-    // to receive holds none, and tests can count the pool's buffers.
-    fn rx_wanted(&mut self) -> usize {
-        (self.rx_buf.borrow().is_none() && !self.rx.borrow().is_empty()) as usize
+    // to receive holds none, and tests can count the pool's buffers. It is
+    // starved all the while, so a buffer is kept free for it.
+    fn rx_wanted(&mut self) -> RxWanted {
+        let starved = self.rx_buf.borrow().is_none();
+        RxWanted {
+            count: (starved && !self.rx.borrow().is_empty()) as usize,
+            starved,
+        }
     }
 
     fn rx_give(&mut self, buf: DriverBuf) {

@@ -204,6 +204,22 @@ where
         }
     }
 
+    fn has_free(&self, count: usize) -> bool {
+        if count == 0 {
+            return true;
+        }
+        let mut found = 0;
+        // Relaxed: only the stack that owns the pool claims slots, and the frees
+        // racing with the scan only make the answer more true.
+        self.scan(|used| {
+            if !used.load(Ordering::Relaxed) {
+                found += 1;
+            }
+            found == count
+        })
+        .is_some()
+    }
+
     fn buf_capacity(&self) -> usize {
         SIZE
     }

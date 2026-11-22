@@ -110,6 +110,10 @@ where
         }
     }
 
+    fn has_free(&self, count: usize) -> bool {
+        self.count.load(Ordering::Relaxed) + count <= self.max_count
+    }
+
     fn buf_capacity(&self) -> usize {
         SIZE
     }

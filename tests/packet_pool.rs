@@ -1,5 +1,11 @@
 //! Packet pool exhaustion, the way an application causes it: by keeping the
 //! buffers it allocates. Each stack has a pool of its own.
+//!
+//! The stack keeps a few buffers free whatever the application keeps: one for
+//! each interface that has none to receive into, and one to send a
+//! solicitation or a fragment. So what the application can take is everything
+//! but those. The test device only takes a buffer when a frame comes in, so it
+//! has none, and one is kept for it.
 
 use xarxa::iface::Medium;
 use xarxa::udp::SendError;
@@ -51,9 +57,9 @@ fn sends() {
     // so a send leaves the pool as it found it.
     stack.udp_socket(udp).send_slice(b"hello", dst()).unwrap();
 
-    // Take every buffer.
+    // Take every buffer: 16, but the 2 kept free.
     let mut held = take_all(&mut stack, udp);
-    assert_eq!(held.len(), 16);
+    assert_eq!(held.len(), 14);
 
     // A send now fails, and the socket is unharmed.
     assert_eq!(
@@ -126,7 +132,7 @@ fn send_waits_for_nothing() {
 /// A router solicitation that can't be built doesn't count as sent. It stays
 /// due, and the stack asks to be polled again 1 ms later to retry it, since
 /// nothing signals a freed buffer. So do the multicast reports for the
-/// interface's groups.
+/// interface's groups. They don't take the buffers kept free.
 #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
 #[test]
 fn solicitation_waits() {
@@ -187,11 +193,12 @@ fn syn_waits() {
     assert!(deadline > retry + Duration::from_millis(1));
 }
 
-/// The fragments of a datagram wait for buffers the same way. With one free
-/// buffer, the datagram takes it and none is left for the fragments.
+/// The fragments of a datagram don't wait for the application: a datagram
+/// that takes the last buffer to spare is fragmented with the one kept free
+/// for sending.
 #[cfg(feature = "ipv4-fragmentation")]
 #[test]
-fn fragments_wait() {
+fn fragments_use_the_reserve() {
     use xarxa::time::{Duration, Instant};
 
     let device = TestDevice::new(Medium::Ip).with_mtu(600);
@@ -201,90 +208,18 @@ fn fragments_wait() {
 
     drop(held.pop());
     stack.udp_socket(udp).send_slice(&[0; 800], dst()).unwrap();
-    assert!(tx.borrow().is_empty());
+    // The device frees each fragment's buffer as it takes it, so the one
+    // buffer carries both fragments.
+    assert_eq!(tx.borrow().len(), 2);
 
-    let now = Instant::from_secs(1);
-    let retry = now + Duration::from_millis(1);
-    assert_eq!(stack.poll(now), retry);
-    assert!(tx.borrow().is_empty());
-
-    // A buffer is back by the retry. The device frees each fragment's buffer as
-    // it takes it, so the one buffer carries both fragments.
-    drop(held.pop());
     // Nothing left to do: the stack asks to be polled again in a day.
-    assert_eq!(stack.poll(retry), retry + Duration::from_secs(24 * 60 * 60));
-    assert_eq!(tx.borrow().len(), 2);
-}
-
-/// A TCP segment held back behind fragments that wait for a buffer waits for a
-/// buffer too. It is retried soon even if the fragments get their buffer later in
-/// the same poll: the device never said no, so no wakeup would bring a poll.
-#[cfg(all(feature = "tcp", feature = "ipv4-fragmentation"))]
-#[test]
-fn held_back_behind_fragments() {
-    use xarxa::driver::{Capabilities, Driver, DriverBuf};
-    use xarxa::time::{Duration, Instant};
-
-    /// Hands the stack one junk frame, which it drops. That frees a buffer in
-    /// the middle of a poll, as a driver reclaiming a sent frame would.
-    struct Junk(Option<DriverBuf>);
-    impl Driver for Junk {
-        fn capabilities(&self) -> Capabilities {
-            let mut caps = Capabilities::default();
-            caps.medium = xarxa::driver::Medium::Ip;
-            caps
-        }
-        fn hardware_address(&self) -> xarxa::driver::HardwareAddress {
-            xarxa::driver::HardwareAddress::Ip
-        }
-        // It has its one frame already, and wants no buffers.
-        fn rx_wanted(&mut self) -> usize {
-            0
-        }
-        fn rx_give(&mut self, _buf: DriverBuf) {}
-        fn receive(&mut self) -> Option<DriverBuf> {
-            self.0.take()
-        }
-        fn can_transmit(&mut self) -> bool {
-            true
-        }
-        fn transmit(&mut self, _buf: DriverBuf) -> Result<(), DriverBuf> {
-            Ok(())
-        }
-    }
-
-    let device = TestDevice::new(Medium::Ip).with_mtu(600);
-    let tx = device.tx.clone();
-    let (mut stack, udp) = ip_stack(device);
-    let tcp = stack
-        .add_tcp_socket_with_bufs(vec![0; 1024].leak(), vec![0; 1024].leak())
-        .unwrap();
-
-    // The datagram takes the one free buffer, and its fragments wait.
-    let mut held = take_all(&mut stack, udp);
-    drop(held.pop());
-    stack.udp_socket(udp).send_slice(&[0; 800], dst()).unwrap();
-    assert!(tx.borrow().is_empty());
-    stack.tcp_socket(tcp).connect(dst(), 0).unwrap();
-
-    // The second interface is polled after the first one's fragments tried and
-    // failed, and before they try again at the end of the poll.
-    let junk = Junk(Some(held.pop().unwrap().into_driver_buf()));
-    stack.add_iface_borrowed(Box::leak(Box::new(junk))).unwrap();
-
     let now = Instant::from_secs(1);
-    let retry = now + Duration::from_millis(1);
-    assert_eq!(stack.poll(now), retry);
-    assert_eq!(tx.borrow().len(), 2);
-
-    // The retry sends the SYN.
-    stack.poll(retry);
-    assert_eq!(tx.borrow().len(), 3);
+    assert_eq!(stack.poll(now), now + Duration::from_secs(24 * 60 * 60));
 }
 
-/// The ACKs that received TCP segments call for right away wait for a buffer
-/// too. The segment's own buffer is free again by the time they are built, so
-/// one free buffer is enough to receive a segment and answer it.
+/// The ACKs that received TCP segments call for wait for a buffer like other
+/// segments. The segment's own buffer is free again by the time they are built,
+/// so one buffer to spare is enough to receive a segment and answer it.
 #[cfg(feature = "tcp")]
 #[test]
 fn acks_wait() {
@@ -335,7 +270,7 @@ fn acks_wait() {
         .add_tcp_socket_with_bufs(vec![0; 1024].leak(), vec![0; 1024].leak())
         .unwrap();
 
-    // One free buffer from here on.
+    // One buffer to spare from here on.
     let mut held = take_all(&mut stack, udp);
     drop(held.pop());
 
@@ -358,8 +293,7 @@ fn acks_wait() {
     assert_eq!(stack.tcp_socket(tcp).state(), State::Established);
     assert_eq!(tx.borrow_mut().drain(..).count(), 1);
 
-    // An out-of-order segment takes the free buffer, and still gets its
-    // duplicate ACK.
+    // An out-of-order segment, and its duplicate ACK.
     rx.borrow_mut()
         .push_back(segment(remote_seq + 1 + 3, local_seq, false, b"def"));
     stack.poll(now);
@@ -371,8 +305,8 @@ fn acks_wait() {
     }
 
     // The segment that fills the gap, while the device has no room. Then the
-    // device has room but the pool has no buffer, and the stack asks to be
-    // polled again soon to retry.
+    // device has room but the pool has no buffer to spare, and the stack asks
+    // to be polled again soon to retry.
     room.set(Some(0));
     rx.borrow_mut()
         .push_back(segment(remote_seq + 1, local_seq, false, b"abc"));

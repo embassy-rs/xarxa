@@ -2459,8 +2459,9 @@ impl<'d> TcpSocketState<'d> {
                 let mss = local_mss.min(self.send_mss).saturating_sub(options_len);
 
                 // A fast retransmit resends the earliest unacknowledged segment,
-                // whatever the remote and congestion windows say.
-                if self.pending_fast_retransmit && tx_len != 0 {
+                // whatever the remote and congestion windows say. With the transmit
+                // buffer empty, that's the FIN.
+                if self.pending_fast_retransmit && (tx_len != 0 || want_fin) {
                     let len = mss.min(tx_len);
                     let control = data_control(0, len);
                     self.send_segment(clock, &mut send, &repr, control, 0, len)?;
@@ -9320,6 +9321,38 @@ mod test {
         assert_eq!(
             s.dup_acks, 0,
             "duplicate ACK counter is not reset when receiving a window update"
+        );
+    }
+
+    // Three duplicate ACKs with only our FIN unacknowledged retransmit the FIN.
+    #[test]
+    fn test_fast_retransmit_fin() {
+        let mut s = socket_fin_wait_1();
+        recv!(s, time 0, [TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }]);
+        for t in [10, 20, 30] {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            });
+        }
+        assert_eq!(s.timer, Timer::FastRetransmit);
+        recv!(s, time 40, [TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }]);
+        assert_eq!(
+            s.timer,
+            Timer::Retransmit {
+                expires_at: Instant::from_millis(1040)
+            }
         );
     }
 

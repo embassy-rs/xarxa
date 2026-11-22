@@ -1878,9 +1878,10 @@ impl<'d> TcpSocketState<'d> {
             trace!("starting zero-window-probe timer for t+{}", delay);
             self.timer.set_for_zero_window_probe(now, delay);
         }
-        // Once the window opens, what was sent before it shut may have been
-        // dropped, and the retransmit timer recovers it.
-        if self.send_window != 0 && self.timer.is_zero_window_probe() {
+        // Once the window opens, or there is nothing left to send, there is
+        // nothing to probe for. What was sent before the window shut may have
+        // been dropped, and the retransmit timer recovers it.
+        if self.timer.is_zero_window_probe() && (self.send_window != 0 || self.tx_buffer.is_empty()) {
             trace!("stopping zero-window-probe timer");
             if self.send_max != self.send_unack {
                 let rto = self.rtte.retransmission_timeout();
@@ -11044,6 +11045,35 @@ mod test {
             payload: &b"def"[..],
             ..RECV_TEMPL
         }]);
+    }
+
+    // Once everything sent is acknowledged, there is nothing left to probe a
+    // zero window for.
+    #[test]
+    fn test_zero_window_probe_stops_when_all_acked() {
+        let mut s = socket_established();
+        s.view().send_slice(b"abcdef").unwrap();
+        recv!(s, time 0, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abcdef"[..],
+            ..RECV_TEMPL
+        }]);
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 3),
+            window_len: 0,
+            ..SEND_TEMPL
+        });
+        assert!(s.timer.is_zero_window_probe());
+        send!(s, time 20, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            window_len: 0,
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.timer, Timer::Idle { keep_alive_at: None });
+        recv_nothing!(s, time 5000);
     }
 
     #[cfg(feature = "tcp-reno")]

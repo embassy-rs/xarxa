@@ -942,6 +942,283 @@ impl<'d> TcpSocketState<'d> {
         }
     }
 
+    /// Assert what must hold of the socket between calls: after every
+    /// `process`, `dispatch` and user call. Each invariant is its own assertion,
+    /// so a failure names the one that broke. Does nothing without debug
+    /// assertions.
+    fn check_invariants(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+
+        let state = self.state;
+
+        // The connection, its tuple, and how it ended.
+        if state != State::Closed {
+            assert!(self.tuple.is_some(), "{} with no tuple", state);
+            assert!(
+                self.close_reason.is_none(),
+                "{} with a close reason {:?}",
+                state,
+                self.close_reason
+            );
+        } else if self.tuple.is_some() {
+            assert!(
+                matches!(self.close_reason, Some(CloseReason::TimedOut | CloseReason::Aborted)),
+                "CLOSED keeps the tuple only while it owes an RST, close reason {:?}",
+                self.close_reason
+            );
+        }
+
+        // Send sequence space: SND.UNA <= retransmission cursor <= SND.MAX.
+        assert!(
+            self.send_unack <= self.send_next,
+            "send_unack {} past send_next {}",
+            self.send_unack,
+            self.send_next
+        );
+        assert!(
+            self.send_next <= self.send_max,
+            "send_next {} past send_max {}",
+            self.send_next,
+            self.send_max
+        );
+
+        // Our SYN is acknowledged once the handshake completes, and nothing is
+        // queued to send before then. A close in SYN-RECEIVED goes to FIN-WAIT-1
+        // with the SYN unacknowledged.
+        match state {
+            State::SynSent | State::SynReceived => assert!(!self.syn_acked, "{} with the SYN acknowledged", state),
+            State::Established | State::FinWait2 | State::CloseWait | State::LastAck | State::TimeWait => {
+                assert!(self.syn_acked, "{} with the SYN unacknowledged", state)
+            }
+            State::FinWait1 | State::Closing | State::Closed => {}
+        }
+        if state != State::Closed && !self.syn_acked {
+            assert!(
+                self.tx_buffer.is_empty(),
+                "{} octets queued before the SYN was acknowledged",
+                self.tx_buffer.len()
+            );
+        }
+
+        // Everything sent is the SYN, the transmit buffer or the FIN. A connection
+        // that ended may have had more in flight than the buffer holds.
+        if state != State::Closed {
+            let fin_queued = matches!(state, State::FinWait1 | State::Closing | State::LastAck);
+            let end = self.tx_start() + self.tx_buffer.len() + fin_queued as usize;
+            assert!(
+                self.send_max <= end,
+                "{}: send_max {} past the end of what there is to send {}",
+                state,
+                self.send_max,
+                end
+            );
+        }
+        // Once our FIN is acknowledged, everything is.
+        if matches!(state, State::FinWait2 | State::TimeWait) {
+            assert!(
+                self.tx_buffer.is_empty(),
+                "{} with {} octets queued",
+                state,
+                self.tx_buffer.len()
+            );
+            assert!(
+                self.send_unack == self.send_max,
+                "{} with send_unack {} short of send_max {}",
+                state,
+                self.send_unack,
+                self.send_max
+            );
+        }
+
+        // The send window.
+        assert!(
+            self.send_window <= self.send_window_max,
+            "send_window {} over send_window_max {}",
+            self.send_window,
+            self.send_window_max
+        );
+        if !matches!(state, State::Closed | State::SynSent) {
+            assert!(
+                self.send_wl2 <= self.send_max,
+                "send_wl2 {} past send_max {}",
+                self.send_wl2,
+                self.send_max
+            );
+        }
+
+        // Window scaling: at most 14 (RFC 7323 2.3), and on only if both ends do it.
+        assert!(
+            self.recv_window_shift <= 14,
+            "recv_window_shift {}",
+            self.recv_window_shift
+        );
+        if let Some(shift) = self.send_window_shift {
+            assert!(shift <= 14, "send_window_shift {}", shift);
+        }
+        if !matches!(state, State::Closed | State::SynSent) && self.send_window_shift.is_none() {
+            assert!(
+                self.recv_window_shift == 0,
+                "recv_window_shift {} with the remote not scaling",
+                self.recv_window_shift
+            );
+        }
+
+        // Receive sequence space: data is accepted up to the right edge of the
+        // window, and the window never advertised more than the buffer holds.
+        let recv_next = self.recv_next();
+        assert!(
+            recv_next <= self.recv_adv,
+            "RCV.NXT {} past the right edge of the window {}",
+            recv_next,
+            self.recv_adv
+        );
+        assert!(
+            self.recv_adv - self.recv_read <= self.rx_buffer.capacity(),
+            "the window up to {} doesn't fit the receive buffer of {} octets from {}",
+            self.recv_adv,
+            self.rx_buffer.capacity(),
+            self.recv_read
+        );
+        if let Some(recv_ack_sent) = self.recv_ack_sent {
+            assert!(
+                recv_ack_sent <= recv_next,
+                "ACK {} sent for data past RCV.NXT {}",
+                recv_ack_sent,
+                recv_next
+            );
+        }
+
+        // Out-of-order data: never at RCV.NXT, which would make it in order, and
+        // within the window and the stream.
+        if let Some((start, _)) = self.assembler.iter_data().next() {
+            assert!(start > 0, "in-order data held in the assembler");
+        }
+        if let Some((_, end)) = self.assembler.iter_data().last() {
+            assert!(
+                recv_next + end <= self.recv_adv,
+                "out-of-order data up to {} past the right edge of the window {}",
+                recv_next + end,
+                self.recv_adv
+            );
+            if let Some(fin_seq) = self.rx_fin_seq {
+                assert!(
+                    recv_next + end <= fin_seq,
+                    "out-of-order data up to {} past the remote's FIN at {}",
+                    recv_next + end,
+                    fin_seq
+                );
+            }
+        }
+
+        // The remote's FIN: at or after RCV.NXT until it is taken, right before
+        // it after.
+        if let Some(fin_seq) = self.rx_fin_seq {
+            if self.rx_fin_received() {
+                assert!(
+                    fin_seq + 1 == recv_next,
+                    "the remote's FIN at {} was taken, but RCV.NXT is {}",
+                    fin_seq,
+                    recv_next
+                );
+            } else {
+                assert!(
+                    fin_seq <= self.recv_adv,
+                    "the remote's FIN at {} past the right edge of the window {}",
+                    fin_seq,
+                    self.recv_adv
+                );
+            }
+        }
+        match state {
+            State::CloseWait | State::Closing | State::LastAck | State::TimeWait => {
+                assert!(self.rx_fin_received(), "{} without the remote's FIN", state)
+            }
+            State::SynSent | State::SynReceived | State::Established | State::FinWait1 | State::FinWait2 => {
+                assert!(!self.rx_fin_received(), "{} with the remote's FIN taken", state)
+            }
+            State::Closed => {}
+        }
+
+        // Nothing is received before the handshake completes.
+        if matches!(state, State::SynSent | State::SynReceived) {
+            assert!(
+                self.rx_buffer.is_empty() && self.assembler.is_empty(),
+                "{} with data received",
+                state
+            );
+        }
+
+        // Timers.
+        assert!(
+            (RTTE_MIN_RTO..=RTTE_MAX_RTO).contains(&self.rtte.rto),
+            "RTO {} out of range",
+            self.rtte.rto
+        );
+        if state != State::Closed
+            && let Some((_, seq)) = self.rtte.timestamp
+        {
+            assert!(
+                self.send_unack < seq && seq <= self.send_max,
+                "timing a segment ending at {}, outside send_unack {}..=send_max {}",
+                seq,
+                self.send_unack,
+                self.send_max
+            );
+        }
+        assert!(
+            (state == State::TimeWait) == matches!(self.timer, Timer::Close { .. }),
+            "{} with timer {:?}: TIME-WAIT, and only it, runs the close timer",
+            state,
+            self.timer
+        );
+        // Whatever was sent and not acknowledged has a timer that recovers it if
+        // it was lost, or a retransmission that a blocked dispatch left pending.
+        if self.unacked_untimed() {
+            assert!(
+                self.send_next == self.send_unack || self.pending_fast_retransmit,
+                "{}: {} to {} unacknowledged, with timer {:?} and no retransmission pending",
+                state,
+                self.send_unack,
+                self.send_max,
+                self.timer
+            );
+        }
+        if self.timer.is_retransmit() {
+            assert!(
+                self.send_max != self.send_unack,
+                "retransmit timer {:?} with nothing to retransmit",
+                self.timer
+            );
+        }
+        if self.timer.is_zero_window_probe() {
+            assert!(
+                !self.tx_buffer.is_empty(),
+                "zero-window probe timer {:?} with nothing to send",
+                self.timer
+            );
+        }
+        if self.ack_delay_timer != AckDelayTimer::Idle {
+            assert!(
+                self.ack_to_transmit(),
+                "delayed ACK timer {:?} with no ACK to send",
+                self.ack_delay_timer
+            );
+        }
+    }
+
+    /// Whether sequence space we sent is unacknowledged, with no timer to
+    /// recover it if it was lost.
+    fn unacked_untimed(&self) -> bool {
+        !matches!(self.state, State::Closed | State::TimeWait)
+            && self.send_max != self.send_unack
+            && !matches!(
+                self.timer,
+                Timer::Retransmit { .. } | Timer::FastRetransmit | Timer::ZeroWindowProbe { .. }
+            )
+    }
+
     /// The RST answering `repr`, a segment that no connection takes or that one
     /// rejects.
     pub(crate) fn rst_reply(repr: &TcpRepr) -> TcpRepr<'static> {
@@ -1059,6 +1336,7 @@ impl<'d> TcpSocketState<'d> {
                 trace!("icmp error {}, recorded as soft error", error);
             }
         }
+        self.check_invariants();
     }
 
     /// Process a segment the socket [`accepts`](Self::accepts).
@@ -1073,6 +1351,12 @@ impl<'d> TcpSocketState<'d> {
         dst_addr: &IpAddr,
         repr: &TcpRepr,
     ) -> ProcessResult {
+        let result = self.process_inner(now, src_addr, dst_addr, repr);
+        self.check_invariants();
+        result
+    }
+
+    fn process_inner(&mut self, now: Instant, src_addr: &IpAddr, dst_addr: &IpAddr, repr: &TcpRepr) -> ProcessResult {
         debug_assert!(self.accepts(src_addr, dst_addr, repr));
         // Ingress reprs come from `parse`, which never splits the payload.
         debug_assert!(repr.payload2.is_empty());
@@ -1914,6 +2198,30 @@ impl<'d> TcpSocketState<'d> {
     /// Packets are sent using the `emit` closure. Real egress uses the [`transmit`] function,
     /// tests pass a closure that captures what's sent.
     pub(crate) fn dispatch<E>(
+        &mut self,
+        cx: &mut TxContext<'_, '_>,
+        clock: &mut Clock,
+        emit: impl FnMut(&mut TxContext<'_, '_>, Option<EgressRoute>, IpAddr, IpAddr, u8, TcpRepr) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let result = self.dispatch_inner(cx, clock, emit);
+        self.check_invariants();
+        // A blocked dispatch is retried. One that wasn't sent everything it could,
+        // so whatever is left unacknowledged must be timed, or the connection
+        // could wait forever.
+        if cfg!(debug_assertions) && result.is_ok() {
+            assert!(
+                !self.unacked_untimed(),
+                "{}: {} to {} unacknowledged after a dispatch, with timer {:?}",
+                self.state,
+                self.send_unack,
+                self.send_max,
+                self.timer
+            );
+        }
+        result
+    }
+
+    fn dispatch_inner<E>(
         &mut self,
         cx: &mut TxContext<'_, '_>,
         clock: &mut Clock,
@@ -2837,6 +3145,7 @@ impl<'d> TcpSocket<'_, 'd> {
             s.ts_recent = 0;
             s.send_ts_offset = send_ts_offset;
         }
+        s.check_invariants();
         Ok(())
     }
 
@@ -2863,6 +3172,7 @@ impl<'d> TcpSocket<'_, 'd> {
         let s = self.sockets.get_mut(self.index);
         s.reset();
         token.start_syn_received(s, self.tx.rand());
+        s.check_invariants();
         Ok(())
     }
 
@@ -2896,6 +3206,7 @@ impl<'d> TcpSocket<'_, 'd> {
         if !was_armed {
             self.inner_mut().remote_last_ts = None;
         }
+        self.inner().check_invariants();
     }
 
     /// Abort the connection, if any.
@@ -2912,6 +3223,7 @@ impl<'d> TcpSocket<'_, 'd> {
         if s.state != State::Closed {
             s.end_connection(CloseReason::Aborted);
         }
+        s.check_invariants();
     }
 
     /// Return whether the socket is open.
@@ -3046,6 +3358,9 @@ impl<'d> TcpSocket<'_, 'd> {
         }
 
         let s = self.inner_mut();
+        // `f`'s result may borrow the buffer, so this checks the state the last
+        // call left, before `f` runs. The next one checks what `f` did.
+        s.check_invariants();
         let old_length = s.tx_buffer.len();
         let was_armed = s.timeout_armed();
         let (size, result) = f(&mut s.tx_buffer);
@@ -3110,6 +3425,9 @@ impl<'d> TcpSocket<'_, 'd> {
         self.recv_error_check()?;
 
         let s = self.inner_mut();
+        // `f`'s result may borrow the buffer, so this checks the state the last
+        // call left, before `f` runs. The next one checks what `f` did.
+        s.check_invariants();
         let _old_length = s.rx_buffer.len();
         let (size, result) = f(&mut s.rx_buffer);
         s.recv_read += size;
@@ -6037,6 +6355,7 @@ mod test {
         let local_seq_start = TcpSeqNumber(i32::MAX - 1);
         s.send_unack = local_seq_start + 1;
         s.send_next = local_seq_start + 1;
+        s.send_max = local_seq_start + 1;
         s.view().send_slice(b"abc").unwrap();
         recv!(s, time 1000, Ok(TcpRepr {
             seq_number: local_seq_start + 1,
@@ -6580,6 +6899,7 @@ mod test {
         s.send_ts_ok = true;
         s.send_mss = 9999;
         s.send_window = 9999;
+        s.send_window_max = 9999;
 
         // Payload should contain 12 bytes less due to timestamp
         s.view().send_slice(&[0; EFFECTIVE_MSS]).unwrap();
@@ -7681,6 +8001,9 @@ mod test {
         let _ = s.tx_buffer.enqueue_slice(b"x");
         s.send_next = LOCAL_SEQ + 1 + 1 + 1;
         s.send_max = s.send_next;
+        s.timer = Timer::Retransmit {
+            expires_at: Instant::from_millis(1000),
+        };
         send!(
             s,
             TcpRepr {
@@ -7855,6 +8178,9 @@ mod test {
         // Mark it as already sent (send_next is past the data byte and the FIN).
         s.send_next = LOCAL_SEQ + 1 + 1 + 1; // data(1) + FIN(1)
         s.send_max = s.send_next;
+        s.timer = Timer::Retransmit {
+            expires_at: Instant::from_millis(1000),
+        };
 
         // Remote ACKs just the data byte, not the FIN (partial ACK).
         // ack_number = send_unack + 1  =>  ack_len = 1, ack_of_fin = false.
@@ -8308,6 +8634,7 @@ mod test {
     fn test_congestion_window_limits_data_in_flight() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
         s.send_window = 65535;
+        s.send_window_max = 65535;
         s.send_mss = 1024;
 
         let data = [b'x'; 8192];
@@ -8353,6 +8680,7 @@ mod test {
     fn test_congestion_window_doesnt_limit_fast_retransmit() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
         s.send_window = 65535;
+        s.send_window_max = 65535;
         s.send_mss = 1024;
 
         // Normal ACK of previously received segment
@@ -9631,6 +9959,7 @@ mod test {
         // its handshake ACK: segments are capped at 1000 bytes.
         s.send_mss = 1000;
         s.send_window = 32767;
+        s.send_window_max = 32767;
         s.view().send_slice(&[0; 1200][..]).unwrap();
         recv!(
             s,
@@ -10603,6 +10932,7 @@ mod test {
     fn test_zero_window_probe_not_capped_by_cwnd() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
         s.send_window = 65535;
+        s.send_window_max = 65535;
         s.send_mss = 1024;
 
         let data = [b'x'; 4096];

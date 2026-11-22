@@ -2265,24 +2265,6 @@ impl<'d> TcpSocketState<'d> {
 
         self.congestion_controller.pre_transmit(now);
 
-        // Data queued into a zero window since the last dispatch: the first probe
-        // goes out one RTO from now (RFC 9293 3.8.6.1).
-        if self.send_window == 0
-            && !self.tx_buffer.is_empty()
-            && self.timer.is_idle()
-            && matches!(
-                self.state,
-                State::Established | State::FinWait1 | State::Closing | State::CloseWait | State::LastAck
-            )
-        {
-            let delay = self.rtte.retransmission_timeout();
-            trace!("starting zero-window-probe timer for t+{}", delay);
-            self.timer = Timer::ZeroWindowProbe {
-                expires_at: clock.after(delay),
-                delay,
-            };
-        }
-
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(clock) {
             // If a timeout expires, we should abort the connection.
@@ -2321,6 +2303,25 @@ impl<'d> TcpSocketState<'d> {
 
             // Inform RTTE, so that it can avoid bogus measurements.
             self.rtte.on_retransmit();
+        }
+
+        // Data queued into a zero window since the last dispatch, or a
+        // retransmission a zero window holds back: the first probe goes out one
+        // RTO from now (RFC 9293 3.8.6.1).
+        if self.send_window == 0
+            && !self.tx_buffer.is_empty()
+            && self.timer.is_idle()
+            && matches!(
+                self.state,
+                State::Established | State::FinWait1 | State::Closing | State::CloseWait | State::LastAck
+            )
+        {
+            let delay = self.rtte.retransmission_timeout();
+            trace!("starting zero-window-probe timer for t+{}", delay);
+            self.timer = Timer::ZeroWindowProbe {
+                expires_at: clock.after(delay),
+                delay,
+            };
         }
 
         // Route the destination now, before building anything: the egress
@@ -10965,6 +10966,42 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    // A retransmission timeout that a zero window holds back starts the
+    // zero-window probe timer, rather than leaving the data with no timer.
+    #[test]
+    fn test_zero_window_probe_after_rto_into_zero_window() {
+        let mut s = socket_established();
+        s.view().send_slice(b"abcdef").unwrap();
+        recv!(s, time 0, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abcdef"[..],
+            ..RECV_TEMPL
+        }]);
+        // The remote shuts its window, acknowledging nothing.
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 0,
+            ..SEND_TEMPL
+        });
+        // The retransmission timeout can't send anything into the zero window.
+        recv_nothing!(s, time 1000);
+        assert_eq!(
+            s.timer,
+            Timer::ZeroWindowProbe {
+                expires_at: Instant::from_millis(3000),
+                delay: Duration::from_millis(2000),
+            }
+        );
+        assert_eq!(s.deadline, Instant::from_millis(3000));
+        recv!(s, time 3000, [TcpRepr {
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }]);
     }
 
     // When a zero window opens again, what was sent before it shut and wasn't

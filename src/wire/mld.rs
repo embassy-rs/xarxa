@@ -64,28 +64,39 @@ impl<'a> Packet<'a> {
         Ipv6Addr::from_octets(self.buffer[field::QUERY_MCAST_ADDR].try_into().unwrap())
     }
 
-    /// Return the Suppress Router-Side Processing flag.
+    /// Return the Suppress Router-Side Processing flag, `None` if this is not
+    /// an MLDv2 query.
     #[inline]
-    pub fn s_flag(&self) -> bool {
-        (self.buffer[field::SQRV] & 0x08) != 0
+    pub fn s_flag(&self) -> Option<bool> {
+        Some((self.mldv2_query()?[field::SQRV] & 0x08) != 0)
     }
 
-    /// Return the Querier's Robustness Variable.
+    /// Return the Querier's Robustness Variable, `None` if this is not an MLDv2
+    /// query.
     #[inline]
-    pub fn qrv(&self) -> u8 {
-        self.buffer[field::SQRV] & 0x7
+    pub fn qrv(&self) -> Option<u8> {
+        Some(self.mldv2_query()?[field::SQRV] & 0x7)
     }
 
-    /// Return the Querier's Query Interval Code.
+    /// Return the Querier's Query Interval Code, `None` if this is not an MLDv2
+    /// query.
     #[inline]
-    pub fn qqic(&self) -> u8 {
-        self.buffer[field::QQIC]
+    pub fn qqic(&self) -> Option<u8> {
+        Some(self.mldv2_query()?[field::QQIC])
     }
 
-    /// Return number of sources.
+    /// Return number of sources, `None` if this is not an MLDv2 query.
     #[inline]
-    pub fn num_srcs(&self) -> u16 {
-        NetworkEndian::read_u16(&self.buffer[field::QUERY_NUM_SRCS])
+    pub fn num_srcs(&self) -> Option<u16> {
+        Some(NetworkEndian::read_u16(&self.mldv2_query()?[field::QUERY_NUM_SRCS]))
+    }
+
+    /// The header of an MLDv2 query, `None` if the buffer is too short for one.
+    ///
+    /// RFC 3810 §8.1 tells an MLDv2 query from an MLDv1 one by its length alone.
+    #[inline]
+    fn mldv2_query(&self) -> Option<&[u8]> {
+        self.buffer.get(..field::QUERY_NUM_SRCS.end)
     }
 }
 
@@ -348,15 +359,36 @@ mod test {
         assert_eq!(packet.max_resp_code(), 0x0400);
         assert_eq!(packet.max_resp_delay(), Duration::from_millis(0x0400));
         assert_eq!(packet.mcast_addr(), IPV6_LINK_LOCAL_ALL_NODES);
-        assert!(packet.s_flag());
-        assert_eq!(packet.qrv(), 0x02);
-        assert_eq!(packet.qqic(), 0x12);
-        assert_eq!(packet.num_srcs(), 0x01);
+        assert_eq!(packet.s_flag(), Some(true));
+        assert_eq!(packet.qrv(), Some(0x02));
+        assert_eq!(packet.qqic(), Some(0x12));
+        assert_eq!(packet.num_srcs(), Some(0x01));
         assert_eq!(
             Ipv6Addr::from_octets(packet.payload().try_into().unwrap()),
             IPV6_LINK_LOCAL_ALL_ROUTERS
         );
         assert!(packet.verify_checksum(&IPV6_LINK_LOCAL_ALL_NODES, &IPV6_LINK_LOCAL_ALL_ROUTERS));
+    }
+
+    /// An MLDv1 query (24 bytes) passes `check_len`, and the MLDv2 query fields
+    /// it does not have read as `None`.
+    #[test]
+    fn test_check_len_mldv1_query() {
+        let mut bytes = [0u8; 24];
+        bytes[0] = 0x82;
+        let packet = Packet::new_checked(&mut bytes[..]).unwrap();
+        assert_eq!(packet.header_len(), 24);
+        assert!(packet.payload().is_empty());
+        assert_eq!(packet.num_srcs(), None);
+        assert_eq!(packet.qrv(), None);
+        assert!(Packet::new_checked(&mut bytes[..23]).is_err());
+
+        // Too short for MLDv2, too long for MLDv1: the consumer ignores it.
+        let mut bytes = [0u8; 26];
+        bytes[0] = 0x82;
+        let packet = Packet::new_checked(&mut bytes[..]).unwrap();
+        assert_eq!(packet.payload().len(), 2);
+        assert_eq!(packet.s_flag(), None);
     }
 
     #[test]

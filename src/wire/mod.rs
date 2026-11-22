@@ -161,7 +161,10 @@ pub use self::mld::{
 pub use self::ndisc::{NeighborFlags as NdiscNeighborFlags, RouterFlags as NdiscRouterFlags};
 
 #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
-pub use self::ndiscoption::{NdiscOption, PrefixInfoFlags as NdiscPrefixInfoFlags, Type as NdiscOptionType};
+pub use self::ndiscoption::{
+    NdiscOption, NdiscOptions, PrefixInfoFlags as NdiscPrefixInfoFlags, PrefixInformation as NdiscPrefixInformation,
+    Type as NdiscOptionType,
+};
 
 #[cfg(feature = "medium-ieee802154")]
 pub use self::ieee802154::{

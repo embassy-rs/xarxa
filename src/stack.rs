@@ -2524,10 +2524,13 @@ impl StackInner {
         }
 
         let target_addr = icmp_packet.target_addr();
-        let lladdr = check!(ndisc_lladdr_option(icmp_packet, NdiscOptionType::SourceLinkLayerAddr));
+        let lladdr = check!(ndisc_lladdr_option(
+            icmp_packet,
+            NdiscOptionType::SourceLinkLayerAddr,
+            iface.medium()
+        ));
 
         if let Some(lladdr) = lladdr {
-            let lladdr = check!(lladdr.parse(iface.medium()));
             if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
                 return;
             }
@@ -2604,16 +2607,16 @@ impl StackInner {
         if dst_addr.is_multicast() && flags.contains(NdiscNeighborFlags::SOLICITED) {
             return;
         }
-        let lladdr = match check!(ndisc_lladdr_option(icmp_packet, NdiscOptionType::TargetLinkLayerAddr)) {
-            Some(lladdr) => {
-                let lladdr = check!(lladdr.parse(iface.medium()));
-                if !lladdr.is_unicast() {
-                    return;
-                }
-                Some(lladdr)
-            }
-            None => None,
-        };
+        let lladdr = check!(ndisc_lladdr_option(
+            icmp_packet,
+            NdiscOptionType::TargetLinkLayerAddr,
+            iface.medium()
+        ));
+        if let Some(lladdr) = lladdr
+            && !lladdr.is_unicast()
+        {
+            return;
+        }
 
         let ip_addr = IpAddr::V6(target_addr);
         let Some(entry) = self.neighbor_cache.get(iface.handle, ip_addr) else {
@@ -3326,27 +3329,25 @@ pub(crate) fn write_lladdr_option(opt: &mut [u8], option_type: NdiscOptionType, 
     opt.set_link_layer_addr(RawHardwareAddress::from(addr));
 }
 
+/// Find the link-layer address option of `option_type` in a neighbor
+/// solicitation or advertisement.
+///
+/// Fails only on broken option framing, which discards the whole message (RFC
+/// 4861 §7.1.1, §7.1.2). Every other option is ignored, and so is an address
+/// option that does not parse for `medium`: it counts as absent.
 #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 fn ndisc_lladdr_option(
     icmp_packet: &mut Icmpv6Packet<'_>,
     option_type: NdiscOptionType,
-) -> Result<Option<RawHardwareAddress>, Malformed> {
-    let mut lladdr = None;
-    let options = icmp_packet.payload_mut();
-    let mut offset = 0;
-    while offset < options.len() {
-        let opt = NdiscOption::new_checked(&mut options[offset..])?;
-        let opt_len = opt.data_len() as usize * 8;
-        if opt_len == 0 {
-            trace!("ndisc: option with zero length");
-            return Err(Malformed);
+    medium: Medium,
+) -> Result<Option<HardwareAddress>, Malformed> {
+    let mut opts = NdiscOptions::new_checked(icmp_packet.payload_mut())?;
+    Ok(opts.find_map(|opt| {
+        if opt.option_type() != option_type {
+            return None;
         }
-        if opt.option_type() == option_type {
-            lladdr = Some(opt.link_layer_addr());
-        }
-        offset += opt_len;
-    }
-    Ok(lladdr)
+        opt.link_layer_addr().parse(medium).ok()
+    }))
 }
 
 #[cfg(all(
@@ -4332,6 +4333,60 @@ pub(crate) mod test {
         assert!(stack.routes().default_ipv6_route().is_none());
     }
 
+    /// `frame`, a router advertisement from [`router_advert`], with `options`
+    /// appended to its options.
+    #[cfg(feature = "slaac")]
+    fn with_ra_options(frame: &[u8], router_ll: Ipv6Addr, options: &[u8]) -> Vec<u8> {
+        let mut icmp = frame[ETHERNET_HEADER_LEN + IPV6_HEADER_LEN..].to_vec();
+        icmp.extend_from_slice(options);
+        Icmpv6Packet::new_unchecked(&mut icmp[..]).fill_checksum(&router_ll, &IPV6_LINK_LOCAL_ALL_NODES);
+        let mut ip = ipv6_packet(router_ll, IPV6_LINK_LOCAL_ALL_NODES, IpProtocol::Icmpv6, &icmp);
+        Ipv6Packet::new_unchecked(&mut ip[..]).set_hop_limit(255);
+        [&frame[..ETHERNET_HEADER_LEN], &ip[..]].concat()
+    }
+
+    /// RFC 4861 §6.1.2: options an advertisement does not use are ignored,
+    /// whatever their contents, and so is a prefix information option too short
+    /// to hold a prefix. Only broken option framing discards the advertisement.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_ignores_unused_options() {
+        let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let router_ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let prefix = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        let frame = router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        );
+
+        let advertise = |options: &[u8]| {
+            let (mut stack, rx, _tx) = test_stack(Medium::Ethernet);
+            let iface = IfaceHandle::new(0);
+            stack.iface(iface).set_slaac(Some(SlaacConfig::default())).unwrap();
+            stack.poll(Instant::from_secs(1));
+            rx.borrow_mut().push_back(with_ra_options(&frame, router_ll, options));
+            stack.poll(Instant::from_secs(2));
+            let configured = stack
+                .iface(iface)
+                .ip_addrs()
+                .iter()
+                .any(|a| a.origin == AddrOrigin::Slaac);
+            (configured, stack.routes().default_ipv6_route().is_some())
+        };
+
+        // A Redirected Header and a Prefix Information option, each too short
+        // for its type.
+        assert_eq!(advertise(&[0x04, 0x01, 0, 0, 0, 0, 0, 0]), (true, true));
+        assert_eq!(advertise(&[0x03, 0x01, 0, 0, 0, 0, 0, 0]), (true, true));
+        // An option of Length 0, and one that runs past the end of the message.
+        assert_eq!(advertise(&[0xc8, 0x00, 0, 0, 0, 0, 0, 0]), (false, false));
+        assert_eq!(advertise(&[0xc8, 0x02, 0, 0, 0, 0, 0, 0]), (false, false));
+    }
+
     /// Inject a packet into the device and poll the stack to process it.
     pub(crate) fn inject(stack: &mut Stack, rx: &Queue, bytes: Vec<u8>) {
         rx.borrow_mut().push_back(bytes);
@@ -5095,6 +5150,26 @@ pub(crate) mod test {
         assert_eq!(
             stack.udp_socket(handle).take_icmp_error(),
             Some((IcmpError::PortUnreachable, SocketAddr::new(REMOTE_V6.into(), 53)))
+        );
+    }
+
+    /// RFC 4443 §2.4(a): an ICMPv6 error of a type we do not know still reaches the
+    /// socket whose packet caused it. Like every error, it has the 8-byte header,
+    /// and the quote starts after it.
+    #[test]
+    fn test_udp_icmp_error_unknown_type_v6() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let handle = stack.add_udp_socket().unwrap();
+        stack.udp_socket(handle).bind(5000, (REMOTE_V6, 53)).unwrap();
+        stack.udp_socket(handle).send_slice(b"query", (REMOTE_V6, 53)).unwrap();
+        let sent = tx.borrow().last().unwrap().clone();
+
+        let error = icmpv6_error_packet(REMOTE_V6, OUR_V6, Icmpv6Message::from(100), 0, &sent);
+        inject(&mut stack, &rx, error);
+
+        assert_eq!(
+            stack.udp_socket(handle).take_icmp_error(),
+            Some((IcmpError::Other, SocketAddr::new(REMOTE_V6.into(), 53)))
         );
     }
 
@@ -6289,19 +6364,33 @@ pub(crate) mod test {
         dst_addr: Ipv6Addr,
         target: Ipv6Addr,
     ) -> Vec<u8> {
-        let mut icmp = vec![0; 24 + 8];
+        let mut slla = [0; 8];
+        {
+            let mut opt = NdiscOption::new_unchecked(&mut slla);
+            opt.set_option_type(NdiscOptionType::SourceLinkLayerAddr);
+            opt.set_data_len(1);
+            opt.set_link_layer_addr(RawHardwareAddress::from(remote_hw));
+        }
+        neighbor_solicit_with_options(remote_hw, remote_ll, dst_addr, target, &slla)
+    }
+
+    /// Like [`neighbor_solicit`], with `options` as the whole options area.
+    #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+    fn neighbor_solicit_with_options(
+        remote_hw: EthernetAddress,
+        remote_ll: Ipv6Addr,
+        dst_addr: Ipv6Addr,
+        target: Ipv6Addr,
+        options: &[u8],
+    ) -> Vec<u8> {
+        let mut icmp = vec![0; 24 + options.len()];
         {
             let mut ns = Icmpv6Packet::new_unchecked(&mut icmp[..]);
             ns.set_msg_type(Icmpv6Message::NeighborSolicit);
             ns.set_msg_code(0);
             ns.clear_reserved();
             ns.set_target_addr(target);
-            {
-                let mut opt = NdiscOption::new_unchecked(ns.payload_mut());
-                opt.set_option_type(NdiscOptionType::SourceLinkLayerAddr);
-                opt.set_data_len(1);
-                opt.set_link_layer_addr(RawHardwareAddress::from(remote_hw));
-            }
+            ns.payload_mut().copy_from_slice(options);
             ns.fill_checksum(&remote_ll, &dst_addr);
         }
         let mut ip = ipv6_packet(remote_ll, dst_addr, IpProtocol::Icmpv6, &icmp);
@@ -6358,6 +6447,52 @@ pub(crate) mod test {
             neighbor_solicit(remote_hw, remote_ll, OUR_LINK_LOCAL, remote_ll),
         );
         assert!(tx.borrow().is_empty());
+    }
+
+    /// RFC 4861 §7.1.1: options a solicitation does not use are ignored, whatever
+    /// their contents, and so is a source link-layer address option that does not
+    /// parse. Only broken option framing discards the solicitation.
+    #[test]
+    #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+    fn test_ndisc_solicit_ignores_unused_options() {
+        let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let remote_ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let dst_addr = OUR_LINK_LOCAL.solicited_node();
+        let mut slla = [0x01, 0x01, 0, 0, 0, 0, 0, 0];
+        slla[2..].copy_from_slice(remote_hw.as_bytes());
+
+        let solicit = |options: &[u8]| {
+            let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+            let ns = neighbor_solicit_with_options(remote_hw, remote_ll, dst_addr, OUR_LINK_LOCAL, options);
+            inject(&mut stack, &rx, ns);
+            let tx = tx.borrow();
+            (tx.len(), cached_lladdr(&stack, remote_ll))
+        };
+
+        // A Redirected Header and a Prefix Information option, each too short
+        // for its type.
+        let short_redirected = [0x04, 0x01, 0, 0, 0, 0, 0, 0];
+        let short_prefix = [0x03, 0x01, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            solicit(&[short_redirected, short_prefix, slla].concat()),
+            (1, Some(remote_hw))
+        );
+
+        // A source link-layer address option that is no Ethernet address (16
+        // bytes), next to the one that is. Only with 802.15.4 does the option
+        // yield more than the 6 bytes of an Ethernet address, which then fail to
+        // parse.
+        #[cfg(feature = "medium-ieee802154")]
+        {
+            let long_slla = [0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(solicit(&[&long_slla[..], &slla].concat()), (1, Some(remote_hw)));
+            assert_eq!(solicit(&[&slla[..], &long_slla].concat()), (1, Some(remote_hw)));
+        }
+
+        // An option of Length 0 after the address option, and one that runs past
+        // the end of the message.
+        assert_eq!(solicit(&[&slla[..], &[0xc8, 0, 0, 0, 0, 0, 0, 0]].concat()), (0, None));
+        assert_eq!(solicit(&[&slla[..], &[0xc8, 2, 0, 0, 0, 0, 0, 0]].concat()), (0, None));
     }
 
     // ===== IPv4 fragmentation and reassembly =====

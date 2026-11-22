@@ -202,37 +202,22 @@ impl<'a> Packet<'a> {
 
     /// Ensure that no accessor method will panic if called.
     ///
+    /// This checks lengths only, for any message type value: the buffer holds the
+    /// header of its type, as [`header_len`] gives it. Every accessor for the
+    /// message's type is then in bounds. Fields that only some messages of a type
+    /// carry, like the MLDv2 query fields, have accessors that return `None`
+    /// when they are not there. Whether the message is valid for its type is up
+    /// to the consumer.
+    ///
     /// # Errors
-    /// - `Malformed`: if the buffer is too short.
+    /// - `Malformed`: if the buffer is shorter than the header of the message type.
+    ///
+    /// [`header_len`]: #method.header_len
     pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
-
-        if len < 4 {
+        if len < field::CHECKSUM.end || len < self.header_len() {
             return Err(Malformed);
         }
-
-        match self.msg_type() {
-            Message::DstUnreachable
-            | Message::PktTooBig
-            | Message::TimeExceeded
-            | Message::ParamProblem
-            | Message::EchoRequest
-            | Message::EchoReply
-            | Message::MldQuery
-            | Message::RouterSolicit
-            | Message::RouterAdvert
-            | Message::NeighborSolicit
-            | Message::NeighborAdvert
-            | Message::Redirect
-            | Message::MldReport => {
-                if len < field::HEADER_END || len < self.header_len() {
-                    return Err(Malformed);
-                }
-            }
-            Message::RplControl => return Err(Malformed),
-            _ => return Err(Malformed),
-        }
-
         Ok(())
     }
 
@@ -280,6 +265,10 @@ impl<'a> Packet<'a> {
 
     /// Return the header length. The result depends on the value of
     /// the message type field.
+    ///
+    /// Every error message (type below 128) has the 8-byte header of RFC 4443
+    /// §2.1, also the types this does not know, so that the payload of an
+    /// unknown error is the packet it quotes.
     pub fn header_len(&self) -> usize {
         match self.msg_type() {
             Message::DstUnreachable => field::UNUSED.end,
@@ -293,9 +282,13 @@ impl<'a> Packet<'a> {
             Message::NeighborSolicit => field::TARGET_ADDR.end,
             Message::NeighborAdvert => field::TARGET_ADDR.end,
             Message::Redirect => field::DEST_ADDR.end,
-            Message::MldQuery => field::QUERY_NUM_SRCS.end,
+            // RFC 3810 §8.1 tells the versions apart by length: an MLDv2 query
+            // has 4 more bytes of header than an MLDv1 query (RFC 2710 §3).
+            Message::MldQuery if self.buffer.len() >= field::QUERY_NUM_SRCS.end => field::QUERY_NUM_SRCS.end,
+            Message::MldQuery => field::QUERY_MCAST_ADDR.end,
             Message::MldReport => field::NR_MCAST_RCRDS.end,
-            // For packets that are not included in RFC 4443, do not
+            msg_type if msg_type.is_error() => field::HEADER_END,
+            // For informational messages that are not known here, do not
             // include the last 32 bits of the ICMPv6 header in
             // `header_bytes`. This must be done so that these bytes
             // can be accessed in the `payload`.
@@ -354,7 +347,10 @@ impl<'a> Packet<'a> {
             }
             Message::MldQuery => {
                 NetworkEndian::write_u16(&mut self.buffer[field::QUERY_RESV], 0);
-                self.buffer[field::SQRV] &= 0xf;
+                // An MLDv1 query has no S/QRV field.
+                if let Some(sqrv) = self.buffer.get_mut(field::SQRV) {
+                    *sqrv &= 0xf;
+                }
             }
             Message::MldReport => {
                 NetworkEndian::write_u16(&mut self.buffer[field::RECORD_RESV], 0);
@@ -487,6 +483,30 @@ mod test {
         assert_eq!(packet.payload(), &PKT_TOO_BIG_IP_PAYLOAD[..]);
         assert!(packet.verify_checksum(&MOCK_IP_ADDR_1, &MOCK_IP_ADDR_2));
         assert!(packet.msg_type().is_error());
+    }
+
+    /// `check_len` checks lengths only. Every error type, known or not, has the
+    /// 8-byte error header, and an unknown informational type has 4 bytes.
+    #[test]
+    fn test_check_len_unknown_types() {
+        let mut bytes = [100, 0, 0, 0, 0, 0, 0, 0, 0xaa];
+        let packet = Packet::new_checked(&mut bytes[..]).unwrap();
+        assert!(packet.msg_type().is_error());
+        assert_eq!(packet.payload(), &[0xaa]);
+        assert!(Packet::new_checked(&mut bytes[..7]).is_err());
+
+        let mut bytes = [200, 0, 0, 0, 0xaa];
+        let packet = Packet::new_checked(&mut bytes[..]).unwrap();
+        assert_eq!(packet.payload(), &[0xaa]);
+        assert!(Packet::new_checked(&mut bytes[..3]).is_err());
+
+        // RPL control, a known informational type with no fixed header here.
+        let mut bytes = [0x9b, 0, 0, 0];
+        assert!(Packet::new_checked(&mut bytes[..]).is_ok());
+
+        // Known types still need their header.
+        let mut bytes = [0x87; 23];
+        assert!(Packet::new_checked(&mut bytes[..]).is_err());
     }
 
     #[test]

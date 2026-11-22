@@ -54,7 +54,9 @@ impl IcmpError {
                 _ => IcmpError::Other,
             }),
             Icmpv6Message::PktTooBig => Some(IcmpError::PacketTooBig),
-            Icmpv6Message::TimeExceeded | Icmpv6Message::ParamProblem => Some(IcmpError::Other),
+            // RFC 4443 §2.4(a): an error of a type we do not know is still passed
+            // to the process whose packet caused it.
+            msg_type if msg_type.is_error() => Some(IcmpError::Other),
             _ => None,
         }
     }

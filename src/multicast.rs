@@ -583,6 +583,12 @@ impl IfaceState<'_> {
         if icmp_packet.msg_code() != 0 {
             return;
         }
+        // RFC 3810 §8.1: only a query of 28 bytes or more is an MLDv2 query. A
+        // 24-byte one is an MLDv1 query, which takes the MLDv1 compatibility mode
+        // this does not have, and any other length is to be ignored.
+        if icmp_packet.num_srcs().is_none() {
+            return;
+        }
 
         let mcast_addr = icmp_packet.mcast_addr();
 
@@ -1255,6 +1261,31 @@ mod test {
             inject(&mut stack, &rx, medium, EthernetProtocol::Ipv6, query, timestamp),
             idle_deadline(timestamp)
         );
+    }
+
+    /// RFC 3810 §8.1: a query is told apart by its length. One of 28 bytes or more
+    /// is an MLDv2 query and is answered. A 24-byte MLDv1 query passes the wire
+    /// checks, but is not answered, for want of the MLDv1 compatibility mode. Any
+    /// other length is ignored.
+    #[test]
+    fn test_multicast_query_length() {
+        let medium = Medium::Ethernet;
+        let (mut stack, rx, tx, _link) = test_stack(medium);
+        let timestamp = Instant::ZERO;
+        stack.poll(timestamp);
+        // flush the report from joining the solicited-node group
+        recv_mld(medium, &tx);
+
+        for (len, answered) in [(24, false), (26, false), (28, true)] {
+            let mut query = mld_query(REMOTE_LL, IPV6_LINK_LOCAL_ALL_NODES, Ipv6Addr::UNSPECIFIED, 0);
+            query.truncate(IPV6_HEADER_LEN + len);
+            Ipv6Packet::new_unchecked(&mut query[..]).set_payload_len(len as u16);
+            let mut icmp = Icmpv6Packet::new_checked(&mut query[IPV6_HEADER_LEN..]).unwrap();
+            icmp.fill_checksum(&REMOTE_LL, &IPV6_LINK_LOCAL_ALL_NODES);
+            assert_eq!(icmp.num_srcs().is_some(), len >= 28);
+            inject(&mut stack, &rx, medium, EthernetProtocol::Ipv6, query, timestamp);
+            assert_eq!(!recv_mld(medium, &tx).is_empty(), answered, "query of {len} bytes");
+        }
     }
 
     /// The report delay follows the query's Maximum Response Code: a code of

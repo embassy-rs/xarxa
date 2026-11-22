@@ -38,7 +38,7 @@ use crate::wire::{IpProtocol, IpVersion};
 #[cfg(all(feature = "ipv6", feature = "multicast"))]
 use crate::wire::{MLD_ADDRESS_RECORD_LEN, MldAddressRecord};
 #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
-use crate::wire::{NdiscOption, NdiscOptionType};
+use crate::wire::{NdiscOptionType, NdiscOptions};
 #[cfg(feature = "tcp")]
 use crate::wire::{TcpOption, TcpPacket};
 
@@ -763,7 +763,7 @@ fn log_icmpv6(buf: &mut [u8]) {
         ),
         #[cfg(feature = "multicast")]
         Icmpv6Message::MldQuery => trace!(
-            "ICMPv6 type={} max_resp_code={} mcast_addr={} num_srcs={}",
+            "ICMPv6 type={} max_resp_code={} mcast_addr={} num_srcs={:?}",
             ty,
             packet.max_resp_code(),
             packet.mcast_addr(),
@@ -824,33 +824,27 @@ fn log_mld_records(mut buf: &mut [u8]) {
 }
 
 #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
-fn log_ndisc_options(mut buf: &mut [u8]) {
-    while !buf.is_empty() {
-        let opt = match NdiscOption::new_checked(buf) {
-            Ok(o) => o,
-            Err(_) => {
-                trace!("  ndisc option: malformed");
-                return;
-            }
-        };
+fn log_ndisc_options(buf: &mut [u8]) {
+    let Ok(opts) = NdiscOptions::new_checked(buf) else {
+        trace!("  ndisc options: malformed");
+        return;
+    };
+    for opt in opts {
         let ty = opt.option_type();
-        let len = opt.data_len() as usize * 8;
         match ty {
             NdiscOptionType::SourceLinkLayerAddr | NdiscOptionType::TargetLinkLayerAddr => {
                 trace!("  ndisc option {} addr={}", ty, opt.link_layer_addr())
             }
-            NdiscOptionType::PrefixInformation => trace!(
-                "  ndisc option {} prefix={}/{} flags={:?}",
-                ty,
-                opt.prefix(),
-                opt.prefix_len(),
-                opt.prefix_flags()
-            ),
+            NdiscOptionType::PrefixInformation => match opt.prefix_information() {
+                Some(pi) => trace!(
+                    "  ndisc option {} prefix={}/{} flags={:?}",
+                    ty, pi.prefix, pi.prefix_len, pi.flags
+                ),
+                None => trace!("  ndisc option {}: malformed", ty),
+            },
             NdiscOptionType::Mtu => trace!("  ndisc option {} mtu={}", ty, opt.mtu()),
-            _ => trace!("  ndisc option {} len={}", ty, len),
+            _ => trace!("  ndisc option {} len={}", ty, opt.data_len() as usize * 8),
         }
-        // `new_checked` guarantees `len <= buf.len()`.
-        buf = &mut buf[len..];
     }
 }
 

@@ -58,8 +58,6 @@ mod field {
     pub const TYPE: usize = 0;
     // 8-bit unsigned integer. Length of the option, in units of 8 octets.
     pub const LENGTH: usize = 1;
-    // Minimum length of an option.
-    pub const MIN_OPT_LEN: usize = 8;
     // Variable-length field. Option-Type-specific data.
     pub const fn DATA(length: u8) -> Field {
         2..length as usize * 8
@@ -115,7 +113,6 @@ mod field {
 
     // Reserved bits.
     pub const REDIRECTED_RESERVED: Field = 2..8;
-    pub const REDIR_MIN_SZ: usize = 48;
 
     // MTU Option fields
     //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -143,41 +140,28 @@ impl<'a> NdiscOption<'a> {
     pub fn new_checked(buffer: &'a mut [u8]) -> Result<NdiscOption<'a>, Malformed> {
         let opt = Self::new_unchecked(buffer);
         opt.check_len()?;
-
-        // A data length field of 0 is invalid.
-        if opt.data_len() == 0 {
-            return Err(Malformed);
-        }
-
         Ok(opt)
     }
 
     /// Ensure that no accessor method will panic if called.
     ///
+    /// This checks the framing only, for any option type value: the Length field
+    /// is not zero (RFC 4861 §4.6), and the buffer holds that many bytes. The
+    /// accessors of a type that needs more than the 8 bytes every option has, like
+    /// [prefix_information], return `None` for an option too short for it.
+    /// Whether the option is valid for its type is up to the consumer.
+    ///
     /// The result of this check is invalidated by calling [set_data_len].
     ///
     /// # Errors
-    /// - `Malformed`: if the buffer is too short.
+    /// - `Malformed`: if the Length field is zero, or the buffer is too short.
     ///
+    /// [prefix_information]: #method.prefix_information
     /// [set_data_len]: #method.set_data_len
     pub fn check_len(&self) -> Result<(), Malformed> {
-        let len = self.buffer.len();
-
-        if len < field::MIN_OPT_LEN {
-            Err(Malformed)
-        } else {
-            let data_range = field::DATA(self.buffer[field::LENGTH]);
-            if len < data_range.end {
-                Err(Malformed)
-            } else {
-                match self.option_type() {
-                    Type::SourceLinkLayerAddr | Type::TargetLinkLayerAddr | Type::Mtu => Ok(()),
-                    Type::PrefixInformation if data_range.end >= field::PREFIX.end => Ok(()),
-                    Type::RedirectedHeader if data_range.end >= field::REDIR_MIN_SZ => Ok(()),
-                    Type::PrefixInformation | Type::RedirectedHeader => Err(Malformed),
-                    _ => Ok(()),
-                }
-            }
+        match option_len(self.buffer) {
+            Some(_) => Ok(()),
+            None => Err(Malformed),
         }
     }
 
@@ -213,36 +197,44 @@ impl<'a> NdiscOption<'a> {
     }
 }
 
+/// The fields of a Prefix Information option.
+///
+/// See [RFC 4861 § 4.6.2].
+///
+/// [RFC 4861 § 4.6.2]: https://tools.ietf.org/html/rfc4861#section-4.6.2
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixInformation {
+    /// The number of leading bits of `prefix` that are valid.
+    pub prefix_len: u8,
+    /// The on-link and autonomous address-configuration flags.
+    pub flags: PrefixInfoFlags,
+    /// How long the prefix is valid for on-link determination.
+    pub valid_lifetime: Duration,
+    /// How long addresses formed from the prefix stay preferred.
+    pub preferred_lifetime: Duration,
+    /// The prefix. Bits past `prefix_len` are not meaningful.
+    pub prefix: Ipv6Addr,
+}
+
 /// Getter methods only relevant for the Prefix Information option.
 impl<'a> NdiscOption<'a> {
-    /// Return the prefix length.
+    /// Return the fields of a Prefix Information option, or `None` if the
+    /// option is too short to hold them.
+    ///
+    /// This does not look at the option type.
     #[inline]
-    pub fn prefix_len(&self) -> u8 {
-        self.buffer[field::PREFIX_LEN]
-    }
-
-    /// Return the prefix information flags.
-    #[inline]
-    pub fn prefix_flags(&self) -> PrefixInfoFlags {
-        PrefixInfoFlags::from_bits_truncate(self.buffer[field::FLAGS])
-    }
-
-    /// Return the valid lifetime of the prefix.
-    #[inline]
-    pub fn valid_lifetime(&self) -> Duration {
-        Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::VALID_LT]))
-    }
-
-    /// Return the preferred lifetime of the prefix.
-    #[inline]
-    pub fn preferred_lifetime(&self) -> Duration {
-        Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::PREF_LT]))
-    }
-
-    /// Return the prefix.
-    #[inline]
-    pub fn prefix(&self) -> Ipv6Addr {
-        Ipv6Addr::from_octets(self.buffer[field::PREFIX].try_into().unwrap())
+    pub fn prefix_information(&self) -> Option<PrefixInformation> {
+        if field::DATA(self.data_len()).end < field::PREFIX.end {
+            return None;
+        }
+        Some(PrefixInformation {
+            prefix_len: self.buffer[field::PREFIX_LEN],
+            flags: PrefixInfoFlags::from_bits_truncate(self.buffer[field::FLAGS]),
+            valid_lifetime: Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::VALID_LT])),
+            preferred_lifetime: Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::PREF_LT])),
+            prefix: Ipv6Addr::from_octets(self.buffer[field::PREFIX].try_into().unwrap()),
+        })
     }
 }
 
@@ -351,10 +343,70 @@ impl<'a> NdiscOption<'a> {
     }
 }
 
+/// The length of the option at the start of `buffer`, from its Length field, or
+/// `None` if the Length field is zero or the buffer is too short for it.
+fn option_len(buffer: &[u8]) -> Option<usize> {
+    // An option is a whole number of 8-byte units, and at least one. The
+    // accessors that need no more than one unit read within it.
+    let len = *buffer.get(field::LENGTH)? as usize * 8;
+    if len == 0 || len > buffer.len() {
+        return None;
+    }
+    Some(len)
+}
+
+/// An iterator over the options of an NDISC message.
+///
+/// Each option is yielded as an [`NdiscOption`] whose buffer is that option
+/// alone, so it passes [`NdiscOption::check_len`]. Every option is yielded,
+/// whatever its type or contents: options the message does not use, and options
+/// that do not parse as their type, are for the consumer to skip (RFC 4861
+/// §6.1.2, §7.1.1, §7.1.2).
+#[derive(Debug)]
+pub struct NdiscOptions<'a> {
+    buffer: &'a mut [u8],
+}
+
+impl<'a> NdiscOptions<'a> {
+    /// Iterate over the options in `buffer`, the options area of an NDISC
+    /// message, without checking their framing first.
+    ///
+    /// The iteration stops at the first option whose framing is broken.
+    pub const fn new_unchecked(buffer: &'a mut [u8]) -> NdiscOptions<'a> {
+        NdiscOptions { buffer }
+    }
+
+    /// Iterate over the options in `buffer`, the options area of an NDISC
+    /// message, after checking the framing of them all.
+    ///
+    /// # Errors
+    /// - `Malformed`: if an option has a Length of zero or runs past the end of
+    ///   the buffer. RFC 4861 discards the whole message then.
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<NdiscOptions<'a>, Malformed> {
+        let mut rest = &buffer[..];
+        while !rest.is_empty() {
+            let len = option_len(rest).ok_or(Malformed)?;
+            rest = &rest[len..];
+        }
+        Ok(Self::new_unchecked(buffer))
+    }
+}
+
+impl<'a> Iterator for NdiscOptions<'a> {
+    type Item = NdiscOption<'a>;
+
+    fn next(&mut self) -> Option<NdiscOption<'a>> {
+        let len = option_len(self.buffer)?;
+        let (opt, rest) = core::mem::take(&mut self.buffer).split_at_mut(len);
+        self.buffer = rest;
+        Some(NdiscOption::new_unchecked(opt))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::Malformed;
-    use super::{NdiscOption, PrefixInfoFlags, Type};
+    use super::{NdiscOption, NdiscOptions, PrefixInfoFlags, PrefixInformation, Type};
     use crate::time::Duration;
     use crate::wire::Ipv6Addr;
 
@@ -369,11 +421,16 @@ mod test {
         let opt = NdiscOption::new_unchecked(&mut bytes[..]);
         assert_eq!(opt.option_type(), Type::PrefixInformation);
         assert_eq!(opt.data_len(), 4);
-        assert_eq!(opt.prefix_len(), 64);
-        assert_eq!(opt.prefix_flags(), PrefixInfoFlags::ON_LINK | PrefixInfoFlags::ADDRCONF);
-        assert_eq!(opt.valid_lifetime(), Duration::from_secs(900));
-        assert_eq!(opt.preferred_lifetime(), Duration::from_secs(1000));
-        assert_eq!(opt.prefix(), Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        assert_eq!(
+            opt.prefix_information(),
+            Some(PrefixInformation {
+                prefix_len: 64,
+                flags: PrefixInfoFlags::ON_LINK | PrefixInfoFlags::ADDRCONF,
+                valid_lifetime: Duration::from_secs(900),
+                preferred_lifetime: Duration::from_secs(1000),
+                prefix: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            })
+        );
     }
 
     #[test]
@@ -467,8 +524,81 @@ mod test {
     #[test]
     fn test_short_packet() {
         assert_eq!(NdiscOption::new_checked(&mut [0x00, 0x00]), Err(Malformed));
-        let mut bytes = [0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(
+            NdiscOption::new_checked(&mut [0x01, 0x02, 0, 0, 0, 0, 0, 0]),
+            Err(Malformed)
+        );
+    }
+
+    /// Length 0 fails `check_len`, not only `new_checked`, so that no accessor
+    /// can panic after `check_len` passed.
+    #[test]
+    fn test_zero_length() {
+        let mut bytes = [0x01, 0x00, 0, 0, 0, 0, 0, 0];
+        assert_eq!(NdiscOption::new_unchecked(&mut bytes).check_len(), Err(Malformed));
         assert_eq!(NdiscOption::new_checked(&mut bytes), Err(Malformed));
+    }
+
+    /// A Prefix Information or Redirected Header option shorter than its type
+    /// needs is well framed. Only the accessor that needs the bytes says so.
+    #[test]
+    fn test_short_typed_option() {
+        let mut bytes = [0x03, 0x01, 0, 0, 0, 0, 0, 0];
+        let opt = NdiscOption::new_checked(&mut bytes).unwrap();
+        assert_eq!(opt.prefix_information(), None);
+        let mut bytes = [0x04, 0x01, 0, 0, 0, 0, 0, 0];
+        assert!(NdiscOption::new_checked(&mut bytes).is_ok());
+
+        // The bytes of the next option do not count toward a short one.
+        let mut bytes = [0u8; 32];
+        bytes[..2].copy_from_slice(&[0x03, 0x01]);
+        bytes[8..10].copy_from_slice(&[0xc8, 0x03]);
+        let mut opts = NdiscOptions::new_checked(&mut bytes).unwrap();
+        assert_eq!(opts.next().unwrap().prefix_information(), None);
+        assert_eq!(opts.next().unwrap().option_type(), Type::from(0xc8));
+        assert!(opts.next().is_none());
+    }
+
+    #[test]
+    fn test_options_iter() {
+        let mut bytes = [0u8; 8 + 32 + 8];
+        bytes[..8].copy_from_slice(&[0x01, 0x01, 0x54, 0x52, 0x00, 0x12, 0x23, 0x34]);
+        bytes[8..40].copy_from_slice(&PREFIX_OPT_BYTES);
+        bytes[40..].copy_from_slice(&[0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x05, 0xdc]);
+        let types: Vec<_> = NdiscOptions::new_checked(&mut bytes)
+            .unwrap()
+            .map(|opt| (opt.option_type(), opt.data().len()))
+            .collect();
+        assert_eq!(
+            types,
+            [
+                (Type::SourceLinkLayerAddr, 6),
+                (Type::PrefixInformation, 30),
+                (Type::Mtu, 6)
+            ]
+        );
+
+        assert!(NdiscOptions::new_checked(&mut []).unwrap().next().is_none());
+    }
+
+    /// A broken framing anywhere fails the whole walk, as RFC 4861 discards the
+    /// message. Unchecked, the walk stops there.
+    #[test]
+    fn test_options_framing() {
+        // Length 0 after a good option.
+        let mut bytes = [0x05, 0x01, 0, 0, 0, 0, 0x05, 0xdc, 0xc8, 0x00, 0, 0, 0, 0, 0, 0];
+        assert!(NdiscOptions::new_checked(&mut bytes).is_err());
+        let mut opts = NdiscOptions::new_unchecked(&mut bytes);
+        assert_eq!(opts.next().unwrap().option_type(), Type::Mtu);
+        assert!(opts.next().is_none());
+
+        // An option running past the end.
+        let mut bytes = [0x05, 0x01, 0, 0, 0, 0, 0x05, 0xdc, 0xc8, 0x02, 0, 0, 0, 0, 0, 0];
+        assert!(NdiscOptions::new_checked(&mut bytes).is_err());
+
+        // Trailing bytes too short for an option.
+        let mut bytes = [0x05, 0x01, 0, 0, 0, 0, 0x05, 0xdc, 0xc8];
+        assert!(NdiscOptions::new_checked(&mut bytes).is_err());
     }
 }
 

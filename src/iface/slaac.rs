@@ -18,8 +18,8 @@ use crate::stack::StackInner;
 use crate::time::{Clock, Duration, Instant};
 use crate::wire::{
     HardwareAddress, IPV6_HEADER_LEN, IPV6_LINK_LOCAL_ALL_ROUTERS, Icmpv6Message, Icmpv6Packet, IpCidr, Ipv6Addr,
-    Ipv6Cidr, NdiscOption, NdiscOptionType, NdiscPrefixInfoFlags, NdiscRouterFlags, RawHardwareAddress,
-    ipv6::AddressExt,
+    Ipv6Cidr, NdiscOptionType, NdiscOptions, NdiscPrefixInfoFlags, NdiscPrefixInformation as PrefixInformation,
+    NdiscRouterFlags, ipv6::AddressExt,
 };
 
 const MAX_RTR_SOLICITATIONS: u8 = 3;
@@ -81,17 +81,6 @@ struct Route {
 struct PrefixInfo {
     preferred_until: Instant,
     valid_until: Instant,
-}
-
-/// The contents of a prefix information option, as parsed out of a router
-/// advertisement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PrefixInformation {
-    pub prefix_len: u8,
-    pub flags: NdiscPrefixInfoFlags,
-    pub valid_lifetime: Duration,
-    pub preferred_lifetime: Duration,
-    pub prefix: Ipv6Addr,
 }
 
 impl PrefixInformation {
@@ -260,8 +249,8 @@ impl Slaac {
 
     /// Process a router advertisement's information.
     ///
-    /// `prefixes` are the prefix information options of the advertisement, all of
-    /// them, in order.
+    /// `prefixes` are the prefix information options of the advertisement, all
+    /// those long enough to hold a prefix, in order.
     pub(crate) fn process_advertisement(
         &mut self,
         source: &Ipv6Addr,
@@ -385,50 +374,39 @@ impl IfaceState<'_> {
         icmp_packet: &mut Icmpv6Packet<'_>,
         now: Instant,
     ) {
+        let medium = self.medium();
         let Some(slaac) = &mut self.slaac else { return };
 
         let flags = icmp_packet.router_flags();
         let router_lifetime = icmp_packet.router_lifetime();
 
-        // First pass over the options: validate them all, and pick up the
-        // source link-layer address option, which teaches us the router's MAC.
-        let mut lladdr: Option<RawHardwareAddress> = None;
+        // First pass over the options: check their framing, which discards the
+        // whole advertisement if broken (RFC 4861 §6.1.2), and pick up the source
+        // link-layer address option, which teaches us the router's MAC. One that
+        // does not parse counts as absent.
         let options = icmp_packet.payload_mut();
-        let mut offset = 0;
-        while offset < options.len() {
-            let Ok(opt) = NdiscOption::new_checked(&mut options[offset..]) else {
-                trace!("ndisc: malformed router advertisement option");
-                return;
-            };
-            if opt.option_type() == NdiscOptionType::SourceLinkLayerAddr {
-                lladdr = Some(opt.link_layer_addr());
+        let Ok(mut opts) = NdiscOptions::new_checked(options) else {
+            trace!("ndisc: malformed router advertisement option");
+            return;
+        };
+        let lladdr = opts.find_map(|opt| {
+            if opt.option_type() != NdiscOptionType::SourceLinkLayerAddr {
+                return None;
             }
-            offset += opt.data_len() as usize * 8;
-        }
+            opt.link_layer_addr().parse(medium).ok()
+        });
 
         // Second pass: feed every prefix information option to SLAAC, straight
-        // from the packet. The first pass checked that they all parse.
-        let mut offset = 0;
-        let prefixes = core::iter::from_fn(|| {
-            while offset < options.len() {
-                let opt = NdiscOption::new_checked(&mut options[offset..]).ok()?;
-                offset += opt.data_len() as usize * 8;
-                if opt.option_type() == NdiscOptionType::PrefixInformation {
-                    return Some(PrefixInformation {
-                        prefix_len: opt.prefix_len(),
-                        flags: opt.prefix_flags(),
-                        valid_lifetime: opt.valid_lifetime(),
-                        preferred_lifetime: opt.preferred_lifetime(),
-                        prefix: opt.prefix(),
-                    });
-                }
+        // from the packet. One too short to hold the prefix is skipped.
+        let prefixes = NdiscOptions::new_unchecked(options).filter_map(|opt| {
+            if opt.option_type() != NdiscOptionType::PrefixInformation {
+                return None;
             }
-            None
+            opt.prefix_information()
         });
         slaac.process_advertisement(&src_addr, flags, router_lifetime, prefixes, now);
 
         if let Some(lladdr) = lladdr
-            && let Ok(lladdr) = lladdr.parse(self.medium())
             && lladdr.is_unicast()
         {
             inner.fill_neighbor(self, crate::wire::IpAddr::V6(src_addr), lladdr, now);

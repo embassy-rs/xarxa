@@ -5202,6 +5202,10 @@ pub(crate) mod test {
 
         assert_eq!(stack.tcp_socket(handle).state(), TcpState::Closed);
         assert_eq!(
+            stack.tcp_socket(handle).close_reason(),
+            Some(crate::tcp::CloseReason::Icmp)
+        );
+        assert_eq!(
             stack.tcp_socket(handle).take_icmp_error(),
             Some(IcmpError::HostUnreachable)
         );

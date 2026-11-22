@@ -181,6 +181,37 @@ impl Display for RecvError {
 
 impl core::error::Error for RecvError {}
 
+/// Why a connection ended, returned by [`TcpSocket::close_reason`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CloseReason {
+    /// Both sides closed with a FIN, and each FIN was acknowledged.
+    Graceful,
+    /// The remote reset the connection with an RST.
+    Reset,
+    /// The remote stopped answering for longer than the timeout (see
+    /// [`TcpSocket::set_timeout`]).
+    TimedOut,
+    /// The connection was ended locally, by [`TcpSocket::abort`], or by
+    /// [`TcpSocket::close`] before the handshake completed.
+    Aborted,
+    /// An ICMP error arrived during the handshake.
+    #[cfg_attr(feature = "icmp-errors", doc = "[`TcpSocket::take_icmp_error`] returns it.")]
+    Icmp,
+}
+
+impl Display for CloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            CloseReason::Graceful => write!(f, "closed gracefully"),
+            CloseReason::Reset => write!(f, "reset by remote"),
+            CloseReason::TimedOut => write!(f, "timed out"),
+            CloseReason::Aborted => write!(f, "aborted"),
+            CloseReason::Icmp => write!(f, "ICMP error"),
+        }
+    }
+}
+
 /// A TCP socket ring buffer.
 pub(crate) type SocketBuffer<'d> = RingBuffer<'d, u8>;
 
@@ -374,6 +405,9 @@ enum Timer {
 }
 
 const ACK_DELAY_DEFAULT: Duration = Duration::from_millis(10);
+/// How long TIME-WAIT lasts. RFC 9293 asks for 2 MSL (4 minutes), which would keep
+/// a socket from being reused for that long. 10 s covers the remote retransmitting
+/// its FIN a few times, which is what TIME-WAIT is for on a LAN.
 const CLOSE_DELAY: Duration = Duration::from_millis(10_000);
 
 impl Timer {
@@ -503,8 +537,11 @@ pub(crate) struct TcpSocketState<'d> {
     keep_alive: Option<Duration>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
-    /// Current 4-tuple (local and remote addresses).
+    /// Current 4-tuple (local and remote addresses). Kept in CLOSED only while
+    /// an RST is owed to the remote.
     tuple: Option<Tuple>,
+    /// Why the last connection ended. `None` until it does.
+    close_reason: Option<CloseReason>,
     /// The interface the socket is bound to. Zero-sized without `iface-bind`.
     /// User configuration, kept across `reset` like the hop limit.
     binding: IfaceBinding,
@@ -661,6 +698,7 @@ impl<'d> TcpSocketState<'d> {
             keep_alive: None,
             hop_limit: None,
             tuple: None,
+            close_reason: None,
             binding: IfaceBinding::Any,
             #[cfg(feature = "icmp-errors")]
             icmp_error: None,
@@ -765,20 +803,35 @@ impl<'d> TcpSocketState<'d> {
         self.rx_fin_seq.is_some_and(|fin_seq| fin_seq < self.recv_next())
     }
 
-    /// Whether the socket is open: it processes incoming and dispatches
-    /// outgoing packets. `false` means it can be reused for a new connection.
+    /// Whether the socket is open: it may still process incoming or dispatch
+    /// outgoing packets. `false` means it can be reused for a new connection: it
+    /// is CLOSED and owes the remote no RST.
     fn is_open(&self) -> bool {
-        match self.state {
-            State::Closed => false,
-            State::TimeWait => false,
-            _ => true,
-        }
+        self.state != State::Closed || self.tuple.is_some()
     }
 
-    /// Return the socket to the closed state, ready to be reused by `connect`
-    /// or `TcpSocket::accept`. Everything the user configured
-    /// (hop limit, timeout, keep-alive, Nagle, ACK delay) is kept; everything
-    /// belonging to the connection is cleared.
+    /// End the connection. This is the only way a connection reaches CLOSED.
+    ///
+    /// The tuple is kept only while an RST is owed, which is when the local side
+    /// gave up on a connection the remote may still think is open: the next
+    /// dispatch sends it, and then forgets the tuple. The receive buffer and the
+    /// remote's FIN are kept, so data that was ACKed can still be read.
+    fn end_connection(&mut self, reason: CloseReason) {
+        debug!("connection ended: {}", reason);
+        self.set_state(State::Closed);
+        self.close_reason = Some(reason);
+        if !matches!(reason, CloseReason::TimedOut | CloseReason::Aborted) {
+            self.tuple = None;
+        }
+        self.timer = Timer::new();
+        self.ack_delay_timer = AckDelayTimer::Idle;
+        self.challenge_ack_limit = ChallengeAckLimit::None;
+    }
+
+    /// Clear everything belonging to the last connection, so that `connect` or
+    /// `TcpSocket::accept` can start a new one. Only for a socket that is not
+    /// open. Everything the user configured (hop limit, timeout, keep-alive,
+    /// Nagle, ACK delay) is kept.
     fn reset(&mut self) {
         let rx_cap_log2 = mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
@@ -790,6 +843,7 @@ impl<'d> TcpSocketState<'d> {
         self.rx_buffer.clear();
         self.rx_fin_seq = None;
         self.tuple = None;
+        self.close_reason = None;
         #[cfg(feature = "icmp-errors")]
         {
             self.icmp_error = None;
@@ -999,8 +1053,7 @@ impl<'d> TcpSocketState<'d> {
         match self.state {
             State::SynSent | State::SynReceived => {
                 debug!("{} during handshake, aborting connection", error);
-                self.set_state(State::Closed);
-                self.tuple = None;
+                self.end_connection(CloseReason::Icmp);
             }
             _ => {
                 trace!("icmp error {}, recorded as soft error", error);
@@ -1302,8 +1355,7 @@ impl<'d> TcpSocketState<'d> {
             // RSTs close the socket.
             (_, TcpControl::Rst) => {
                 trace!("received RST");
-                self.set_state(State::Closed);
-                self.tuple = None;
+                self.end_connection(CloseReason::Reset);
                 return ProcessResult::None;
             }
 
@@ -1387,9 +1439,7 @@ impl<'d> TcpSocketState<'d> {
             // ACK packets in LAST-ACK state change it to CLOSED.
             (State::LastAck, TcpControl::None) => {
                 if ack_of_fin {
-                    // Clear the remote address, or we'll send an RST there.
-                    self.set_state(State::Closed);
-                    self.tuple = None;
+                    self.end_connection(CloseReason::Graceful);
                 } else if ack_len == 0 {
                     // Duplicate ACK; our FIN has not been acknowledged.
                     // Per RFC 9293 (3.10.7.4), send a challenge ACK.
@@ -1921,8 +1971,7 @@ impl<'d> TcpSocketState<'d> {
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(clock) {
             // If a timeout expires, we should abort the connection.
-            debug!("timeout exceeded");
-            self.set_state(State::Closed);
+            self.end_connection(CloseReason::TimedOut);
         } else if self.timer.should_retransmit(clock) {
             if let Timer::Retransmit { .. } = self.timer {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
@@ -2201,7 +2250,7 @@ impl<'d> TcpSocketState<'d> {
             // If we have spent enough time in the TIME-WAIT state, close the socket.
             Timer::Close { expires_at } if clock.expired(expires_at) => {
                 trace!("TIME-WAIT timer expired");
-                self.reset();
+                self.end_connection(CloseReason::Graceful);
             }
             _ => {}
         }
@@ -2705,7 +2754,8 @@ impl<'d> TcpSocket<'_, 'd> {
     ///
     /// # Errors
     /// - `InvalidState`: if the socket is open (see
-    ///   [is_open](#method.is_open)).
+    ///   [is_open](#method.is_open)), including in `TIME-WAIT` and while it
+    ///   owes a reset.
     /// - `Unaddressable`: if the remote port is zero, the remote address is
     ///   unspecified, there is no route to the remote address, the interface
     ///   the route goes out of has no address to send from, or `local` is an
@@ -2802,7 +2852,9 @@ impl<'d> TcpSocket<'_, 'd> {
     /// timeout, keep-alive, Nagle, ACK delay) is left unchanged.
     ///
     /// # Errors
-    /// - `InvalidState`: if the socket is not closed.
+    /// - `InvalidState`: if the socket is open (see
+    ///   [is_open](TcpSocket::is_open)), including in `TIME-WAIT` and while it
+    ///   owes a reset.
     #[cfg(feature = "tcp-listener")]
     pub fn accept(&mut self, token: AcceptToken) -> Result<(), AcceptError> {
         if self.is_open() {
@@ -2821,14 +2873,17 @@ impl<'d> TcpSocket<'_, 'd> {
     ///
     /// Note that there is no corresponding function for the receive half of the full-duplex
     /// connection; only the remote end can close it. If you no longer wish to receive any
-    /// data and would like to reuse the socket right away, use [abort](#method.abort).
+    /// data and would like to reuse the socket soon, use [abort](#method.abort).
+    ///
+    /// In the `SYN-SENT` state there is nothing to close yet: this aborts the
+    /// connection instead.
     pub fn close(&mut self) {
         // Queuing a FIN arms the timeout. Restart it, like `send_impl` does.
         let was_armed = self.inner().timeout_armed();
         match self.inner_mut().state {
             // In the SYN-SENT state the remote peer is not yet synchronized and, upon
             // receiving an RST, will abort the connection.
-            State::SynSent => self.inner_mut().set_state(State::Closed),
+            State::SynSent => self.inner_mut().end_connection(CloseReason::Aborted),
             // In the SYN-RECEIVED, ESTABLISHED and CLOSE-WAIT states the transmit half
             // of the connection is open, and needs to be explicitly closed with a FIN.
             State::SynReceived | State::Established => self.inner_mut().set_state(State::FinWait1),
@@ -2843,39 +2898,66 @@ impl<'d> TcpSocket<'_, 'd> {
         }
     }
 
-    /// Aborts the connection, if any.
+    /// Abort the connection, if any.
     ///
-    /// This function instantly closes the socket. One reset packet will be sent to the remote
-    /// peer.
+    /// The socket moves to the `CLOSED` state at once, and
+    /// [close_reason](#method.close_reason) returns [`CloseReason::Aborted`]. Unless
+    /// the connection had already ended, one reset packet is sent to the remote peer
+    /// at the next poll. Until then the socket stays open (see
+    /// [is_open](#method.is_open)), so it can't be reused yet.
     ///
-    /// In terms of the TCP state machine, the socket may be in any state and is moved to
-    /// the `CLOSED` state.
+    /// Data already in the receive buffer can still be read.
     pub fn abort(&mut self) {
-        self.inner_mut().set_state(State::Closed);
+        let s = self.inner_mut();
+        if s.state != State::Closed {
+            s.end_connection(CloseReason::Aborted);
+        }
     }
 
     /// Return whether the socket is open.
     ///
-    /// This function returns true if the socket will process incoming or dispatch outgoing
-    /// packets. Note that this does not mean that it is possible to send or receive data through
-    /// the socket; for that, use [can_send](#method.can_send) or [can_recv](#method.can_recv).
+    /// An open socket may still process incoming or dispatch outgoing packets, so
+    /// it can't be used for a new connection: `connect`, `accept` and
+    /// `bind_to_iface` fail with `InvalidState`. Note that this does not mean that
+    /// it is possible to send or receive data through the socket; for that, use
+    /// [can_send](#method.can_send) or [can_recv](#method.can_recv).
     ///
-    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`
-    /// or `TIME-WAIT` states.
+    /// In terms of the TCP state machine, the socket is open in every state but
+    /// `CLOSED`. That includes `TIME-WAIT`, which follows an active close and
+    /// answers retransmissions of the remote's FIN for 10 seconds (shorter than
+    /// the 2 MSL RFC 9293 asks for). A `CLOSED` socket is also still open while
+    /// it owes the remote a reset, after [abort](#method.abort) or a timeout: the
+    /// next poll sends it.
     #[inline]
     pub fn is_open(&self) -> bool {
         self.inner().is_open()
     }
 
+    /// Return why the connection ended, or `None` if it hasn't.
+    ///
+    /// Once the remote's FIN has been received, [recv](#method.recv) returns
+    /// `Finished`, whether the connection then closes gracefully or is reset. This
+    /// tells the two apart.
+    ///
+    /// It is set when the socket reaches the `CLOSED` state, and cleared when
+    /// `connect` or `accept` starts a new connection. A connection in `TIME-WAIT`
+    /// has not ended yet: it ends gracefully when `TIME-WAIT` does, unless it is
+    /// reset or aborted first.
+    #[inline]
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        self.inner().close_reason
+    }
+
     /// Return whether a connection is active.
     ///
-    /// This function returns true if the socket is actively exchanging packets with
-    /// a remote peer. Note that this does not mean that it is possible to send or receive
-    /// data through the socket; for that, use [can_send](#method.can_send) or
+    /// This function returns true from the start of a connection until it ends or
+    /// enters `TIME-WAIT`: while the remote may still send data or expect it. Note
+    /// that this does not mean that it is possible to send or receive data through
+    /// the socket; for that, use [can_send](#method.can_send) or
     /// [can_recv](#method.can_recv).
     ///
-    /// If a connection is established, [abort](#method.close) will send a reset to
-    /// the remote peer.
+    /// A socket that is not active may still be open (see
+    /// [is_open](#method.is_open)).
     ///
     /// In terms of the TCP state machine, the socket must not be in the `CLOSED`
     /// or `TIME-WAIT` state.
@@ -3042,7 +3124,9 @@ impl<'d> TcpSocket<'_, 'd> {
     ///
     /// # Errors
     /// - `Finished`: if the receive half was gracefully closed (with a FIN
-    ///   packet). The previously received data is complete.
+    ///   packet). The previously received data is complete. The connection may
+    ///   still have been reset afterwards: see
+    ///   [close_reason](#method.close_reason).
     /// - `InvalidState`: if the receive half is not open for any other reason.
     ///   The previously received data may be incomplete (truncated).
     pub fn recv<'b, R>(&'b mut self, f: impl FnOnce(&'b mut [u8]) -> (usize, R)) -> Result<R, RecvError> {
@@ -3877,6 +3961,10 @@ mod test {
             5
         );
         stack.tcp_socket(sh).abort();
+        // It owes the remote an RST, so it can't be reused before a poll sends it.
+        assert!(stack.tcp_socket(sh).is_open());
+        stack.poll(Instant::ZERO);
+        assert!(!stack.tcp_socket(sh).is_open());
         let token = stack.tcp_listener(h).accept().unwrap();
         assert_eq!(stack.tcp_socket(sh).accept(token), Ok(()));
         assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
@@ -5356,6 +5444,14 @@ mod test {
         let mut s = socket();
         s.view().close();
         assert_eq!(s.state, State::Closed);
+    }
+
+    #[test]
+    fn test_syn_sent_close_aborts() {
+        let mut s = socket_syn_sent();
+        s.view().close();
+        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.view().close_reason(), Some(CloseReason::Aborted));
     }
 
     #[test]
@@ -6952,6 +7048,7 @@ mod test {
         let mut s = socket_established();
         s.view().abort();
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.view().close_reason(), Some(CloseReason::Aborted));
         recv!(
             s,
             [TcpRepr {
@@ -6961,6 +7058,54 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    /// The RST an abort owes goes out before the socket can be reused. A
+    /// `connect` right after the abort fails, and one after the next dispatch
+    /// works.
+    #[test]
+    fn test_abort_then_connect_sends_rst_first() {
+        let mut s = socket_established();
+        s.view().abort();
+        assert!(s.view().is_open());
+        assert!(!s.view().is_active());
+        assert_eq!(
+            s.view().connect(REMOTE_END, LOCAL_END.port + 1),
+            Err(ConnectError::InvalidState)
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        assert!(!s.view().is_open());
+        assert_eq!(s.view().connect(REMOTE_END, LOCAL_END.port + 1), Ok(()));
+        assert_eq!(s.view().close_reason(), None);
+    }
+
+    /// Aborting a connection that already ended changes nothing: no RST, and
+    /// the reason stays.
+    #[test]
+    fn test_abort_after_end_keeps_reason() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closed);
+        s.view().abort();
+        assert_eq!(s.view().close_reason(), Some(CloseReason::Reset));
+        assert!(!s.view().is_open());
+        recv_nothing!(s);
     }
 
     #[test]
@@ -7389,6 +7534,51 @@ mod test {
         assert_eq!(s.state, State::TimeWait);
         recv_nothing!(s, time 60_000);
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.view().close_reason(), Some(CloseReason::Graceful));
+        assert!(!s.view().is_open());
+    }
+
+    /// Data that was received and ACKed before TIME-WAIT stays readable after
+    /// it expires, followed by `Finished`.
+    #[test]
+    fn test_time_wait_expiry_keeps_unread_data() {
+        let mut s = socket_fin_wait_2();
+        send!(s, time 1_000, TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 1),
+            payload: &b"response"[..],
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.state, State::TimeWait);
+        recv!(s, time 1_000, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 8 + 1),
+            window_len: 56,
+            ..RECV_TEMPL
+        }]);
+        recv_nothing!(s, time 11_000);
+        assert_eq!(s.state, State::Closed);
+
+        let mut buf = [0u8; 16];
+        assert_eq!(s.view().recv_slice(&mut buf), Ok(8));
+        assert_eq!(&buf[..8], b"response");
+        assert_eq!(s.view().recv_slice(&mut buf), Err(RecvError::Finished));
+        assert_eq!(s.view().close_reason(), Some(CloseReason::Graceful));
+    }
+
+    /// A socket in TIME-WAIT is open: it can't be reused, not even for the
+    /// same tuple, until TIME-WAIT ends.
+    #[test]
+    fn test_time_wait_is_open() {
+        let mut s = socket_time_wait(false);
+        assert!(s.view().is_open());
+        assert!(!s.view().is_active());
+        assert_eq!(s.view().close_reason(), None);
+        assert_eq!(s.view().connect(REMOTE_END, LOCAL_END), Err(ConnectError::InvalidState));
+        assert_eq!(s.state, State::TimeWait);
+        #[cfg(feature = "iface-bind")]
+        assert_eq!(s.view().bind_to_iface(None), Err(ConnectError::InvalidState));
     }
 
     // =========================================================================================//
@@ -7529,6 +7719,31 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.view().close_reason(), Some(CloseReason::Graceful));
+        assert!(!s.view().is_open());
+    }
+
+    /// After the remote's FIN, `recv` returns `Finished` whether the connection
+    /// then closes gracefully or is reset. The close reason tells them apart
+    /// (RFC 9293 MUST-12).
+    #[test]
+    fn test_last_ack_rst_close_reason() {
+        let mut s = socket_last_ack();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1 + 1,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closed);
+        let mut buf = [0u8; 4];
+        assert_eq!(s.view().recv_slice(&mut buf), Err(RecvError::Finished));
+        assert_eq!(s.view().close_reason(), Some(CloseReason::Reset));
+        assert!(!s.view().is_open());
+        recv_nothing!(s);
     }
 
     #[test]
@@ -10813,6 +11028,7 @@ mod test {
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.view().close_reason(), Some(CloseReason::TimedOut));
     }
 
     #[test]

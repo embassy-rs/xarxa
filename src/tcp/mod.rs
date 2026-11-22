@@ -1878,9 +1878,16 @@ impl<'d> TcpSocketState<'d> {
             trace!("starting zero-window-probe timer for t+{}", delay);
             self.timer.set_for_zero_window_probe(now, delay);
         }
+        // Once the window opens, what was sent before it shut may have been
+        // dropped, and the retransmit timer recovers it.
         if self.send_window != 0 && self.timer.is_zero_window_probe() {
             trace!("stopping zero-window-probe timer");
-            self.timer.set_for_idle(now, self.keep_alive);
+            if self.send_max != self.send_unack {
+                let rto = self.rtte.retransmission_timeout();
+                self.timer.set_for_retransmit(now + rto);
+            } else {
+                self.timer.set_for_idle(now, self.keep_alive);
+            }
         }
 
         if !payload.is_empty() {
@@ -10925,6 +10932,48 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    // When a zero window opens again, what was sent before it shut and wasn't
+    // acknowledged is retransmitted when the retransmit timer expires.
+    #[test]
+    fn test_zero_window_opens_with_data_in_flight() {
+        let mut s = socket_established();
+        s.view().send_slice(b"abcdef").unwrap();
+        recv!(s, time 0, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"abcdef"[..],
+            ..RECV_TEMPL
+        }]);
+        // The remote takes three octets and shuts its window: the other three
+        // were dropped.
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 3),
+            window_len: 0,
+            ..SEND_TEMPL
+        });
+        assert!(s.timer.is_zero_window_probe());
+        // The window opens again.
+        send!(s, time 20, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 3),
+            ..SEND_TEMPL
+        });
+        recv_nothing!(s, time 20);
+        assert_eq!(
+            s.timer,
+            Timer::Retransmit {
+                expires_at: Instant::from_millis(1020)
+            }
+        );
+        recv!(s, time 1020, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 3,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"def"[..],
+            ..RECV_TEMPL
+        }]);
     }
 
     #[cfg(feature = "tcp-reno")]

@@ -587,7 +587,7 @@ mod test {
     const IF_1: IfaceHandle = IfaceHandle::new(1);
 
     fn buf() -> Buf {
-        Buf::from_driver_buf(crate::pool::test_pool_ref().alloc().unwrap())
+        crate::buffers::test_kept_buf()
     }
 
     fn is_retransmit(event: Option<ProbeEvent>, addr: Ipv6Addr) -> bool {

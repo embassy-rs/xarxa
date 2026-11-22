@@ -743,7 +743,7 @@ mod test {
     fn test_stack_with_checksum(medium: Medium, checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(medium).with_checksum(checksum);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let handle = driver.install(
             &mut stack,
             match medium {

@@ -34,7 +34,7 @@ use crate::neighbor::NeighborState;
 use crate::neighbor::{Answer as NeighborAnswer, Key as NeighborKey, NeighborCache, ProbeEvent};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::buffers::Buf;
-use crate::pool::PoolRef;
+use crate::buffers::Buffers;
 use crate::rand::Rand;
 #[cfg(feature = "_raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketIter, RawSocketState};
@@ -84,8 +84,8 @@ pub(crate) struct Sockets<'d> {
 /// while taking `&mut self`.
 pub(crate) struct StackInner {
     /// The pool the stack allocates its packet buffers from.
-    pub(crate) pool: PoolRef,
-    /// Size of the storage of each buffer of `pool`.
+    pub(crate) buffers: Buffers,
+    /// Size of the storage of each buffer of the pool.
     pub(crate) buf_capacity: usize,
     #[cfg(feature = "packetmeta-timestamp")]
     pub(crate) tx_timestamps: TxTimestampQueue,
@@ -610,16 +610,36 @@ impl<'d> Stack<'d> {
     /// Create a network stack.
     ///
     /// The stack allocates its packet buffers from `pool`, for example a
-    /// [`StaticPool`](crate::StaticPool).
+    /// [`StaticPool`](crate::StaticPool). The pool belongs to this stack alone.
     ///
     /// `random_seed` seeds the stack's PRNG, which picks TCP initial sequence
     /// numbers and ephemeral ports. This should be random, or at least different
     /// at every boot.
-    pub fn new(pool: &'static impl Pool, random_seed: u64) -> Self {
-        Self::new_inner(PoolRef::new(pool), pool.buf_capacity(), random_seed)
+    pub fn new<P: Pool + 'static>(pool: &'static mut P, random_seed: u64) -> Self {
+        let pool: &'static P = pool;
+        Self::new_inner(Buffers::new(pool), pool.buf_capacity(), random_seed)
     }
 
-    fn new_inner(pool: PoolRef, buf_capacity: usize, random_seed: u64) -> Self {
+    /// A buffer from the stack's own pool holding `bytes`, for tests that hand
+    /// packets to the stack's internals.
+    #[cfg(test)]
+    #[allow(dead_code)] // which builds use it depends on the features
+    pub(crate) fn test_buf(&self, bytes: &[u8]) -> DriverBuf {
+        let mut buf = self.inner.buffers.alloc().unwrap();
+        buf.set_len(bytes.len());
+        buf.copy_from_slice(bytes);
+        buf
+    }
+
+    /// [`new`](Self::new), for tests that take buffers from the stack's pool
+    /// themselves, to leave the stack short.
+    #[cfg(test)]
+    #[allow(dead_code)] // which builds use it depends on the features
+    pub(crate) fn new_shared<P: Pool + 'static>(pool: &'static P, random_seed: u64) -> Self {
+        Self::new_inner(Buffers::new(pool), pool.buf_capacity(), random_seed)
+    }
+
+    fn new_inner(buffers: Buffers, buf_capacity: usize, random_seed: u64) -> Self {
         #[cfg_attr(not(feature = "ipv4-fragmentation"), allow(unused_mut))]
         let mut rand = Rand::new(random_seed);
 
@@ -628,7 +648,7 @@ impl<'d> Stack<'d> {
 
         Self {
             inner: StackInner {
-                pool,
+                buffers,
                 buf_capacity,
                 #[cfg(feature = "packetmeta-timestamp")]
                 tx_timestamps: TxTimestampQueue::new(),
@@ -1211,10 +1231,10 @@ impl<'d> Stack<'d> {
             // runs short while frames are coming in. Nothing signals a freed buffer,
             // so if the pool runs out first, poll again soon.
             loop {
-                let pool = self.inner.pool;
+                let buffers = &self.inner.buffers;
                 let driver = &mut self.ifaces.get_mut(index).driver;
                 for _ in 0..driver.rx_wanted() {
-                    let Some(buf) = pool.alloc() else {
+                    let Some(buf) = buffers.alloc() else {
                         clock.after(POOL_RETRY_DELAY);
                         break;
                     };
@@ -1222,6 +1242,7 @@ impl<'d> Stack<'d> {
                 }
                 #[allow(unused_mut)]
                 let Some(mut buf) = driver.receive() else { break };
+                buffers.check_owned(&buf);
                 #[cfg(feature = "packet-log")]
                 {
                     trace!("received on iface {}", index);
@@ -2809,7 +2830,7 @@ impl StackInner {
         if !driver.can_transmit() {
             return Err(Blocked::DeviceBusy);
         }
-        self.pool.alloc().ok_or(Blocked::NoBuffer)
+        self.buffers.alloc().ok_or(Blocked::NoBuffer)
     }
 
     /// Transmit a fully-built UDP packet on a given interface as an IPv4 packet from
@@ -3332,7 +3353,7 @@ pub(crate) mod test {
     ) -> (Stack<'static>, Queue, Sent, Room) {
         let driver = TestDevice::new(medium).with_mtu(mtu).with_checksum(checksum);
         let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let handle = driver.install(
             &mut stack,
             match medium {
@@ -3362,7 +3383,7 @@ pub(crate) mod test {
     fn test_iface_reports_device_state() {
         let driver = TestDevice::new(Medium::Ethernet);
         let link = driver.link.clone();
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
 
         // The hardware address is read from the device at add time.
@@ -3889,7 +3910,7 @@ pub(crate) mod test {
     fn test_stack_with_link(medium: Medium) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(medium);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         stack
             .iface(handle)
@@ -4352,7 +4373,7 @@ pub(crate) mod test {
     /// A stack with two IP-medium interfaces: the first owns [`OUR_V4`]/24,
     /// the second 10.0.0.1/24, and both own fe80::1/64.
     fn test_stack_two_ifaces() -> (Stack<'static>, [Queue; 2], [Sent; 2]) {
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let mut rxs = Vec::new();
         let mut txs = Vec::new();
         for addr in [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V4_B.into(), 24)] {
@@ -4795,7 +4816,7 @@ pub(crate) mod test {
             .with_rx_meta(rx_meta)
             .with_tx_stamp(TX_STAMP);
         let (rx, sent) = (driver.rx.clone(), driver.tx_meta.clone());
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
 
@@ -4849,7 +4870,7 @@ pub(crate) mod test {
         const OTHER_V4: Ipv4Addr = Ipv4Addr::new(192, 168, 2, 1);
         const OTHER_REMOTE_V4: Ipv4Addr = Ipv4Addr::new(192, 168, 2, 2);
 
-        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 1);
         let iface_a = TestDevice::new(Medium::Ip)
             .with_tx_stamp(STAMP_A)
             .install(&mut stack, HardwareAddress::Ip);
@@ -5006,7 +5027,7 @@ pub(crate) mod test {
         let tx = driver.tx.clone();
         // 1.5 s before the clock wraps around.
         let start = Instant::from_millis(0u32.wrapping_sub(1500));
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let iface = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         stack
             .iface(iface)
@@ -5039,7 +5060,7 @@ pub(crate) mod test {
     /// A route's expiry is a deadline, and the poll at it removes the route.
     #[test]
     fn test_expired_route_removed() {
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let route = crate::route::Route {
             expires_at: Some(Instant::from_secs(1)),
             ..crate::route::Route::new_ipv4_gateway(Ipv4Addr::new(192, 168, 1, 254), IfaceHandle::new(0))
@@ -5423,7 +5444,7 @@ pub(crate) mod test {
         use crate::iface::AddIfaceError;
 
         // An Ethernet device reporting no hardware address at all.
-        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 1);
         let mut driver = TestDevice::new(Medium::Ethernet);
         driver.hardware_addr = HardwareAddress::Ip;
         let driver = Box::leak(Box::new(driver));
@@ -5439,7 +5460,7 @@ pub(crate) mod test {
     fn test_add_iface_full() {
         use crate::iface::AddIfaceError;
 
-        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 1);
         for _ in 0..crate::config::IFACE_COUNT {
             let driver = Box::leak(Box::new(TestDevice::new(Medium::Ip)));
             stack.add_iface_borrowed(driver).unwrap();
@@ -5453,8 +5474,8 @@ pub(crate) mod test {
     /// `big_headroom`, owning [`OUR_V4`]/24 and knowing [`REMOTE_HW`] for
     /// [`REMOTE_V4`]. Both devices take whole buffers.
     fn test_stack_headrooms(big_headroom: usize) -> (Stack<'static>, [TestDevice; 2]) {
-        let mut stack = Stack::new(crate::pool::test_pool(), 1);
-        let mtu = crate::pool::TEST_POOL_SIZE;
+        let mut stack = Stack::new(crate::buffers::test_pool(), 1);
+        let mtu = crate::buffers::TEST_POOL_SIZE;
         let small = TestDevice::new(Medium::Ip).with_mtu(mtu).with_tx_headroom(0);
         let big = TestDevice::new(Medium::Ethernet)
             .with_mtu(mtu)
@@ -5481,7 +5502,7 @@ pub(crate) mod test {
     #[test]
     fn test_tx_headroom_per_iface() {
         let (mut stack, [small, big]) = test_stack_headrooms(100);
-        let mtu = crate::pool::TEST_POOL_SIZE;
+        let mtu = crate::buffers::TEST_POOL_SIZE;
         let small_mtu = stack.iface(IfaceHandle::new(0)).ip_mtu();
         let big_mtu = stack.iface(IfaceHandle::new(1)).ip_mtu();
         assert_eq!(small_mtu, mtu);
@@ -5544,9 +5565,9 @@ pub(crate) mod test {
     fn test_add_iface_buffer_too_small() {
         use crate::iface::AddIfaceError;
 
-        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 1);
         let room = crate::iface::min_ip_room(Medium::Ip);
-        let headroom = crate::pool::TEST_POOL_SIZE - room;
+        let headroom = crate::buffers::TEST_POOL_SIZE - room;
         let driver = Box::leak(Box::new(TestDevice::new(Medium::Ip).with_tx_headroom(headroom + 1)));
         assert_eq!(stack.add_iface_borrowed(driver), Err(AddIfaceError::BufferTooSmall));
         let driver = Box::leak(Box::new(TestDevice::new(Medium::Ip).with_tx_headroom(usize::MAX)));
@@ -5566,8 +5587,8 @@ pub(crate) mod test {
     fn test_add_iface_buffer_too_small_for_dhcp() {
         use crate::iface::AddIfaceError;
 
-        let mut stack = Stack::new(crate::pool::test_pool(), 1);
-        let headroom = crate::pool::TEST_POOL_SIZE - ETHERNET_HEADER_LEN - IPV4_MIN_MTU + 1;
+        let mut stack = Stack::new(crate::buffers::test_pool(), 1);
+        let headroom = crate::buffers::TEST_POOL_SIZE - ETHERNET_HEADER_LEN - IPV4_MIN_MTU + 1;
         let driver = Box::leak(Box::new(TestDevice::new(Medium::Ethernet).with_tx_headroom(headroom)));
         assert_eq!(stack.add_iface_borrowed(driver), Err(AddIfaceError::BufferTooSmall));
         let driver = Box::leak(Box::new(
@@ -5592,7 +5613,7 @@ pub(crate) mod test {
             })
             .unwrap();
         assert_eq!(stack.raw_socket(handle).send_headroom(), 100 + ETHERNET_HEADER_LEN);
-        let max = crate::pool::TEST_POOL_SIZE - 100 - ETHERNET_HEADER_LEN;
+        let max = crate::buffers::TEST_POOL_SIZE - 100 - ETHERNET_HEADER_LEN;
         assert_eq!(
             stack.raw_socket(handle).send_with(max + 1, |_| unreachable!()),
             Err(crate::raw::SendError::BufferFull)
@@ -5606,10 +5627,7 @@ pub(crate) mod test {
         assert_eq!(big.tx.borrow().len(), 1);
 
         // An owned buffer with too little headroom is moved, not refused.
-        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
-        buf.set_len(packet.len());
-        buf.copy_from_slice(&packet);
-        let buf = crate::Buf::from_driver_buf(buf);
+        let buf = crate::Buf::from_driver_buf(stack.test_buf(&packet));
         stack
             .raw_socket(handle)
             .send_buf(buf)
@@ -5644,7 +5662,7 @@ pub(crate) mod test {
     #[test]
     #[cfg(feature = "hostname")]
     fn test_set_hostname_too_long() {
-        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 1);
         stack.set_hostname("xarxa").unwrap();
         let long = "x".repeat(64);
         assert_eq!(stack.set_hostname(&long), Err(crate::error::HostnameTooLong));
@@ -6042,7 +6060,7 @@ pub(crate) mod test {
     #[test]
     #[cfg(all(feature = "async", feature = "medium-ip", feature = "ipv4", feature = "udp"))]
     fn test_device_full_wakes_only_senders_waiting_on_it() {
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let mut rooms = Vec::new();
         for addr in [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V4_B.into(), 24)] {
             let driver = TestDevice::new(Medium::Ip);
@@ -6374,7 +6392,7 @@ pub(crate) mod test {
                 100,
                 ip_mtu,
                 ip_mtu + 1,
-                crate::pool::TEST_POOL_SIZE - crate::test_device::TX_HEADROOM - link_header_len(medium),
+                crate::buffers::TEST_POOL_SIZE - crate::test_device::TX_HEADROOM - link_header_len(medium),
             ] {
                 tx.borrow_mut().clear();
 
@@ -6384,7 +6402,7 @@ pub(crate) mod test {
                 let udp_packet_payload = vec![1; udp_packet_payload_len];
                 let datagram = udp_datagram(OUR_V4.into(), 12345, REMOTE_V4.into(), 54321, &udp_packet_payload);
 
-                let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
+                let mut buf = stack.test_buf(&[]);
                 buf.reserve(crate::test_device::TX_HEADROOM + link_header_len(medium) + IPV4_HEADER_LEN);
                 buf.set_len(datagram.len());
                 buf.copy_from_slice(&datagram);
@@ -6814,10 +6832,10 @@ pub(crate) mod test {
     #[cfg(all(feature = "medium-ieee802154", feature = "ipv4-fragmentation"))]
     fn test_ipv4_not_fragmented_on_ieee802154() {
         // A pool of its own, so the test can take every buffer.
-        static POOL: crate::StaticPool<{ crate::pool::TEST_POOL_SIZE }, 8> = crate::StaticPool::new();
+        static POOL: crate::StaticPool<{ crate::buffers::TEST_POOL_SIZE }, 8> = crate::StaticPool::new();
         let driver = TestDevice::new(Medium::Ieee802154);
         let (tx, room) = (driver.tx.clone(), driver.room.clone());
-        let mut stack = Stack::new(&POOL, 0x1234_5678_dead_beef);
+        let mut stack = Stack::new_shared(&POOL, 0x1234_5678_dead_beef);
         let iface = driver.install(
             &mut stack,
             HardwareAddress::Ieee802154(Ieee802154Address::Extended([0x02; 8])),
@@ -6857,7 +6875,7 @@ pub(crate) mod test {
     fn test_ipv4_fragments_carry_meta() {
         let driver = TestDevice::new(Medium::Ip).with_mtu(576);
         let sent = driver.tx_meta.clone();
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
         let udp = stack.add_udp_socket().unwrap();
@@ -7179,7 +7197,7 @@ pub(crate) mod test {
 
         let driver = TestDevice::new(Medium::Ethernet);
         let filter = driver.mcast_filter.clone();
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
 
         // The lists the driver was given since the last call, each sorted, so the
@@ -8327,7 +8345,7 @@ pub(crate) mod test {
     //
     // Each test has a small pool of its own, so it can take every buffer.
 
-    type SmallPool<const N: usize> = crate::StaticPool<{ crate::pool::TEST_POOL_SIZE }, N>;
+    type SmallPool<const N: usize> = crate::StaticPool<{ crate::buffers::TEST_POOL_SIZE }, N>;
 
     /// A stack on a pool of its own, with one interface that owns [`OUR_V4`]/24.
     fn small_pool_stack(
@@ -8337,7 +8355,7 @@ pub(crate) mod test {
     ) -> (Stack<'static>, Queue, Sent, Room) {
         let driver = TestDevice::new(medium).with_mtu(mtu);
         let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
-        let mut stack = Stack::new(pool, 0x1234_5678_dead_beef);
+        let mut stack = Stack::new_shared(pool, 0x1234_5678_dead_beef);
         let handle = driver.install(
             &mut stack,
             match medium {
@@ -8455,6 +8473,18 @@ pub(crate) mod test {
             .iter()
             .filter(|frame| ethertype_of(frame) == EthernetProtocol::Ipv4)
             .count()
+    }
+
+    /// A socket only sends buffers of its stack's pool.
+    #[test]
+    #[should_panic(expected = "another stack's pool")]
+    fn test_send_foreign_buffer() {
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(1000, ListenSocketAddr::UNSPECIFIED).unwrap();
+        let _ = stack
+            .udp_socket(udp)
+            .send_buf(crate::buffers::test_kept_buf(), (REMOTE_V4, 1000));
     }
 
     /// A packet that is sent in fragments is parked whole on its neighbor while

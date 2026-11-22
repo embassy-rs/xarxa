@@ -16,7 +16,7 @@ use crate::driver::DriverBuf;
 use crate::error::IcmpError;
 use crate::error::InvalidHopLimit;
 use crate::iface::IfaceHandle;
-use crate::pool::PoolRef;
+use crate::buffers::Buffers;
 use crate::rand::Rand;
 use crate::stack::{Blocked, EgressRoute, IfaceBinding, Stack, TxContext, alloc_ephemeral_port};
 use crate::storage::Slab;
@@ -2309,7 +2309,7 @@ impl<'d> TcpSocketState<'d> {
 /// headroom reserved for the IP header and the `ip_headroom` below it (as in
 /// [`EgressRoute::ip_headroom`]). `None` if the pool is empty.
 pub(crate) fn build_tcp_packet(
-    pool: PoolRef,
+    buffers: &Buffers,
     ip_headroom: usize,
     repr: &TcpRepr<'_>,
     src_addr: &IpAddr,
@@ -2322,7 +2322,7 @@ pub(crate) fn build_tcp_packet(
         #[cfg(feature = "ipv6")]
         IpAddr::V6(_) => IPV6_HEADER_LEN,
     };
-    let mut buf = pool.alloc()?;
+    let mut buf = buffers.alloc()?;
     buf.reserve(ip_headroom + ip_header_len);
     buf.set_len(repr.buffer_len());
     let mut packet = TcpPacket::new_unchecked(&mut buf);
@@ -2412,7 +2412,7 @@ pub(crate) fn transmit(
         return Err(blocked);
     }
     let Some(buf) = build_tcp_packet(
-        cx.inner.pool,
+        &cx.inner.buffers,
         route.ip_headroom,
         &repr,
         &src_addr,
@@ -3405,7 +3405,7 @@ mod test {
 
     /// A stack with one interface owning `LOCAL_ADDR`.
     fn test_stack() -> Stack<'static> {
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
@@ -3906,7 +3906,7 @@ mod test {
         crate::test_device::Sent,
         crate::test_device::Sent,
     ) {
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let d0 = TestDevice::new(Medium::Ip);
         let tx0 = d0.tx.clone();
         let if0 = d0.install(&mut stack, HardwareAddress::Ip);
@@ -4906,7 +4906,7 @@ mod test {
     fn test_connect_ephemeral_port() {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let h1 = stack
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
@@ -4935,7 +4935,7 @@ mod test {
             port: REMOTE_PORT,
         };
 
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let h1 = stack
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
@@ -6506,7 +6506,7 @@ mod test {
         const MTU_MSS: usize = MTU - IPV4_HEADER_LEN - TCP_HEADER_LEN;
 
         let mut s = socket_with_buffer_sizes(2048, 64);
-        s.stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        s.stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let handle = TestDevice::new(Medium::Ip)
             .with_mtu(MTU)
             .install(&mut s.stack, HardwareAddress::Ip);
@@ -13683,7 +13683,7 @@ mod stack_test {
 
     fn stack() -> (Stack<'static>, TestDevice) {
         let driver = TestDevice::new(Medium::Ip);
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let handle = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
@@ -13696,7 +13696,7 @@ mod stack_test {
     /// checksums filled, ready for injection into the device RX queue.
     fn tcp_packet(repr: &TcpRepr) -> Vec<u8> {
         let mut buf = build_tcp_packet(
-            crate::pool::test_pool_ref(),
+            crate::buffers::test_buffers(),
             0,
             repr,
             &REMOTE_ADDR.into(),

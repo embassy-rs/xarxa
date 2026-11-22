@@ -48,6 +48,7 @@
 
 use std::os::unix::io::AsRawFd;
 
+use static_cell::ConstStaticCell;
 use xarxa::driver_impls::{RawSocketDriver, wait};
 use xarxa::time::Instant;
 use xarxa::wire::{HardwareAddress, Ieee802154Address, Ieee802154Pan, ListenSocketAddr};
@@ -67,8 +68,8 @@ fn main() {
     let driver = RawSocketDriver::new(&name, hardware_addr).unwrap();
     let fd = driver.as_raw_fd();
 
-    static POOL: StaticPool = StaticPool::new();
-    let mut stack = Stack::new(&POOL, random_seed());
+    static POOL: ConstStaticCell<StaticPool> = ConstStaticCell::new(StaticPool::new());
+    let mut stack = Stack::new(POOL.take(), random_seed());
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     // The link-local address is derived from the extended address:
     // fe80::180b:4242:4242:4242.

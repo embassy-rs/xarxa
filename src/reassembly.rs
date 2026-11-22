@@ -11,8 +11,7 @@ use core::fmt;
 
 use crate::config::REASSEMBLY_BUFFER_COUNT;
 use crate::driver::DriverBuf;
-use crate::buffers::Buf;
-use crate::pool::PoolRef;
+use crate::buffers::{Buf, Buffers};
 use crate::stack::Stack;
 use crate::storage::Assembler;
 use crate::time::{Clock, Duration, Instant};
@@ -92,9 +91,9 @@ impl<K> PacketAssembler<K> {
     }
 
     /// The buffer the fragments are assembled into, taken from the pool on first use.
-    fn buffer(&mut self, pool: PoolRef) -> Result<&mut Buf, AssemblerError> {
+    fn buffer(&mut self, buffers: &Buffers) -> Result<&mut Buf, AssemblerError> {
         if self.buffer.is_none() {
-            self.buffer = Some(Buf::from_driver_buf(pool.alloc().ok_or(AssemblerError)?));
+            self.buffer = Some(Buf::from_driver_buf(buffers.alloc().ok_or(AssemblerError)?));
         }
         // NOTE(unwrap): filled in just above.
         Ok(unwrap!(self.buffer.as_mut()))
@@ -106,7 +105,7 @@ impl<K> PacketAssembler<K> {
     /// - `AssemblerError`: if the packet can't be completed anymore: the
     ///   fragment disagrees on its total size, or puts data past it, or leaves
     ///   more holes than can be tracked, or no packet buffer is free.
-    fn add(&mut self, pool: PoolRef, frag: &Fragment<'_, K>) -> Result<(), AssemblerError> {
+    fn add(&mut self, buffers: &Buffers, frag: &Fragment<'_, K>) -> Result<(), AssemblerError> {
         let len = frag.data.len();
         let end = frag.offset + len;
         if let Some(total_size) = frag.total_size {
@@ -139,7 +138,7 @@ impl<K> PacketAssembler<K> {
             }
         }
 
-        let buffer = self.buffer(pool)?;
+        let buffer = self.buffer(buffers)?;
         if buffer.capacity() < end {
             return Err(AssemblerError);
         }
@@ -160,14 +159,14 @@ impl<K> PacketAssembler<K> {
 
     /// Get the reassembled packet, if reassembly is complete.
     /// This will mark the assembler as empty, so that it can be reused.
-    fn assemble(&mut self, pool: PoolRef) -> Option<DriverBuf> {
+    fn assemble(&mut self, buffers: &Buffers) -> Option<DriverBuf> {
         if !self.is_complete() {
             return None;
         }
 
         // NOTE: we can unwrap because `is_complete` already checks this.
         let total_size = self.total_size.unwrap();
-        self.buffer(pool).ok()?.set_len(total_size);
+        self.buffer(buffers).ok()?.set_len(total_size);
         let buffer = self.buffer.take();
         self.reset();
         buffer.map(Buf::into_driver_buf)
@@ -205,12 +204,12 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
     /// Add a fragment to the datagram it belongs to, at `now`. The datagram's
     /// first fragment takes a slot for it, which `timeout` later expires.
     ///
-    /// Returns the whole datagram, in a buffer from `pool`, once its last
+    /// Returns the whole datagram, in a buffer from `buffers`, once its last
     /// fragment is in. A fragment that makes its datagram impossible to
     /// complete is dropped, along with the datagram's slot, if it has one.
     pub(crate) fn add(
         &mut self,
-        pool: PoolRef,
+        buffers: &Buffers,
         frag: Fragment<'_, K>,
         now: Instant,
         timeout: Duration,
@@ -232,12 +231,12 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
             debug!("No available packet assembler for fragmented packet");
             return None;
         };
-        if let Err(e) = slot.add(pool, &frag) {
+        if let Err(e) = slot.add(buffers, &frag) {
             debug!("fragmentation error: {:?}", e);
             slot.reset();
             return None;
         }
-        let packet = slot.assemble(pool)?;
+        let packet = slot.assemble(buffers)?;
         self.last_completed = Some(frag.key);
         Some(packet)
     }
@@ -374,7 +373,7 @@ impl Stack<'_> {
         let mut payload =
             self.fragments
                 .assembler
-                .add(self.inner.pool, frag, now, self.fragments.reassembly_timeout)?;
+                .add(&self.inner.buffers, frag, now, self.fragments.reassembly_timeout)?;
 
         // The reassembled packet is this fragment's IP header, patched to
         // describe the whole datagram, in front of the reassembled payload.
@@ -416,13 +415,13 @@ mod tests {
             offset,
             data,
             total_size,
-            max_size: crate::pool::TEST_POOL_SIZE,
+            max_size: crate::buffers::TEST_POOL_SIZE,
             restart_on_overlap: false,
         }
     }
 
     fn add(set: &mut PacketAssemblerSet<Key>, now: Instant, frag: Fragment<Key>) -> Option<std::vec::Vec<u8>> {
-        set.add(crate::pool::test_pool_ref(), frag, now, TIMEOUT)
+        set.add(crate::buffers::test_buffers(), frag, now, TIMEOUT)
             .map(|buf| buf.to_vec())
     }
 
@@ -460,7 +459,7 @@ mod tests {
     /// without taking a slot, and free the one the datagram had.
     #[test]
     fn packet_assembler_too_large() {
-        let size = crate::pool::TEST_POOL_SIZE;
+        let size = crate::buffers::TEST_POOL_SIZE;
         let mut set = PacketAssemblerSet::new();
         assert_eq!(add(&mut set, Instant::ZERO, frag(0, 0, &[0; 8], Some(size + 1))), None);
         assert_eq!(add(&mut set, Instant::ZERO, frag(0, size - 7, &[0; 8], None)), None);
@@ -567,7 +566,7 @@ mod tests {
         let mut set = PacketAssemblerSet::new();
         assert_eq!(
             set.add(
-                crate::pool::test_pool_ref(),
+                crate::buffers::test_buffers(),
                 frag(0, 0, b"ab", None),
                 Instant::ZERO,
                 Duration::from_secs(10)

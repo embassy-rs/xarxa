@@ -22,6 +22,7 @@
 
 use std::os::unix::io::AsRawFd;
 
+use static_cell::ConstStaticCell;
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddr, IpCidr, Ipv4Addr, ListenSocketAddr};
@@ -42,8 +43,8 @@ fn main() {
     let driver = TunTapDriver::new(name, hardware_addr).unwrap();
     let fd = driver.as_raw_fd();
 
-    static POOL: StaticPool = StaticPool::new();
-    let mut stack = Stack::new(&POOL, random_seed());
+    static POOL: ConstStaticCell<StaticPool> = ConstStaticCell::new(StaticPool::new());
+    let mut stack = Stack::new(POOL.take(), random_seed());
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     stack
         .iface(iface)

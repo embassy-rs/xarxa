@@ -44,13 +44,14 @@ fn alloc_storage_is_dma_shaped() {
 /// `packet_pool` integration test.)
 #[test]
 fn fresh_buffer_is_reset() {
-    let mut buf = test_pool().alloc().unwrap();
+    let pool: &'static crate::buffers::TestPool = crate::buffers::test_pool();
+    let mut buf = pool.alloc().unwrap();
     buf.reserve(100);
     buf.set_len(200);
     buf.fill(0xff);
     drop(buf);
 
-    let buf = test_pool().alloc().unwrap();
+    let buf = pool.alloc().unwrap();
     assert_eq!(buf.len(), 0);
     assert_eq!(buf.headroom(), 0);
     assert_eq!(buf.meta(), PacketMeta::default());
@@ -152,7 +153,7 @@ fn check_rx_refill(pool: &'static impl Pool) {
     }
 
     let ring = Rc::new(RefCell::new(Vec::new()));
-    let mut stack = Stack::new(pool, 0);
+    let mut stack = Stack::new_shared(pool, 0);
     stack
         .add_iface_borrowed(std::boxed::Box::leak(std::boxed::Box::new(Ring(ring.clone()))))
         .unwrap();

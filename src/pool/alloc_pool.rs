@@ -17,14 +17,14 @@ use crate::driver::{DriverBuf, PacketMeta, RawDriverBuf};
 ///
 /// The build fails for the same buffer sizes that fail with `StaticPool`.
 ///
-/// It must be `'static`. It can go in a `static`:
+/// A pool belongs to one stack, which takes it by `&'static mut`:
 ///
 /// ```
 /// use xarxa::{AllocPool, Stack};
 ///
-/// static POOL: AllocPool<1514> = AllocPool::new(64);
+/// let pool = Box::leak(Box::new(AllocPool::<1514>::new(64)));
 ///
-/// let stack = Stack::new(&POOL, 0x1234_5678);
+/// let stack = Stack::new(pool, 0x1234_5678);
 /// ```
 pub struct AllocPool<const SIZE: usize = 1514, const ALIGN: usize = 1>
 where

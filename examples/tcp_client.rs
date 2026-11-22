@@ -25,6 +25,7 @@
 use std::io::Write as _;
 use std::os::unix::io::AsRawFd;
 
+use static_cell::ConstStaticCell;
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddr, IpCidr, Ipv4Addr, SocketAddr};
@@ -57,8 +58,8 @@ fn main() {
     let mut rx_buffer = [0u8; 4096];
     let mut tx_buffer = [0u8; 4096];
 
-    static POOL: StaticPool = StaticPool::new();
-    let mut stack = Stack::new(&POOL, random_seed());
+    static POOL: ConstStaticCell<StaticPool> = ConstStaticCell::new(StaticPool::new());
+    let mut stack = Stack::new(POOL.take(), random_seed());
     let iface = stack.add_iface_borrowed(&mut driver).unwrap();
     stack
         .iface(iface)

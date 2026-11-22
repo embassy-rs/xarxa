@@ -24,14 +24,17 @@ use crate::driver::{DriverBuf, PacketMeta, RawDriverBuf};
 ///
 /// `ALIGN` can be 1, 2, 4, 8, 16, 32 or 64.
 ///
-/// Put it in a `static`:
+/// A pool belongs to one stack, which takes it by `&'static mut`. Put it in a
+/// `static`, for example with
+/// [`ConstStaticCell`](https://docs.rs/static_cell/latest/static_cell/struct.ConstStaticCell.html):
 ///
 /// ```
+/// use static_cell::ConstStaticCell;
 /// use xarxa::{Stack, StaticPool};
 ///
-/// static POOL: StaticPool<1514, 16> = StaticPool::new();
+/// static POOL: ConstStaticCell<StaticPool<1514, 16>> = ConstStaticCell::new(StaticPool::new());
 ///
-/// let stack = Stack::new(&POOL, 0x1234_5678);
+/// let stack = Stack::new(POOL.take(), 0x1234_5678);
 /// ```
 ///
 /// The pool is zero-initialized, so a `static` of it lives in `.bss`. To put it
@@ -55,6 +58,15 @@ where
 // is dropped, in `free`. So no two threads ever touch the same slot, and the
 // flags are atomic.
 unsafe impl<const SIZE: usize, const COUNT: usize, const ALIGN: usize> Sync for StaticPool<SIZE, COUNT, ALIGN> where
+    Align<ALIGN>: ValidAlign
+{
+}
+
+// SAFETY: the raw pointers in the slots only point into the pool itself, and
+// buffers only exist for a pool at a `'static` address (`alloc` takes
+// `&'static self`), which nothing can move. So moving a pool to another thread
+// moves no buffer.
+unsafe impl<const SIZE: usize, const COUNT: usize, const ALIGN: usize> Send for StaticPool<SIZE, COUNT, ALIGN> where
     Align<ALIGN>: ValidAlign
 {
 }

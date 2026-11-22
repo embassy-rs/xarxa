@@ -29,6 +29,7 @@
 
 use std::os::unix::io::AsRawFd;
 
+use static_cell::ConstStaticCell;
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::raw::RawMode;
 use xarxa::time::{Duration, Instant};
@@ -64,8 +65,8 @@ fn main() {
     let fd = driver.as_raw_fd();
 
     let seed = random_seed();
-    static POOL: StaticPool = StaticPool::new();
-    let mut stack = Stack::new(&POOL, seed);
+    static POOL: ConstStaticCell<StaticPool> = ConstStaticCell::new(StaticPool::new());
+    let mut stack = Stack::new(POOL.take(), seed);
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     stack
         .iface(iface)

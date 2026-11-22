@@ -959,7 +959,7 @@ mod test {
     fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
-        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 1);
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         assert_eq!(handle, IFACE);
         // Drain the solicited-node multicast report the link-local address triggers,
@@ -1555,7 +1555,7 @@ mod test {
 
         let driver = TestDevice::new(Medium::Ip);
         let tx = driver.tx.clone();
-        let mut stack = Stack::new(crate::pool::test_pool(), 1);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 1);
         let handle = driver.install(&mut stack, HardwareAddress::Ip);
         assert_eq!(
             stack.iface(handle).set_dhcpv4(Some(DhcpConfig::default())),

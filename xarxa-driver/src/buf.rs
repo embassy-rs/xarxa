@@ -23,8 +23,8 @@ pub struct RawDriverBuf {
     /// Called with this `RawDriverBuf` when the buffer is dropped. It gives the buffer
     /// back to its pool.
     pub free: unsafe fn(NonNull<RawDriverBuf>),
-    /// For the pool's own use, for example to find itself in `free`. The buffer
-    /// never reads it.
+    /// The address of the pool the buffer belongs to. The pool can use it to find
+    /// itself in `free`. [`DriverBuf::pool`] returns it.
     pub pool: *const (),
     /// Start of the storage.
     pub data: NonNull<u8>,
@@ -96,6 +96,13 @@ impl DriverBuf {
         // SAFETY: `data` is valid and initialized for `capacity` bytes, and only
         // this buffer accesses it.
         unsafe { core::slice::from_raw_parts(raw.data.as_ptr(), raw.capacity) }
+    }
+
+    /// The address of the pool the buffer belongs to.
+    ///
+    /// Two buffers with the same address come from the same pool.
+    pub fn pool(&self) -> *const () {
+        self.raw().pool
     }
 
     /// The packet's metadata.

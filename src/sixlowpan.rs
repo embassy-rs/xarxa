@@ -722,7 +722,7 @@ impl Stack<'_> {
         let packet = self
             .fragments
             .assembler
-            .add(self.inner.pool, frag, now, self.fragments.reassembly_timeout)?;
+            .add(&self.inner.buffers, frag, now, self.fragments.reassembly_timeout)?;
         trace!("6LoWPAN: fragmented packet now complete");
         Some(packet)
     }
@@ -910,7 +910,7 @@ mod test {
     ) -> (Stack<'static>, IfaceHandle, Queue, Sent, Room) {
         let driver = TestDevice::new(Medium::Ieee802154).with_mtu(MTU);
         let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
-        let mut stack = Stack::new(crate::pool::test_pool(), 0x1234_5678_dead_beef);
+        let mut stack = Stack::new(crate::buffers::test_pool(), 0x1234_5678_dead_beef);
         let handle = driver.install(&mut stack, HardwareAddress::Ieee802154(hw));
         stack.iface(handle).set_pan_id(pan_id);
         // Drain the solicited-node multicast reports the link-local address
@@ -963,7 +963,7 @@ mod test {
     /// if sent from `src` to `dst`. Returns the 6LoWPAN bytes (IPHC first) and
     /// the header difference.
     fn compress(packet: &[u8], src: Ieee802154Address, dst: Ieee802154Address, headroom: usize) -> (Vec<u8>, usize) {
-        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
+        let mut buf = crate::buffers::test_buf();
         buf.reserve(headroom);
         buf.set_len(packet.len());
         buf.copy_from_slice(packet);
@@ -981,7 +981,7 @@ mod test {
         headroom: usize,
         total_len: Option<usize>,
     ) -> Result<Vec<u8>, Malformed> {
-        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
+        let mut buf = crate::buffers::test_buf();
         buf.reserve(headroom);
         buf.set_len(payload.len());
         buf.copy_from_slice(payload);
@@ -1605,7 +1605,7 @@ mod test {
     fn test_compress_no_room() {
         let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
-        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
+        let mut buf = crate::buffers::test_buf();
         let len = buf.capacity();
         buf.set_len(len);
         let datagram = udp_datagram(src.into(), 1234, dst.into(), 5678, &vec![0; len - 48]);

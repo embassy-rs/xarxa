@@ -12,7 +12,6 @@ pub use alloc_pool::AllocPool;
 pub use static_pool::StaticPool;
 
 use core::mem::MaybeUninit;
-use core::ptr::NonNull;
 
 use crate::driver::{DriverBuf, RawDriverBuf};
 
@@ -29,6 +28,8 @@ use crate::driver::{DriverBuf, RawDriverBuf};
 /// Implementations must guarantee:
 /// - Every buffer `alloc` returns has a [`capacity`](DriverBuf::capacity) of
 ///   [`buf_capacity`](Self::buf_capacity).
+/// - Every buffer `alloc` returns has the pool's own address as its
+///   [`RawDriverBuf::pool`].
 /// - `buf_capacity` is between 128 and 65535, and never changes.
 ///
 /// `DriverBuf` has no lifetime, so the pool must be `'static`.
@@ -43,39 +44,6 @@ pub trait Pool: Sync {
 
     /// Size of the storage of each buffer, in bytes.
     fn buf_capacity(&self) -> usize;
-}
-
-/// A type-erased reference to a [`Pool`], without a vtable.
-#[derive(Clone, Copy)]
-pub(crate) struct PoolRef {
-    pool: NonNull<()>,
-    alloc: unsafe fn(NonNull<()>) -> Option<DriverBuf>,
-}
-
-// SAFETY: `pool` comes from a `&'static P` with `P: Pool`, and `Pool: Sync`.
-unsafe impl Send for PoolRef {}
-unsafe impl Sync for PoolRef {}
-
-impl PoolRef {
-    pub(crate) fn new<P: Pool + 'static>(pool: &'static P) -> Self {
-        /// SAFETY: `pool` must point to a `P` that lives for `'static`.
-        unsafe fn alloc<P: Pool + 'static>(pool: NonNull<()>) -> Option<DriverBuf> {
-            let pool: &'static P = unsafe { pool.cast::<P>().as_ref() };
-            pool.alloc()
-        }
-
-        Self {
-            pool: NonNull::from(pool).cast(),
-            alloc: alloc::<P>,
-        }
-    }
-
-    /// Allocate a buffer, see [`Pool::alloc`].
-    #[inline]
-    pub(crate) fn alloc(&self) -> Option<DriverBuf> {
-        // SAFETY: `pool` and `alloc` were made from the same `&'static P` in `new`.
-        unsafe { (self.alloc)(self.pool) }
-    }
 }
 
 /// One buffer of a pool: its `RawDriverBuf`, then its storage, aligned to `ALIGN`.
@@ -143,30 +111,6 @@ const fn check_buf_capacity(capacity: usize) {
         capacity >= crate::wire::ETHERNET_HEADER_LEN + crate::wire::IPV4_MIN_MTU,
         "DHCP needs Pool buffers of at least 590 bytes, plus the driver headroom"
     );
-}
-
-/// The pool type of the unit tests. They run in parallel threads of one process,
-/// all sharing one pool, so it is big. Its buffers hold an Ethernet frame plus
-/// the test device's driver headroom.
-#[cfg(test)]
-pub(crate) type TestPool = StaticPool<TEST_POOL_SIZE, 1024>;
-
-/// The buffer size of [`TestPool`].
-#[cfg(test)]
-pub(crate) const TEST_POOL_SIZE: usize = 1514 + crate::test_device::TX_HEADROOM;
-
-/// The pool the unit tests share.
-#[cfg(test)]
-pub(crate) fn test_pool() -> &'static TestPool {
-    static POOL: TestPool = StaticPool::new();
-    &POOL
-}
-
-/// [`test_pool`], erased.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn test_pool_ref() -> PoolRef {
-    PoolRef::new(test_pool())
 }
 
 #[cfg(test)]

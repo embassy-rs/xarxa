@@ -96,7 +96,7 @@ impl StackInner {
                 trace!("fragmenter: device has no room, fragments wait");
                 return Err(Blocked::DeviceBusy);
             }
-            let Some(mut tx_buffer) = self.pool.alloc() else {
+            let Some(mut tx_buffer) = self.buffers.alloc() else {
                 trace!("fragmenter: no packet buffer, fragments wait");
                 return Err(Blocked::NoBuffer);
             };

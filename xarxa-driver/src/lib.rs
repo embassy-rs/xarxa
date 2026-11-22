@@ -10,7 +10,7 @@ mod meta;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
-pub use buf::{PacketBuf, RawPacketBuf};
+pub use buf::{DriverBuf, RawDriverBuf};
 pub use meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
 pub use meta::{Timestamp, TxTimestamp};
@@ -265,7 +265,7 @@ pub trait Driver {
     ///
     /// The stack never gives more buffers than [`rx_wanted`](Self::rx_wanted) asked
     /// for. The buffer has zero headroom and length.
-    fn rx_give(&mut self, buf: PacketBuf);
+    fn rx_give(&mut self, buf: DriverBuf);
 
     /// Poll for a received frame.
     ///
@@ -275,7 +275,7 @@ pub trait Driver {
     /// A driver that has per-packet metadata to report, such as an identifier or a
     /// receive timestamp, sets it on the buffer's [`PacketMeta`] here. It travels
     /// with the packet up to the socket that receives it.
-    fn receive(&mut self) -> Option<PacketBuf>;
+    fn receive(&mut self) -> Option<DriverBuf>;
 
     /// Whether the device can transmit one frame right now.
     ///
@@ -304,9 +304,9 @@ pub trait Driver {
     /// packet's [`id`](PacketMeta::id).
     ///
     /// # Errors
-    /// - `PacketBuf`: the buffer itself, handed back if the frame cannot be
+    /// - `DriverBuf`: the buffer itself, handed back if the frame cannot be
     ///   queued right now (device busy or queue full).
-    fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf>;
+    fn transmit(&mut self, buf: DriverBuf) -> Result<(), DriverBuf>;
 
     /// Poll for the timestamp of an already-transmitted packet.
     ///
@@ -374,16 +374,16 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     fn rx_wanted(&mut self) -> usize {
         T::rx_wanted(self)
     }
-    fn rx_give(&mut self, buf: PacketBuf) {
+    fn rx_give(&mut self, buf: DriverBuf) {
         T::rx_give(self, buf)
     }
-    fn receive(&mut self) -> Option<PacketBuf> {
+    fn receive(&mut self) -> Option<DriverBuf> {
         T::receive(self)
     }
     fn can_transmit(&mut self) -> bool {
         T::can_transmit(self)
     }
-    fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+    fn transmit(&mut self, buf: DriverBuf) -> Result<(), DriverBuf> {
         T::transmit(self, buf)
     }
     #[cfg(feature = "packetmeta-timestamp")]

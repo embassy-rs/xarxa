@@ -21,7 +21,7 @@ use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
 #[cfg(feature = "dhcpv4-options")]
 use crate::config::DHCP_OPTIONS_BUF_SIZE;
 use crate::driver::ChecksumCapabilities;
-use crate::driver::PacketBuf;
+use crate::driver::DriverBuf;
 use crate::route::{Route, RouteOrigin};
 use crate::stack::{Blocked, StackInner};
 use crate::time::{Clock, Duration, Instant};
@@ -466,7 +466,7 @@ impl Client {
     /// emits are tiny, so only an absurd `outgoing_options` can cause that.
     #[allow(clippy::too_many_arguments)]
     fn build(
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         config: &DhcpConfig,
         #[cfg(feature = "hostname")] hostname: Option<&str>,
         message_type: DhcpMessageType,
@@ -480,7 +480,7 @@ impl Client {
         src_addr: Ipv4Addr,
         dst_addr: Ipv4Addr,
         checksum_caps: &ChecksumCapabilities,
-    ) -> PacketBuf {
+    ) -> DriverBuf {
         // Worst case biggest IPv4 header length.
         // 0x0f * 4 = 60 bytes.
         const MAX_IPV4_HEADER_LEN: usize = 60;

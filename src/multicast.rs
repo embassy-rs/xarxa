@@ -6,7 +6,7 @@ use crate::config::MULTICAST_GROUP_COUNT;
 use crate::error::Full;
 use crate::storage::Vec;
 
-use crate::driver::PacketBuf;
+use crate::driver::DriverBuf;
 use crate::iface::{Iface, IfaceState};
 use crate::stack::{Blocked, StackInner};
 use crate::time::{Clock, Duration, Instant};
@@ -419,7 +419,7 @@ impl IfaceState<'_> {
     /// The destination is multicast, which is always routable and doesn't require
     /// neighbor discovery: the packet goes out of this interface, with the
     /// destination itself as the next hop.
-    fn dispatch_ip(&mut self, inner: &mut StackInner, mut buf: PacketBuf) {
+    fn dispatch_ip(&mut self, inner: &mut StackInner, mut buf: DriverBuf) {
         let (dst_addr, ethertype) = match IpVersion::of_packet(&buf) {
             #[cfg(feature = "ipv4")]
             Ok(IpVersion::V4) => (
@@ -445,7 +445,7 @@ impl IfaceState<'_> {
     /// query is answered with one report per group, spread evenly over the query's Max Resp
     /// Time, and a group-specific query after a quarter of it.
     #[cfg(feature = "ipv4")]
-    pub(crate) fn process_igmp(&mut self, dst_addr: Ipv4Addr, mut buf: PacketBuf, now: Instant) {
+    pub(crate) fn process_igmp(&mut self, dst_addr: Ipv4Addr, mut buf: DriverBuf, now: Instant) {
         let igmp_packet = check!(IgmpPacket::new_checked(&mut buf));
         if !igmp_packet.verify_checksum() {
             trace!("igmp: checksum incorrect");
@@ -515,7 +515,7 @@ impl IfaceState<'_> {
     }
 
     #[cfg(feature = "ipv4")]
-    fn igmp_report_packet(&self, mut pkt: PacketBuf, version: IgmpVersion, group_addr: Ipv4Addr) -> Option<PacketBuf> {
+    fn igmp_report_packet(&self, mut pkt: DriverBuf, version: IgmpVersion, group_addr: Ipv4Addr) -> Option<DriverBuf> {
         let iface_addr = self.ipv4_addr()?;
         pkt.reserve(self.ip_headroom + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
@@ -543,7 +543,7 @@ impl IfaceState<'_> {
     }
 
     #[cfg(feature = "ipv4")]
-    fn igmp_leave_packet(&self, mut pkt: PacketBuf, group_addr: Ipv4Addr) -> Option<PacketBuf> {
+    fn igmp_leave_packet(&self, mut pkt: DriverBuf, group_addr: Ipv4Addr) -> Option<DriverBuf> {
         let iface_addr = self.ipv4_addr()?;
         pkt.reserve(self.ip_headroom + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
@@ -617,9 +617,9 @@ impl IfaceState<'_> {
     /// Records past what fits in one packet are left out.
     fn mldv2_report_packet(
         &self,
-        pkt: PacketBuf,
+        pkt: DriverBuf,
         records: impl Iterator<Item = (MldRecordType, Ipv6Addr)> + Clone,
-    ) -> Option<PacketBuf> {
+    ) -> Option<DriverBuf> {
         let (mut pkt, record_count) = self.mldv2_report_start(pkt, records.clone().count())?;
         let mut mld = Icmpv6Packet::new_unchecked(&mut pkt);
         let mut payload = mld.payload_mut();
@@ -638,7 +638,7 @@ impl IfaceState<'_> {
     /// Start an MLDv2 report for `record_count` address records in `pkt`: write its
     /// header. Returns the report and how many records fit in it.
     #[cfg(feature = "ipv6")]
-    fn mldv2_report_start(&self, mut pkt: PacketBuf, record_count: usize) -> Option<(PacketBuf, usize)> {
+    fn mldv2_report_start(&self, mut pkt: DriverBuf, record_count: usize) -> Option<(DriverBuf, usize)> {
         // MLD report: the report header (8 bytes) plus one record per group.
         pkt.reserve(self.ip_headroom + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
         let max_records = (pkt.tailroom() - 8) / MLD_ADDRESS_RECORD_LEN;
@@ -661,7 +661,7 @@ impl IfaceState<'_> {
     /// Checksum an MLDv2 report with its records written, and put the IPv6 headers
     /// in front of it.
     #[cfg(feature = "ipv6")]
-    fn mldv2_report_finish(&self, pkt: &mut PacketBuf) {
+    fn mldv2_report_finish(&self, pkt: &mut DriverBuf) {
         // Per [RFC 3810 § 5.2.13], source addresses must be link-local, falling
         // back to the unspecified address if we haven't acquired one.
         // [RFC 3810 § 5.2.13]: https://tools.ietf.org/html/rfc3810#section-5.2.13
@@ -694,7 +694,7 @@ const MLDV2_ROUTER_ALERT_LEN: usize = 8;
 /// One 8-byte extension header: next header and length, the router alert
 /// option (RFC 2711), and a PadN option of length 0 to fill the 8 bytes.
 #[cfg(feature = "ipv6")]
-fn push_mldv2_router_alert(buf: &mut PacketBuf) {
+fn push_mldv2_router_alert(buf: &mut DriverBuf) {
     buf.push_front(MLDV2_ROUTER_ALERT_LEN);
     let hbh = &mut buf[..MLDV2_ROUTER_ALERT_LEN];
     hbh[0] = IpProtocol::Icmpv6.into();

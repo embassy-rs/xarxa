@@ -4,7 +4,7 @@ use super::*;
 use crate::driver::PacketMeta;
 
 /// The storage a driver DMAs into must be aligned to the pool's alignment,
-/// whatever the `RawPacketBuf` in front of it does to the layout.
+/// whatever the `RawDriverBuf` in front of it does to the layout.
 fn check_dma_shaped(pool: &'static dyn Pool, size: usize, align: usize) {
     assert_eq!(pool.buf_capacity(), size);
     // Two buffers, so that one isn't the first of the pool.
@@ -89,7 +89,7 @@ fn static_limit() {
 #[test]
 fn static_claim_wraps() {
     static POOL: StaticPool<1514, 4> = StaticPool::new();
-    let mut held: Vec<PacketBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
+    let mut held: Vec<DriverBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
     assert_eq!(held.len(), 4);
     let mut ptrs: Vec<*const u8> = held.iter_mut().map(|b| b.storage_mut().as_ptr()).collect();
 
@@ -124,7 +124,7 @@ fn check_rx_refill(pool: &'static impl Pool) {
     use std::rc::Rc;
 
     /// A receive ring of 4 slots that never receives anything.
-    struct Ring(Rc<RefCell<Vec<PacketBuf>>>);
+    struct Ring(Rc<RefCell<Vec<DriverBuf>>>);
     impl Driver for Ring {
         fn capabilities(&self) -> Capabilities {
             let mut caps = Capabilities::default();
@@ -137,16 +137,16 @@ fn check_rx_refill(pool: &'static impl Pool) {
         fn rx_wanted(&mut self) -> usize {
             4 - self.0.borrow().len()
         }
-        fn rx_give(&mut self, buf: PacketBuf) {
+        fn rx_give(&mut self, buf: DriverBuf) {
             self.0.borrow_mut().push(buf);
         }
-        fn receive(&mut self) -> Option<PacketBuf> {
+        fn receive(&mut self) -> Option<DriverBuf> {
             None
         }
         fn can_transmit(&mut self) -> bool {
             true
         }
-        fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
+        fn transmit(&mut self, _buf: DriverBuf) -> Result<(), DriverBuf> {
             Ok(())
         }
     }

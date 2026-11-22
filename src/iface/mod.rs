@@ -405,7 +405,7 @@ impl<'d> Iface<'_, 'd> {
     }
 
     /// The interface's IP-layer MTU: the device MTU minus the link-layer header,
-    /// clamped to what a [`PacketBuf`](crate::driver::PacketBuf) can carry after
+    /// clamped to what a [`DriverBuf`](crate::driver::DriverBuf) can carry after
     /// the device's [`tx_headroom`](Capabilities::tx_headroom) and the link-layer
     /// header.
     pub fn ip_mtu(&self) -> usize {

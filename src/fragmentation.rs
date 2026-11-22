@@ -7,7 +7,9 @@
 //! compressed packet is cut into pieces behind fragment headers. Fragmentation
 //! pays one extra copy, on purpose: it is a fallback path.
 
-use crate::driver::PacketBuf;
+use crate::buffers::Buf;
+#[cfg(feature = "ipv4-fragmentation")]
+use crate::driver::DriverBuf;
 use crate::iface::IfaceState;
 #[cfg(feature = "ipv4-fragmentation")]
 use crate::rand::Rand;
@@ -29,7 +31,7 @@ pub(crate) enum Fragmenter {
 #[cfg(feature = "ipv4-fragmentation")]
 pub(crate) struct Ipv4Fragmenter {
     /// The IP packet, header included.
-    pub buffer: PacketBuf,
+    pub buffer: Buf,
     /// Where the fragments go on the link: the resolved next hop, or nowhere
     /// on an IP medium.
     pub link_dst: HardwareAddress,
@@ -42,7 +44,7 @@ pub(crate) struct Ipv4Fragmenter {
 #[cfg(feature = "sixlowpan-fragmentation")]
 pub(crate) struct SixlowpanFragmenter {
     /// The compressed packet, from the IPHC header on.
-    pub buffer: PacketBuf,
+    pub buffer: Buf,
     /// How much of it was sent.
     pub sent_bytes: usize,
     /// The size of the whole IPv6 datagram.
@@ -134,7 +136,7 @@ impl StackInner {
 
     /// Fragment an IPv4 packet larger than the interface's MTU, whose next hop
     /// is resolved to `link_dst`, and start transmitting the fragments.
-    pub(crate) fn fragment_ipv4(&mut self, iface: &mut IfaceState<'_>, link_dst: HardwareAddress, mut buf: PacketBuf) {
+    pub(crate) fn fragment_ipv4(&mut self, iface: &mut IfaceState<'_>, link_dst: HardwareAddress, mut buf: DriverBuf) {
         debug!("start fragmentation");
 
         if !iface.fragmenter.is_idle() {
@@ -150,7 +152,7 @@ impl StackInner {
 
         // Keep the packet, and where its fragments go.
         iface.fragmenter = Fragmenter::Ipv4(Ipv4Fragmenter {
-            buffer: buf,
+            buffer: Buf::from_driver_buf(buf),
             link_dst,
             ident: self.next_ipv4_frag_ident(),
             frag_offset: 0,
@@ -163,7 +165,7 @@ impl StackInner {
 
     /// Fill `tx_buffer` with the next fragment of the IPv4 packet in the
     /// interface's fragmenter, and transmit it.
-    fn dispatch_ipv4_frag(&mut self, iface: &mut IfaceState<'_>, mut tx_buffer: PacketBuf) {
+    fn dispatch_ipv4_frag(&mut self, iface: &mut IfaceState<'_>, mut tx_buffer: DriverBuf) {
         let ip_mtu = iface.ip_mtu;
         let checksum_caps = iface.checksum_caps();
         tx_buffer.reserve(iface.ip_headroom);

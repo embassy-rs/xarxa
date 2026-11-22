@@ -2,7 +2,7 @@ use std::io;
 use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use crate::driver::PacketBuf;
+use crate::driver::DriverBuf;
 use crate::driver::{Capabilities, Driver};
 use crate::iface::Medium;
 use crate::wire::HardwareAddress;
@@ -56,7 +56,7 @@ pub struct RawSocketDriver {
     mtu: usize,
     hardware_addr: HardwareAddress,
     /// The buffer the next frame is received into, given by the stack.
-    rx_buf: Option<PacketBuf>,
+    rx_buf: Option<DriverBuf>,
 }
 
 impl AsRawFd for RawSocketDriver {
@@ -209,11 +209,11 @@ impl Driver for RawSocketDriver {
         self.rx_buf.is_none() as usize
     }
 
-    fn rx_give(&mut self, buf: PacketBuf) {
+    fn rx_give(&mut self, buf: DriverBuf) {
         self.rx_buf = Some(buf);
     }
 
-    fn receive(&mut self) -> Option<PacketBuf> {
+    fn receive(&mut self) -> Option<DriverBuf> {
         let Some(mut buf) = self.rx_buf.take() else {
             // No buffer: drop the frame, if there is one, rather than leave it
             // pending. A short read takes the whole frame.
@@ -234,7 +234,7 @@ impl Driver for RawSocketDriver {
         }
     }
 
-    fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+    fn transmit(&mut self, buf: DriverBuf) -> Result<(), DriverBuf> {
         match self.send(&buf) {
             Ok(_) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {

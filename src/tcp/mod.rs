@@ -11,7 +11,7 @@ use core::{fmt, mem};
 use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
 use crate::driver::ChecksumCapabilities;
-use crate::driver::PacketBuf;
+use crate::driver::DriverBuf;
 #[cfg(feature = "icmp-errors")]
 use crate::error::IcmpError;
 use crate::error::InvalidHopLimit;
@@ -2315,7 +2315,7 @@ pub(crate) fn build_tcp_packet(
     src_addr: &IpAddr,
     dst_addr: &IpAddr,
     checksum_caps: &ChecksumCapabilities,
-) -> Option<PacketBuf> {
+) -> Option<DriverBuf> {
     let ip_header_len = match dst_addr {
         #[cfg(feature = "ipv4")]
         IpAddr::V4(_) => IPV4_HEADER_LEN,
@@ -2336,7 +2336,7 @@ pub(crate) fn build_tcp_packet(
 ///
 /// Returns `false` if the buffer can't hold it.
 pub(crate) fn build_tcp_packet_in(
-    buf: &mut PacketBuf,
+    buf: &mut DriverBuf,
     ip_headroom: usize,
     repr: &TcpRepr<'static>,
     src_addr: &IpAddr,

@@ -14,7 +14,7 @@ pub use static_pool::StaticPool;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
-use crate::driver::{PacketBuf, RawPacketBuf};
+use crate::driver::{DriverBuf, RawDriverBuf};
 
 /// Packet pool trait.
 ///
@@ -24,14 +24,14 @@ use crate::driver::{PacketBuf, RawPacketBuf};
 /// - `AllocPool`: buffers allocated from the heap, up to a limit. Needs the
 ///   `alloc` feature.
 ///
-/// To implement it yourself, build buffers with [`PacketBuf::from_raw_parts`].
+/// To implement it yourself, build buffers with [`DriverBuf::from_raw`].
 ///
 /// Implementations must guarantee:
-/// - Every buffer `alloc` returns has a [`capacity`](PacketBuf::capacity) of
+/// - Every buffer `alloc` returns has a [`capacity`](DriverBuf::capacity) of
 ///   [`buf_capacity`](Self::buf_capacity).
 /// - `buf_capacity` is between 128 and 65535, and never changes.
 ///
-/// `PacketBuf` has no lifetime, so the pool must be `'static`.
+/// `DriverBuf` has no lifetime, so the pool must be `'static`.
 pub trait Pool: Sync {
     /// Allocate a buffer.
     ///
@@ -39,7 +39,7 @@ pub trait Pool: Sync {
     ///
     /// The buffer has zero headroom and length, and default metadata. Its storage
     /// may hold data from earlier packets.
-    fn alloc(&'static self) -> Option<PacketBuf>;
+    fn alloc(&'static self) -> Option<DriverBuf>;
 
     /// Size of the storage of each buffer, in bytes.
     fn buf_capacity(&self) -> usize;
@@ -49,7 +49,7 @@ pub trait Pool: Sync {
 #[derive(Clone, Copy)]
 pub(crate) struct PoolRef {
     pool: NonNull<()>,
-    alloc: unsafe fn(NonNull<()>) -> Option<PacketBuf>,
+    alloc: unsafe fn(NonNull<()>) -> Option<DriverBuf>,
 }
 
 // SAFETY: `pool` comes from a `&'static P` with `P: Pool`, and `Pool: Sync`.
@@ -59,7 +59,7 @@ unsafe impl Sync for PoolRef {}
 impl PoolRef {
     pub(crate) fn new<P: Pool + 'static>(pool: &'static P) -> Self {
         /// SAFETY: `pool` must point to a `P` that lives for `'static`.
-        unsafe fn alloc<P: Pool + 'static>(pool: NonNull<()>) -> Option<PacketBuf> {
+        unsafe fn alloc<P: Pool + 'static>(pool: NonNull<()>) -> Option<DriverBuf> {
             let pool: &'static P = unsafe { pool.cast::<P>().as_ref() };
             pool.alloc()
         }
@@ -72,13 +72,13 @@ impl PoolRef {
 
     /// Allocate a buffer, see [`Pool::alloc`].
     #[inline]
-    pub(crate) fn alloc(&self) -> Option<PacketBuf> {
+    pub(crate) fn alloc(&self) -> Option<DriverBuf> {
         // SAFETY: `pool` and `alloc` were made from the same `&'static P` in `new`.
         unsafe { (self.alloc)(self.pool) }
     }
 }
 
-/// One buffer of a pool: its `RawPacketBuf`, then its storage, aligned to `ALIGN`.
+/// One buffer of a pool: its `RawDriverBuf`, then its storage, aligned to `ALIGN`.
 ///
 /// `raw` comes first, so a pointer to it is a pointer to the slot.
 #[repr(C)]
@@ -86,7 +86,7 @@ struct Slot<const SIZE: usize, const ALIGN: usize>
 where
     Align<ALIGN>: ValidAlign,
 {
-    raw: MaybeUninit<RawPacketBuf>,
+    raw: MaybeUninit<RawDriverBuf>,
     /// Aligns `data` to `ALIGN`.
     _align: [<Align<ALIGN> as ValidAlign>::Type; 0],
     data: [u8; SIZE],

@@ -19,7 +19,7 @@ use std::vec::Vec;
 
 use xarxa::Stack;
 use xarxa::driver::Capabilities;
-use xarxa::driver::PacketBuf;
+use xarxa::driver::DriverBuf;
 #[cfg(feature = "packetmeta-id")]
 use xarxa::driver::PacketMeta;
 use xarxa::driver::{ChecksumCapabilities, Driver, LinkState};
@@ -83,7 +83,7 @@ pub struct TestDevice {
     /// The link state it reports.
     pub link: Link,
     /// The empty buffer the next received frame is copied into, given by the stack.
-    pub rx_buf: Rc<RefCell<Option<PacketBuf>>>,
+    pub rx_buf: Rc<RefCell<Option<DriverBuf>>>,
     /// Multicast filter lists the stack set, oldest first.
     pub mcast_filter: McastFilter,
     /// Metadata stamped onto every received packet.
@@ -202,11 +202,11 @@ impl Driver for TestDevice {
         (self.rx_buf.borrow().is_none() && !self.rx.borrow().is_empty()) as usize
     }
 
-    fn rx_give(&mut self, buf: PacketBuf) {
+    fn rx_give(&mut self, buf: DriverBuf) {
         *self.rx_buf.borrow_mut() = Some(buf);
     }
 
-    fn receive(&mut self) -> Option<PacketBuf> {
+    fn receive(&mut self) -> Option<DriverBuf> {
         // With no buffer, the frame stays queued for the test to look at.
         if self.rx_buf.borrow().is_none() || self.rx.borrow().is_empty() {
             return None;
@@ -226,7 +226,7 @@ impl Driver for TestDevice {
         self.room.get().is_none_or(|room| room > 0)
     }
 
-    fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+    fn transmit(&mut self, buf: DriverBuf) -> Result<(), DriverBuf> {
         assert!(
             buf.headroom() >= self.tx_headroom,
             "frame with {} bytes of headroom, the device asked for {}",

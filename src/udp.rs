@@ -11,7 +11,8 @@ use crate::storage::BoundedDeque;
 use core::fmt;
 use core::ops::{Deref, Range};
 
-use crate::driver::PacketBuf;
+use crate::buffers::Buf;
+use crate::driver::DriverBuf;
 use crate::driver::PacketMeta;
 #[cfg(feature = "icmp-errors")]
 use crate::error::IcmpError;
@@ -201,7 +202,7 @@ pub(crate) struct UdpSocketState {
     remote: ListenSocketAddr,
     /// The interface the socket is bound to. Zero-sized without `iface-bind`.
     binding: IfaceBinding,
-    rx_queue: BoundedDeque<PacketBuf, UDP_RX_QUEUE_COUNT>,
+    rx_queue: BoundedDeque<Buf, UDP_RX_QUEUE_COUNT>,
     hop_limit: Option<u8>,
     /// The last ICMP error reported against this socket, with the remote address
     /// it is about. A single slot: a newer error overwrites an unread older one.
@@ -239,7 +240,7 @@ impl UdpSocketState {
 
     /// Queue an ingress datagram. `buf` must be a full IP packet (IP header
     /// included), truncated to the UDP length.
-    pub(crate) fn rx_enqueue(&mut self, buf: PacketBuf) {
+    pub(crate) fn rx_enqueue(&mut self, buf: Buf) {
         if self.rx_queue.push_back(buf).is_err() {
             trace!("udp: rx queue full, dropping packet");
             return;
@@ -294,13 +295,13 @@ impl UdpSocketState {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct RecvPacket {
-    buf: PacketBuf,
+    buf: Buf,
     meta: UdpMetadata,
     payload: Range<usize>,
 }
 
 impl RecvPacket {
-    fn new(mut buf: PacketBuf) -> Self {
+    fn new(mut buf: Buf) -> Self {
         let (meta, payload) = parse_datagram(&mut buf);
         Self { buf, meta, payload }
     }
@@ -332,7 +333,7 @@ impl Deref for RecvPacket {
 /// packet starting at the IP header).
 ///
 /// The packet was validated on ingress, so this cannot fail.
-fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
+fn parse_datagram(buf: &mut DriverBuf) -> (UdpMetadata, Range<usize>) {
     let (src_addr, dst_addr, header_len): (IpAddr, IpAddr, usize) =
         match IpVersion::of_packet(buf).expect("queued packet was validated on ingress") {
             #[cfg(feature = "ipv4")]
@@ -842,14 +843,14 @@ impl UdpSocket<'_, '_> {
     /// Allocate an empty UDP payload buffer with headroom for the headers.
     ///
     /// Allocation works before binding. Returns `None` if every packet buffer
-    /// is in use. Set the payload length with [`PacketBuf::set_len`] before writing.
-    pub fn alloc(&self) -> Option<PacketBuf> {
-        let mut buf = self.tx.inner.pool.alloc()?;
+    /// is in use. Set the payload length with [`DriverBuf::set_len`] before writing.
+    pub fn alloc_buf(&self) -> Option<Buf> {
+        let mut buf = Buf::from_driver_buf(self.tx.inner.pool.alloc()?);
         buf.reserve(self.send_headroom());
         Some(buf)
     }
 
-    /// Headroom to reserve in a buffer for [`send_packet`](Self::send_packet), so
+    /// Headroom to reserve in a buffer for [`send_buf`](Self::send_buf), so
     /// that the payload isn't moved.
     pub fn send_headroom(&self) -> usize {
         // A bind scoped to one IP version only sends over that version.
@@ -872,13 +873,15 @@ impl UdpSocket<'_, '_> {
     /// match [`send_with`](Self::send_with), except this method allocates no
     /// payload buffer and never returns [`SendError::NoBuffer`].
     /// Success transfers ownership to the stack; it does not guarantee delivery.
-    pub fn send_packet(&mut self, buf: PacketBuf, meta: impl Into<UdpMetadata>) -> Result<(), (SendError, PacketBuf)> {
-        self.send_packet_meta(buf, meta.into())
+    pub fn send_buf(&mut self, buf: Buf, meta: impl Into<UdpMetadata>) -> Result<(), (SendError, Buf)> {
+        let buf = buf.into_driver_buf();
+        self.send_meta(buf, meta.into())
+            .map_err(|(err, buf)| (err, Buf::from_driver_buf(buf)))
     }
 
-    /// [`send_packet`](Self::send_packet), with the metadata converted, so that
-    /// only the conversion is compiled per metadata type.
-    fn send_packet_meta(&mut self, mut buf: PacketBuf, mut meta: UdpMetadata) -> Result<(), (SendError, PacketBuf)> {
+    /// [`send_buf`](Self::send_buf), with the metadata converted, so that only
+    /// the conversion is compiled per metadata type.
+    fn send_meta(&mut self, mut buf: DriverBuf, mut meta: UdpMetadata) -> Result<(), (SendError, DriverBuf)> {
         let (route, src, hop_limit) = match self.route_datagram(&mut meta) {
             Ok(routed) => routed,
             Err(err) => return Err((err, buf)),
@@ -906,7 +909,7 @@ impl UdpSocket<'_, '_> {
         &mut self,
         max_size: usize,
         mut meta: UdpMetadata,
-    ) -> Result<(PacketBuf, DatagramEgress), SendError> {
+    ) -> Result<(DriverBuf, DatagramEgress), SendError> {
         let (route, src, hop_limit) = self.route_datagram(&mut meta)?;
         let headroom = send_headroom(route.ip_headroom, meta.remote_addr.addr.version());
         let Some(mut buf) = self.tx.inner.pool.alloc() else {
@@ -1013,7 +1016,7 @@ impl UdpSocket<'_, '_> {
     ///
     /// A datagram that would have to wait inside the stack and can't is handed
     /// back, with only its payload in the buffer again.
-    fn transmit_datagram(&mut self, egress: DatagramEgress, mut buf: PacketBuf) -> Result<(), (SendError, PacketBuf)> {
+    fn transmit_datagram(&mut self, egress: DatagramEgress, mut buf: DriverBuf) -> Result<(), (SendError, DriverBuf)> {
         let DatagramEgress {
             route,
             src,
@@ -1102,7 +1105,7 @@ impl Stack<'_> {
         dst_addr: IpAddr,
         ip_header_len: usize,
         handled_by_raw: bool,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
     ) {
         let Ok(udp_packet) = UdpPacket::new_checked(&mut buf) else {
             trace!("udp: malformed packet");
@@ -1132,7 +1135,7 @@ impl Stack<'_> {
                 "udp:{}: receiving {} octets from {}:{}",
                 socket.local, payload_len, src_addr, src_port
             );
-            socket.rx_enqueue(buf);
+            socket.rx_enqueue(Buf::from_driver_buf(buf));
             return;
         }
 
@@ -1275,13 +1278,13 @@ mod test {
         driver.room.set(Some(0));
         driver.install(&mut stack, HardwareAddress::Ip);
         let mut socket = stack.udp_socket(handle);
-        let mut buf = socket.alloc().unwrap();
+        let mut buf = socket.alloc_buf().unwrap();
         assert!(buf.is_empty());
         assert_eq!(buf.headroom(), crate::test_device::TX_HEADROOM + 40 + 8);
         socket.bind(LOCAL_PORT, ANY).unwrap();
         buf.set_len(3);
         buf.copy_from_slice(b"udp");
-        assert_eq!(&*buf, b"udp");
+        assert_eq!(&buf[..], b"udp");
     }
 
     /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
@@ -1297,7 +1300,7 @@ mod test {
     }
 
     /// Build a queued-datagram buffer the way ingress does, as a full IPv4 + UDP packet.
-    fn queued_packet_from(src_addr: Ipv4Addr, src_port: u16, dst_addr: Ipv4Addr, payload: &[u8]) -> PacketBuf {
+    fn queued_packet_from(src_addr: Ipv4Addr, src_port: u16, dst_addr: Ipv4Addr, payload: &[u8]) -> Buf {
         queued_packet_to_port(src_addr, src_port, dst_addr, LOCAL_PORT, payload)
     }
 
@@ -1308,9 +1311,9 @@ mod test {
         dst_addr: Ipv4Addr,
         dst_port: u16,
         payload: &[u8],
-    ) -> PacketBuf {
+    ) -> Buf {
         let udp_len = UDP_HEADER_LEN + payload.len();
-        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
+        let mut buf = crate::Buf::from_driver_buf(crate::pool::test_pool_ref().alloc().unwrap());
         buf.set_len(IPV4_HEADER_LEN + udp_len);
         {
             let mut ip = Ipv4Packet::new_unchecked(&mut buf);
@@ -1332,7 +1335,7 @@ mod test {
         buf
     }
 
-    fn queued_packet(payload: &[u8]) -> PacketBuf {
+    fn queued_packet(payload: &[u8]) -> Buf {
         queued_packet_from(REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, payload)
     }
 
@@ -1355,14 +1358,14 @@ mod test {
         dst_addr: Ipv4Addr,
         payload: &[u8],
     ) {
-        let mut buf = queued_packet_from(src_addr, src_port, dst_addr, payload);
+        let mut buf = queued_packet_from(src_addr, src_port, dst_addr, payload).into_driver_buf();
         buf.pull_front(IPV4_HEADER_LEN);
         stack.process_udp(iface, src_addr.into(), dst_addr.into(), IPV4_HEADER_LEN, false, buf);
     }
 
     /// Like [`deliver`], with an explicit destination port.
     fn deliver_to_port(stack: &mut Stack, dst_port: u16, payload: &[u8]) {
-        let mut buf = queued_packet_to_port(REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, dst_port, payload);
+        let mut buf = queued_packet_to_port(REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, dst_port, payload).into_driver_buf();
         buf.pull_front(IPV4_HEADER_LEN);
         stack.process_udp(
             IfaceHandle::new(0),
@@ -1543,7 +1546,7 @@ mod test {
             .unwrap();
 
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"yes");
-        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"yes");
+        assert_eq!(&stack.udp_socket(handle).recv().unwrap()[..], b"yes");
     }
 
     #[test]
@@ -1602,7 +1605,7 @@ mod test {
 
         // Matching the connected remote: delivered.
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"yes");
-        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"yes");
+        assert_eq!(&stack.udp_socket(handle).recv().unwrap()[..], b"yes");
 
         // Wrong source address or port: filtered out.
         deliver(&mut stack, OTHER_ADDR, REMOTE_PORT, b"no");
@@ -1620,8 +1623,8 @@ mod test {
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"a");
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT + 1, b"b");
         deliver(&mut stack, OTHER_ADDR, REMOTE_PORT, b"no");
-        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"a");
-        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"b");
+        assert_eq!(&stack.udp_socket(handle).recv().unwrap()[..], b"a");
+        assert_eq!(&stack.udp_socket(handle).recv().unwrap()[..], b"b");
         assert!(!stack.udp_socket(handle).can_recv());
     }
 
@@ -1702,18 +1705,18 @@ mod test {
         deliver_to(&mut stack, REMOTE_ADDR, REMOTE_PORT, BCAST, b"bcast");
         deliver_to(&mut stack, REMOTE_ADDR, REMOTE_PORT, GROUP, b"group");
         assert!(!stack.udp_socket(h_addr).can_recv());
-        assert_eq!(&*stack.udp_socket(h_group).recv().unwrap(), b"group");
+        assert_eq!(&stack.udp_socket(h_group).recv().unwrap()[..], b"group");
         assert!(!stack.udp_socket(h_group).can_recv());
 
         // Unicast to its own address still arrives.
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"unicast");
-        assert_eq!(&*stack.udp_socket(h_addr).recv().unwrap(), b"unicast");
+        assert_eq!(&stack.udp_socket(h_addr).recv().unwrap()[..], b"unicast");
 
         // A wildcard socket takes broadcast, and beats nothing else on the port.
         let h_any = stack.add_udp_socket().unwrap();
         stack.udp_socket(h_any).bind(LOCAL_PORT, ANY).unwrap();
         deliver_to(&mut stack, REMOTE_ADDR, REMOTE_PORT, BCAST, b"bcast2");
-        assert_eq!(&*stack.udp_socket(h_any).recv().unwrap(), b"bcast2");
+        assert_eq!(&stack.udp_socket(h_any).recv().unwrap()[..], b"bcast2");
         assert!(!stack.udp_socket(h_addr).can_recv());
     }
 
@@ -1740,11 +1743,11 @@ mod test {
         // To another local address: only the wildcard socket matches.
         deliver_to(&mut stack, REMOTE_ADDR, REMOTE_PORT, OTHER_ADDR, b"any");
 
-        assert_eq!(&*stack.udp_socket(h_conn).recv().unwrap(), b"conn");
+        assert_eq!(&stack.udp_socket(h_conn).recv().unwrap()[..], b"conn");
         assert!(!stack.udp_socket(h_conn).can_recv());
-        assert_eq!(&*stack.udp_socket(h_addr).recv().unwrap(), b"addr");
+        assert_eq!(&stack.udp_socket(h_addr).recv().unwrap()[..], b"addr");
         assert!(!stack.udp_socket(h_addr).can_recv());
-        assert_eq!(&*stack.udp_socket(h_any).recv().unwrap(), b"any");
+        assert_eq!(&stack.udp_socket(h_any).recv().unwrap()[..], b"any");
         assert!(!stack.udp_socket(h_any).can_recv());
     }
 
@@ -1770,7 +1773,7 @@ mod test {
         stack.udp_socket(h_addr).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
 
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"addr");
-        assert_eq!(&*stack.udp_socket(h_addr).recv().unwrap(), b"addr");
+        assert_eq!(&stack.udp_socket(h_addr).recv().unwrap()[..], b"addr");
         assert!(!stack.udp_socket(h_v4).can_recv());
         assert!(!stack.udp_socket(h_any).can_recv());
     }
@@ -2007,7 +2010,7 @@ mod test {
     }
 
     #[test]
-    fn test_send_packet() {
+    fn test_send_buf() {
         let driver = TestDevice::new(Medium::Ip);
         let tx = driver.tx.clone();
         let room = driver.room.clone();
@@ -2032,23 +2035,23 @@ mod test {
         ] {
             for headroom in [0, send_headroom, send_headroom + 2] {
                 for payload in [b"".as_slice(), b"abcde".as_slice()] {
-                    let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
+                    let mut buf = socket.alloc_buf().unwrap();
                     buf.reserve(headroom);
                     buf.set_len(payload.len());
                     buf.copy_from_slice(payload);
                     let ptr = buf.as_ptr();
                     let meta = buf.meta();
                     room.set(Some(0));
-                    let (err, returned) = socket.send_packet(buf, (dst, REMOTE_PORT)).unwrap_err();
+                    let (err, returned) = socket.send_buf(buf, (dst, REMOTE_PORT)).unwrap_err();
                     assert_eq!(err, SendError::DeviceBusy);
                     assert_eq!(returned.as_ptr(), ptr);
                     assert_eq!(returned.headroom(), headroom);
-                    assert_eq!(&*returned, payload);
+                    assert_eq!(&returned[..], payload);
                     assert_eq!(returned.meta(), meta);
 
                     room.set(None);
                     tx.borrow_mut().clear();
-                    socket.send_packet(returned, (dst, REMOTE_PORT)).unwrap();
+                    socket.send_buf(returned, (dst, REMOTE_PORT)).unwrap();
                     let mut frames = tx.borrow_mut();
                     assert_eq!(frames.len(), 1);
                     assert_eq!(frames[0].len(), header_len + UDP_HEADER_LEN + payload.len());
@@ -2057,10 +2060,12 @@ mod test {
             }
         }
 
-        let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
-        buf.set_len(buf.capacity());
+        let mut buf = socket.alloc_buf().unwrap();
+        buf.reserve(0);
+        let capacity = buf.capacity();
+        buf.set_len(capacity);
         buf.fill(0x5a);
-        let (err, returned) = socket.send_packet(buf, (REMOTE_ADDR, REMOTE_PORT)).unwrap_err();
+        let (err, returned) = socket.send_buf(buf, (REMOTE_ADDR, REMOTE_PORT)).unwrap_err();
         assert_eq!(err, SendError::BufferFull);
         assert_eq!(returned.headroom(), 0);
         assert_eq!(returned.len(), returned.capacity());
@@ -2252,7 +2257,7 @@ mod test {
         assert!(!stack.udp_socket(handle).can_recv());
 
         deliver_to_port(&mut stack, LOCAL_PORT, b"yes");
-        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"yes");
+        assert_eq!(&stack.udp_socket(handle).recv().unwrap()[..], b"yes");
     }
 
     #[cfg(feature = "iface-bind")]
@@ -2322,7 +2327,7 @@ mod test {
 
         // On the bound interface: delivered.
         deliver_on(&mut stack, if1, REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, b"yes");
-        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"yes");
+        assert_eq!(&stack.udp_socket(handle).recv().unwrap()[..], b"yes");
     }
 
     #[cfg(feature = "iface-bind")]
@@ -2338,11 +2343,11 @@ mod test {
         stack.udp_socket(h_bound).bind(LOCAL_PORT, ANY).unwrap();
 
         deliver_on(&mut stack, if0, REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, b"bound");
-        assert_eq!(&*stack.udp_socket(h_bound).recv().unwrap(), b"bound");
+        assert_eq!(&stack.udp_socket(h_bound).recv().unwrap()[..], b"bound");
         assert!(!stack.udp_socket(h_any).can_recv());
 
         deliver_on(&mut stack, if1, REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, b"any");
-        assert_eq!(&*stack.udp_socket(h_any).recv().unwrap(), b"any");
+        assert_eq!(&stack.udp_socket(h_any).recv().unwrap()[..], b"any");
         assert!(!stack.udp_socket(h_bound).can_recv());
     }
 

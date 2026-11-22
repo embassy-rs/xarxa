@@ -24,7 +24,7 @@ use heapless::Vec;
 
 use super::IfaceState;
 use crate::config::{DHCP_MAX_DNS_SERVER_COUNT, DHCP_SERVER_CLIENT_ID_SIZE, DHCP_SERVER_LEASE_COUNT};
-use crate::driver::{ChecksumCapabilities, PacketBuf};
+use crate::driver::{ChecksumCapabilities, DriverBuf};
 use crate::pool::PoolRef;
 use crate::stack::{StackInner, push_ipv4_header};
 use crate::time::{Duration, Instant};
@@ -392,7 +392,7 @@ impl Server {
         ip_headroom: usize,
         message_type: DhcpMessageType,
         packet: &DhcpPacket<'_>,
-    ) -> Option<(PacketBuf, Ipv4Addr, EthernetAddress)> {
+    ) -> Option<(DriverBuf, Ipv4Addr, EthernetAddress)> {
         let chaddr = packet.client_hardware_address();
         let id = match packet.option(field::OPT_CLIENT_ID) {
             Some(data) if !data.is_empty() && data.len() <= DHCP_SERVER_CLIENT_ID_SIZE => ClientId::Id(data),
@@ -477,7 +477,7 @@ impl Server {
         packet: &DhcpPacket<'_>,
         id: &ClientId<'_>,
         chaddr: EthernetAddress,
-    ) -> Option<(PacketBuf, Ipv4Addr, EthernetAddress)> {
+    ) -> Option<(DriverBuf, Ipv4Addr, EthernetAddress)> {
         let requested = packet.option(field::OPT_REQUESTED_IP).and_then(parse_ipv4);
         let requested_lease = packet
             .option(field::OPT_IP_LEASE_TIME)
@@ -540,7 +540,7 @@ impl Server {
         packet: &DhcpPacket<'_>,
         id: &ClientId<'_>,
         chaddr: EthernetAddress,
-    ) -> Option<(PacketBuf, Ipv4Addr, EthernetAddress)> {
+    ) -> Option<(DriverBuf, Ipv4Addr, EthernetAddress)> {
         let requested = packet.option(field::OPT_REQUESTED_IP).and_then(parse_ipv4);
         let server_id = packet.option(field::OPT_SERVER_IDENTIFIER).and_then(parse_ipv4);
         let ciaddr = packet.client_ip();
@@ -641,7 +641,7 @@ impl Server {
         ip_headroom: usize,
         packet: &DhcpPacket<'_>,
         reason: &'static str,
-    ) -> Option<(PacketBuf, Ipv4Addr, EthernetAddress)> {
+    ) -> Option<(DriverBuf, Ipv4Addr, EthernetAddress)> {
         self.build_reply(
             pool,
             server_cidr,
@@ -672,7 +672,7 @@ impl Server {
         ip_headroom: usize,
         request: &DhcpPacket<'_>,
         reply: Reply,
-    ) -> Option<(PacketBuf, Ipv4Addr, EthernetAddress)> {
+    ) -> Option<(DriverBuf, Ipv4Addr, EthernetAddress)> {
         let chaddr = request.client_hardware_address();
         let flags = request.flags();
 

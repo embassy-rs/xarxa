@@ -7,7 +7,7 @@
 //! With the `packet-log` feature, the stack calls it on every packet it receives
 //! and sends.
 
-use crate::driver::PacketBuf;
+use crate::driver::DriverBuf;
 #[cfg(all(feature = "ipv4", feature = "multicast"))]
 use crate::wire::IgmpPacket;
 #[cfg(feature = "udp")]
@@ -74,7 +74,7 @@ pub enum Layer {
 ///
 /// The packet is not modified. The parsers need a mutable slice, which is the
 /// only reason this takes `&mut`.
-pub fn log_packet(buf: &mut PacketBuf, layer: Layer) {
+pub fn log_packet(buf: &mut DriverBuf, layer: Layer) {
     log_layer(&mut buf[..], layer);
 }
 

@@ -3,7 +3,7 @@
 
 use crate::storage::BoundedVec;
 
-use crate::driver::PacketBuf;
+use crate::buffers::Buf;
 use crate::error::NotUnicast;
 use crate::iface::IfaceHandle;
 use crate::stack::POOL_RETRY_DELAY;
@@ -100,7 +100,7 @@ pub(crate) enum ProbeEvent {
     Retransmit(IpAddr),
     /// Resolution failed after the maximum number of solicitations. The entry has
     /// been removed, and this is the packet that was parked on it, if any.
-    Failed(IpAddr, Option<PacketBuf>),
+    Failed(IpAddr, Option<Buf>),
 }
 
 /// An entry in the [`NeighborCache`].
@@ -169,7 +169,7 @@ struct Entry {
     /// The packet waiting for the neighbor. It was sent while the neighbor was
     /// being resolved, and stays after the resolution while the device has no
     /// room for it. It goes with the entry, and when the entry goes stale.
-    parked: Option<PacketBuf>,
+    parked: Option<Buf>,
 }
 
 impl NeighborCache {
@@ -496,7 +496,7 @@ impl NeighborCache {
 
     /// Park a packet on a neighbor that is being resolved. It holds one: if it
     /// already holds one, or isn't being resolved, the packet is handed back.
-    pub(crate) fn park(&mut self, key: &Key, buf: PacketBuf) -> Result<(), PacketBuf> {
+    pub(crate) fn park(&mut self, key: &Key, buf: Buf) -> Result<(), Buf> {
         match self.get_mut(key) {
             Some(Entry {
                 state: State::Started { .. } | State::Incomplete { .. },
@@ -534,7 +534,7 @@ impl NeighborCache {
     /// Take the packet parked on the resolved neighbor at `index`, from
     /// [`next_resolved_parked`](Self::next_resolved_parked), with the
     /// neighbor's address and hardware address.
-    pub(crate) fn take_parked_at(&mut self, index: usize) -> (IpAddr, HardwareAddress, PacketBuf) {
+    pub(crate) fn take_parked_at(&mut self, index: usize) -> (IpAddr, HardwareAddress, Buf) {
         let entry = &mut self.storage[index];
         let State::Reachable { hardware_addr, .. } = entry.state else {
             unreachable!()
@@ -543,7 +543,7 @@ impl NeighborCache {
     }
 
     /// Take the packet parked on a neighbor, if any.
-    pub(crate) fn take_parked(&mut self, key: &Key) -> Option<PacketBuf> {
+    pub(crate) fn take_parked(&mut self, key: &Key) -> Option<Buf> {
         self.get_mut(key)?.parked.take()
     }
 
@@ -586,8 +586,8 @@ mod test {
     const IF_0: IfaceHandle = IfaceHandle::new(0);
     const IF_1: IfaceHandle = IfaceHandle::new(1);
 
-    fn buf() -> PacketBuf {
-        crate::pool::test_pool_ref().alloc().unwrap()
+    fn buf() -> Buf {
+        Buf::from_driver_buf(crate::pool::test_pool_ref().alloc().unwrap())
     }
 
     fn is_retransmit(event: Option<ProbeEvent>, addr: Ipv6Addr) -> bool {

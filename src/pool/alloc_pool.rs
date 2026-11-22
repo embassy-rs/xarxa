@@ -3,7 +3,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{Align, Pool, Slot, ValidAlign, check_buf_capacity};
-use crate::driver::{PacketBuf, PacketMeta, RawPacketBuf};
+use crate::driver::{DriverBuf, PacketMeta, RawDriverBuf};
 
 /// A [`Pool`] that allocates each buffer from the heap.
 ///
@@ -66,9 +66,9 @@ where
     /// Give a buffer back to its pool. Called when it is dropped.
     ///
     /// # Safety
-    /// `raw` must be the `RawPacketBuf` `alloc` gave the buffer, and the buffer must
+    /// `raw` must be the `RawDriverBuf` `alloc` gave the buffer, and the buffer must
     /// no longer be used.
-    unsafe fn free(raw: NonNull<RawPacketBuf>) {
+    unsafe fn free(raw: NonNull<RawDriverBuf>) {
         // SAFETY: `alloc` set `raw.pool` to a `&'static Self`. `raw` is the first
         // field of a slot `alloc` got from `Box::into_raw`.
         unsafe {
@@ -84,7 +84,7 @@ where
     Align<ALIGN>: ValidAlign,
 {
     #[inline(never)] // helps code size: it has many callers
-    fn alloc(&'static self) -> Option<PacketBuf> {
+    fn alloc(&'static self) -> Option<DriverBuf> {
         if !self.reserve() {
             return None;
         }
@@ -96,8 +96,8 @@ where
             // Catch code that relies on fresh buffers being zeroed.
             #[cfg(test)]
             data.write_bytes(0xa5, SIZE);
-            let raw = (&raw mut (*slot).raw).cast::<RawPacketBuf>();
-            raw.write(RawPacketBuf {
+            let raw = (&raw mut (*slot).raw).cast::<RawDriverBuf>();
+            raw.write(RawDriverBuf {
                 free: Self::free,
                 pool: (self as *const Self).cast(),
                 data: NonNull::new_unchecked(data),
@@ -106,7 +106,7 @@ where
                 len: 0,
                 meta: PacketMeta::default(),
             });
-            Some(PacketBuf::from_raw(NonNull::new_unchecked(raw)))
+            Some(DriverBuf::from_raw(NonNull::new_unchecked(raw)))
         }
     }
 

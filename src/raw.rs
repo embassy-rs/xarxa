@@ -14,11 +14,12 @@ use crate::config::RAW_RX_QUEUE_COUNT;
 use crate::storage::BoundedDeque;
 use core::fmt;
 
-use crate::driver::PacketBuf;
+use crate::driver::DriverBuf;
 use crate::driver::PacketMeta;
 use crate::iface::IfaceHandle;
 #[cfg(feature = "raw-ethernet")]
 use crate::iface::Medium;
+use crate::buffers::Buf;
 use crate::pool::PoolRef;
 #[cfg(feature = "raw-ip")]
 use crate::stack::Blocked;
@@ -180,7 +181,7 @@ pub(crate) struct RawSocketState {
     mode: Option<RawMode>,
     /// The interface the socket is bound to. Zero-sized without `iface-bind`.
     binding: IfaceBinding,
-    rx_queue: BoundedDeque<PacketBuf, RAW_RX_QUEUE_COUNT>,
+    rx_queue: BoundedDeque<Buf, RAW_RX_QUEUE_COUNT>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -209,7 +210,7 @@ impl RawSocketState {
 
     /// Queue an ingress packet. `buf` must be a whole Ethernet frame or IP packet,
     /// headers included, matching the socket's mode.
-    pub(crate) fn rx_enqueue(&mut self, buf: PacketBuf) {
+    pub(crate) fn rx_enqueue(&mut self, buf: Buf) {
         if self.rx_queue.push_back(buf).is_err() {
             trace!("raw: rx queue full, dropping packet");
             return;
@@ -222,8 +223,8 @@ impl RawSocketState {
 /// Copy a packet into a freshly allocated buffer. Used when both a raw socket and
 /// the stack's own protocol handlers want an ingress packet. `None` if the pool
 /// is empty: the socket misses the packet, the stack still processes it.
-fn copy_packet(pool: PoolRef, buf: &PacketBuf) -> Option<PacketBuf> {
-    let Some(mut copy) = pool.alloc() else {
+fn copy_packet(pool: PoolRef, buf: &DriverBuf) -> Option<Buf> {
+    let Some(mut copy) = pool.alloc().map(Buf::from_driver_buf) else {
         trace!("raw: no packet buffer for a copy, socket misses the packet");
         return None;
     };
@@ -412,7 +413,7 @@ impl RawSocket<'_, '_> {
     /// # Errors
     /// - `InvalidState`: if the socket is not bound.
     /// - `Exhausted`: if the RX queue is empty.
-    pub fn recv(&mut self) -> Result<PacketBuf, RecvError> {
+    pub fn recv(&mut self) -> Result<Buf, RecvError> {
         if !self.is_open() {
             return Err(RecvError::InvalidState);
         }
@@ -584,15 +585,15 @@ impl RawSocket<'_, '_> {
             self.send_done();
             return Ok(());
         }
-        self.send_packet(buf).map_err(|(err, _)| err)
+        self.send_inner(buf).map_err(|(err, _)| err)
     }
 
     /// Allocate an empty packet buffer with headroom for this socket.
     ///
     /// Allocation works before binding. Returns `None` if every packet buffer
-    /// is in use. Set the payload length with [`PacketBuf::set_len`] before writing.
-    pub fn alloc(&self) -> Option<PacketBuf> {
-        let mut buf = self.tx.inner.pool.alloc()?;
+    /// is in use. Set the payload length with [`DriverBuf::set_len`] before writing.
+    pub fn alloc_buf(&self) -> Option<Buf> {
+        let mut buf = Buf::from_driver_buf(self.tx.inner.pool.alloc()?);
         buf.reserve(self.send_headroom());
         Some(buf)
     }
@@ -632,7 +633,7 @@ impl RawSocket<'_, '_> {
         Ok(())
     }
 
-    /// Headroom to reserve in a buffer for [`send_packet`](Self::send_packet), so
+    /// Headroom to reserve in a buffer for [`send_buf`](Self::send_buf), so
     /// that the packet isn't moved.
     ///
     /// - In Ethernet mode, what the driver of the interface the socket sends on
@@ -663,7 +664,13 @@ impl RawSocket<'_, '_> {
     /// Errors return the buffer unchanged. Errors match [`send_with`](Self::send_with),
     /// except this method allocates no buffer and never returns [`SendError::NoBuffer`].
     /// Success transfers ownership to the stack; it does not guarantee delivery.
-    pub fn send_packet(&mut self, mut buf: PacketBuf) -> Result<(), (SendError, PacketBuf)> {
+    pub fn send_buf(&mut self, buf: Buf) -> Result<(), (SendError, Buf)> {
+        let buf = buf.into_driver_buf();
+        self.send_inner(buf).map_err(|(err, buf)| (err, Buf::from_driver_buf(buf)))
+    }
+
+    /// [`send_buf`](Self::send_buf), on the buffer itself.
+    fn send_inner(&mut self, mut buf: DriverBuf) -> Result<(), (SendError, DriverBuf)> {
         let Some(mode) = self.state.mode else {
             return Err((SendError::InvalidState, buf));
         };
@@ -751,8 +758,8 @@ impl Stack<'_> {
         iface: IfaceHandle,
         ethertype: EthernetProtocol,
         stack_wants: bool,
-        buf: PacketBuf,
-    ) -> Option<PacketBuf> {
+        buf: DriverBuf,
+    ) -> Option<DriverBuf> {
         for (_, socket) in self.sockets.raw.iter_mut() {
             let Some(RawMode::Ethernet {
                 ethertype: bound_ethertype,
@@ -774,7 +781,7 @@ impl Stack<'_> {
                 }
                 return Some(buf);
             } else {
-                socket.rx_enqueue(buf);
+                socket.rx_enqueue(Buf::from_driver_buf(buf));
                 return None;
             }
         }
@@ -801,8 +808,8 @@ impl Stack<'_> {
         version: IpVersion,
         protocol: IpProtocol,
         stack_wants: bool,
-        buf: PacketBuf,
-    ) -> Option<(PacketBuf, bool)> {
+        buf: DriverBuf,
+    ) -> Option<(DriverBuf, bool)> {
         for (_, socket) in self.sockets.raw.iter_mut() {
             let Some(RawMode::Ip {
                 version: bound_version,
@@ -828,7 +835,7 @@ impl Stack<'_> {
                 }
                 return Some((buf, true));
             } else {
-                socket.rx_enqueue(buf);
+                socket.rx_enqueue(Buf::from_driver_buf(buf));
                 return None;
             }
         }
@@ -917,7 +924,7 @@ mod test {
         );
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
-        let buf = socket.alloc().unwrap();
+        let buf = socket.alloc_buf().unwrap();
         assert!(buf.is_empty());
         assert_eq!(buf.headroom(), 0);
         drop(buf);
@@ -929,7 +936,7 @@ mod test {
             },
         ] {
             socket.bind(mode).unwrap();
-            let buf = socket.alloc().unwrap();
+            let buf = socket.alloc_buf().unwrap();
             assert!(buf.is_empty());
             assert!(buf.headroom() >= crate::test_device::TX_HEADROOM);
             assert_eq!(buf.tailroom() + buf.headroom(), buf.capacity());
@@ -982,7 +989,7 @@ mod test {
         bytes
     }
 
-    fn buf_from(bytes: &[u8]) -> PacketBuf {
+    fn buf_from(bytes: &[u8]) -> DriverBuf {
         let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
         buf.set_len(bytes.len());
         buf.copy_from_slice(bytes);
@@ -1097,12 +1104,12 @@ mod test {
         assert_eq!(socket.peek().err(), Some(RecvError::Exhausted));
 
         let packet = ipv4_packet(IP_PROTO, b"abcdef");
-        socket.state.rx_enqueue(buf_from(&packet));
+        socket.state.rx_enqueue(crate::Buf::from_driver_buf(buf_from(&packet)));
         assert!(socket.can_recv());
 
         // The whole packet, header included, byte for byte.
         assert_eq!(socket.peek().unwrap(), &packet[..]);
-        assert_eq!(&*socket.recv().unwrap(), &packet[..]);
+        assert_eq!(&socket.recv().unwrap()[..], &packet[..]);
         assert!(!socket.can_recv());
     }
 
@@ -1119,7 +1126,7 @@ mod test {
             .unwrap();
 
         let packet = ipv4_packet(IP_PROTO, b"abcdef");
-        socket.state.rx_enqueue(buf_from(&packet));
+        socket.state.rx_enqueue(crate::Buf::from_driver_buf(buf_from(&packet)));
 
         let mut slice = [0; 64];
         // Peeking does not dequeue.
@@ -1142,7 +1149,7 @@ mod test {
                 protocol: None,
             })
             .unwrap();
-        socket.state.rx_enqueue(buf_from(&ipv4_packet(IP_PROTO, b"abcdef")));
+        socket.state.rx_enqueue(crate::Buf::from_driver_buf(buf_from(&ipv4_packet(IP_PROTO, b"abcdef"))));
 
         let mut slice = [0; 4];
         // peek_slice keeps the packet...
@@ -1178,7 +1185,7 @@ mod test {
         let res = stack.process_raw_ip(IfaceHandle::new(0), IpVersion::V4, IP_PROTO, false, buf_from(&packet));
         assert!(res.is_none());
         assert!(!stack.raw_socket(h_icmp).can_recv());
-        assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &packet[..]);
+        assert_eq!(&stack.raw_socket(h_any).recv().unwrap()[..], &packet[..]);
 
         // A stack-handled protocol: the matching socket gets a copy, the original
         // is handed back for further processing.
@@ -1193,7 +1200,7 @@ mod test {
         let (res_buf, handled) = res.unwrap();
         assert_eq!(&*res_buf, &packet[..]);
         assert!(handled);
-        assert_eq!(&*stack.raw_socket(h_icmp).recv().unwrap(), &packet[..]);
+        assert_eq!(&stack.raw_socket(h_icmp).recv().unwrap()[..], &packet[..]);
         assert!(!stack.raw_socket(h_any).can_recv());
 
         // Version filter: an IPv6 packet skips the IPv4-bound socket.
@@ -1207,7 +1214,7 @@ mod test {
         );
         assert!(res.is_none());
         assert!(!stack.raw_socket(h_icmp).can_recv());
-        assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &packet[..]);
+        assert_eq!(&stack.raw_socket(h_any).recv().unwrap()[..], &packet[..]);
 
         // No socket matches: the buffer is handed back.
         stack.raw_socket(h_any).close();
@@ -1287,11 +1294,11 @@ mod test {
         let frame = eth_frame(ETHERTYPE_CUSTOM, b"hello");
         let res = stack.process_raw_ethernet(iface_a, ETHERTYPE_CUSTOM, false, buf_from(&frame));
         assert!(res.is_none());
-        assert_eq!(&*stack.raw_socket(h_custom).recv().unwrap(), &frame[..]);
+        assert_eq!(&stack.raw_socket(h_custom).recv().unwrap()[..], &frame[..]);
         assert!(!stack.raw_socket(h_any).can_recv());
         let res = stack.process_raw_ethernet(iface_b, ETHERTYPE_CUSTOM, false, buf_from(&frame));
         assert!(res.is_none());
-        assert_eq!(&*stack.raw_socket(h_custom).recv().unwrap(), &frame[..]);
+        assert_eq!(&stack.raw_socket(h_custom).recv().unwrap()[..], &frame[..]);
 
         // A stack-handled ethertype skips the filtered socket, and the wildcard
         // socket gets a copy while the original is handed back.
@@ -1299,7 +1306,7 @@ mod test {
         let res = stack.process_raw_ethernet(iface_a, EthernetProtocol::Arp, true, buf_from(&frame));
         assert_eq!(&*res.unwrap(), &frame[..]);
         assert!(!stack.raw_socket(h_custom).can_recv());
-        assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &frame[..]);
+        assert_eq!(&stack.raw_socket(h_any).recv().unwrap()[..], &frame[..]);
     }
 
     #[cfg(feature = "iface-bind")]
@@ -1325,11 +1332,11 @@ mod test {
         // One on the bound interface does.
         let res = stack.process_raw_ethernet(iface_a, ETHERTYPE_CUSTOM, false, buf_from(&frame));
         assert!(res.is_none());
-        assert_eq!(&*stack.raw_socket(handle).recv().unwrap(), &frame[..]);
+        assert_eq!(&stack.raw_socket(handle).recv().unwrap()[..], &frame[..]);
     }
 
     #[test]
-    fn test_send_packet() {
+    fn test_send_buf() {
         for mode in [
             RawMode::Ethernet {
                 ethertype: Some(ETHERTYPE_CUSTOM),
@@ -1362,16 +1369,19 @@ mod test {
             } else {
                 ipv4_packet(IP_PROTO, b"hello")
             };
-            let buf = buf_from(&bytes);
+            let mut buf = socket.alloc_buf().unwrap();
+            buf.reserve(0);
+            buf.set_len(bytes.len());
+            buf.copy_from_slice(&bytes);
             let ptr = buf.as_ptr();
             room.set(Some(0));
-            let (err, buf) = socket.send_packet(buf).unwrap_err();
+            let (err, buf) = socket.send_buf(buf).unwrap_err();
             assert_eq!(err, SendError::DeviceBusy);
             assert_eq!(buf.as_ptr(), ptr);
             assert_eq!(buf.headroom(), 0);
-            assert_eq!(&*buf, &bytes);
+            assert_eq!(&buf[..], &bytes[..]);
             room.set(None);
-            socket.send_packet(buf).unwrap();
+            socket.send_buf(buf).unwrap();
             assert_eq!(&*tx.borrow(), &[bytes]);
         }
     }
@@ -1534,7 +1544,7 @@ mod test {
         assert!(!stack.raw_socket(handle).can_recv());
         let res = stack.process_raw_ip(if1, IpVersion::V4, IP_PROTO, false, buf_from(&packet));
         assert!(res.is_none());
-        assert_eq!(&*stack.raw_socket(handle).recv().unwrap(), &packet[..]);
+        assert_eq!(&stack.raw_socket(handle).recv().unwrap()[..], &packet[..]);
 
         // Egress routes through the bound interface: the destination is
         // on-link for it, so the packet goes out of it.
@@ -1795,7 +1805,7 @@ mod test {
             let (res_buf, handled) = res.unwrap();
             assert_eq!(&*res_buf, &packet[..]);
             assert!(handled);
-            assert_eq!(&*stack.raw_socket(handle).recv().unwrap(), &packet[..]);
+            assert_eq!(&stack.raw_socket(handle).recv().unwrap()[..], &packet[..]);
         }
 
         // A socket filtered on (IPv6, ICMPv6) receives only that one.
@@ -1816,7 +1826,7 @@ mod test {
             assert_eq!(handled, wanted);
             assert_eq!(stack.raw_socket(handle).can_recv(), wanted);
             if wanted {
-                assert_eq!(&*stack.raw_socket(handle).recv().unwrap(), &packet[..]);
+                assert_eq!(&stack.raw_socket(handle).recv().unwrap()[..], &packet[..]);
             }
         }
 

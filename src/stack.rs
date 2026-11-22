@@ -14,7 +14,7 @@ use crate::config::TX_TIMESTAMP_QUEUE_COUNT;
 use crate::config::UDP_SOCKET_COUNT;
 #[cfg(feature = "packetmeta-timestamp")]
 use crate::driver::TxTimestamp;
-use crate::driver::{ChecksumCapabilities, Driver, PacketBuf};
+use crate::driver::{ChecksumCapabilities, Driver, DriverBuf};
 #[cfg(any(feature = "udp", feature = "_raw", feature = "tcp"))]
 use crate::error::Full;
 #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
@@ -32,6 +32,8 @@ use crate::iface::{AddIfaceError, Iface, IfaceHandle, IfaceIter, IfaceState, Med
 use crate::neighbor::NeighborState;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::neighbor::{Answer as NeighborAnswer, Key as NeighborKey, NeighborCache, ProbeEvent};
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+use crate::buffers::Buf;
 use crate::pool::PoolRef;
 use crate::rand::Rand;
 #[cfg(feature = "_raw")]
@@ -183,7 +185,7 @@ impl Blocked {
 
 /// The outcome of handing a packet to the egress path. An error hands the
 /// packet back, with what it waits for.
-pub(crate) type TxResult = Result<(), (Blocked, PacketBuf)>;
+pub(crate) type TxResult = Result<(), (Blocked, DriverBuf)>;
 
 /// What the last send a UDP or raw socket refused waits for. [`Stack::poll`]
 /// wakes the socket's send waker once it is there.
@@ -506,7 +508,7 @@ impl TxContext<'_, '_> {
     pub(crate) fn transmit_ip(
         &mut self,
         route: &EgressRoute,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         src_addr: IpAddr,
         dst_addr: IpAddr,
         next_header: IpProtocol,
@@ -541,7 +543,7 @@ impl TxContext<'_, '_> {
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
     #[cfg(feature = "raw-ethernet")]
-    pub(crate) fn transmit_ethernet(&mut self, iface: IfaceHandle, buf: PacketBuf) {
+    pub(crate) fn transmit_ethernet(&mut self, iface: IfaceHandle, buf: DriverBuf) {
         let iface = self.ifaces.get_mut(iface.index());
         self.inner.transmit_raw(iface, buf);
     }
@@ -550,7 +552,7 @@ impl TxContext<'_, '_> {
     ///
     /// A packet that would have to wait and can't is handed back unchanged.
     #[cfg(feature = "raw-ip")]
-    pub(crate) fn transmit_raw_ip(&mut self, route: &EgressRoute, buf: PacketBuf, dst_addr: IpAddr) -> TxResult {
+    pub(crate) fn transmit_raw_ip(&mut self, route: &EgressRoute, buf: DriverBuf, dst_addr: IpAddr) -> TxResult {
         let iface = self.ifaces.get_mut(route.iface.index());
         let ethertype = match dst_addr {
             #[cfg(feature = "ipv4")]
@@ -1355,7 +1357,7 @@ impl<'d> Stack<'d> {
         }
     }
 
-    fn process(&mut self, iface: IfaceHandle, buf: PacketBuf, now: Instant) {
+    fn process(&mut self, iface: IfaceHandle, buf: DriverBuf, now: Instant) {
         match self.ifaces.get(iface.index()).medium() {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => self.process_ethernet(iface, buf, now),
@@ -1367,7 +1369,7 @@ impl<'d> Stack<'d> {
     }
 
     #[cfg(feature = "medium-ethernet")]
-    fn process_ethernet(&mut self, iface: IfaceHandle, mut buf: PacketBuf, now: Instant) {
+    fn process_ethernet(&mut self, iface: IfaceHandle, mut buf: DriverBuf, now: Instant) {
         let eth_frame = check!(EthernetFrame::new_checked(&mut buf));
 
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
@@ -1410,7 +1412,7 @@ impl<'d> Stack<'d> {
     }
 
     #[cfg(feature = "medium-ip")]
-    fn process_ip(&mut self, iface: IfaceHandle, buf: PacketBuf, now: Instant) {
+    fn process_ip(&mut self, iface: IfaceHandle, buf: DriverBuf, now: Instant) {
         if buf.is_empty() {
             return;
         }
@@ -1427,7 +1429,7 @@ impl<'d> Stack<'d> {
     // medium never calls this.
     #[cfg(feature = "ipv4")]
     #[cfg_attr(not(any(feature = "medium-ethernet", feature = "medium-ip")), allow(dead_code))]
-    fn process_ipv4(&mut self, iface: IfaceHandle, eth_src: Option<EthernetAddress>, mut buf: PacketBuf, now: Instant) {
+    fn process_ipv4(&mut self, iface: IfaceHandle, eth_src: Option<EthernetAddress>, mut buf: DriverBuf, now: Instant) {
         let _ = now;
         let ipv4_packet = check!(Ipv4Packet::new_checked(&mut buf));
 
@@ -1615,7 +1617,7 @@ impl<'d> Stack<'d> {
         iface: IfaceHandle,
         src_addr: IpAddr,
         dst_addr: IpAddr,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         now: Instant,
     ) {
         // Per RFC 1122 §3.2.1.3, the unspecified address must never appear as a source
@@ -1691,7 +1693,7 @@ impl<'d> Stack<'d> {
         repr: &TcpRepr<'static>,
         src_addr: IpAddr,
         dst_addr: IpAddr,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
     ) {
         let Some((route, checksum_caps)) = self.route_reply(arrival, &dst_addr) else {
             return;
@@ -1704,7 +1706,7 @@ impl<'d> Stack<'d> {
     }
 
     #[cfg(feature = "ipv4")]
-    fn process_icmpv4(&mut self, iface: IfaceHandle, src_addr: Ipv4Addr, dst_addr: Ipv4Addr, mut buf: PacketBuf) {
+    fn process_icmpv4(&mut self, iface: IfaceHandle, src_addr: Ipv4Addr, dst_addr: Ipv4Addr, mut buf: DriverBuf) {
         let mut icmp_packet = check!(Icmpv4Packet::new_checked(&mut buf));
         if !self.ifaces.get(iface.index()).checksum_caps().icmpv4.rx && !icmp_packet.verify_checksum() {
             trace!("icmpv4: checksum incorrect");
@@ -1823,7 +1825,7 @@ impl<'d> Stack<'d> {
         &mut self,
         iface: IfaceHandle,
         ll_src: Option<HardwareAddress>,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         now: Instant,
     ) {
         let ipv6_packet = check!(Ipv6Packet::new_checked(&mut buf));
@@ -1954,7 +1956,7 @@ impl<'d> Stack<'d> {
         src_addr: Ipv6Addr,
         dst_addr: Ipv6Addr,
         hop_limit: u8,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         now: Instant,
     ) {
         #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
@@ -2093,7 +2095,7 @@ impl<'d> Stack<'d> {
                     // resolution with an ICMP destination unreachable error.
                     if let Some(packet) = parked {
                         #[cfg(feature = "icmp-errors")]
-                        self.deliver_neighbor_failure_error(iface, packet, now);
+                        self.deliver_neighbor_failure_error(iface, packet.into_driver_buf(), now);
                         #[cfg(not(feature = "icmp-errors"))]
                         drop(packet);
                     }
@@ -2116,7 +2118,7 @@ impl<'d> Stack<'d> {
         any(feature = "medium-ethernet", feature = "medium-ieee802154"),
         feature = "icmp-errors"
     ))]
-    fn deliver_neighbor_failure_error(&mut self, iface: IfaceHandle, mut orig: PacketBuf, now: Instant) {
+    fn deliver_neighbor_failure_error(&mut self, iface: IfaceHandle, mut orig: DriverBuf, now: Instant) {
         match IpVersion::of_packet(&orig) {
             #[cfg(feature = "ipv4")]
             Ok(IpVersion::V4) => {
@@ -2207,7 +2209,7 @@ impl<'d> Stack<'d> {
     pub(crate) fn transmit_icmpv4_error(
         &mut self,
         iface: IfaceHandle,
-        mut orig: PacketBuf,
+        mut orig: DriverBuf,
         msg_type: Icmpv4Message,
         msg_code: u8,
     ) {
@@ -2248,7 +2250,7 @@ impl<'d> Stack<'d> {
     pub(crate) fn transmit_icmpv6_error(
         &mut self,
         iface: IfaceHandle,
-        mut orig: PacketBuf,
+        mut orig: DriverBuf,
         msg_type: Icmpv6Message,
         msg_code: u8,
         pointer: u32,
@@ -2321,7 +2323,7 @@ impl<'d> Stack<'d> {
     fn transmit_reply(
         &mut self,
         route: &EgressRoute,
-        buf: PacketBuf,
+        buf: DriverBuf,
         src_addr: IpAddr,
         dst_addr: IpAddr,
         next_header: IpProtocol,
@@ -2338,7 +2340,7 @@ impl<'d> Stack<'d> {
 // because they serve both ingress (above) and socket egress (`TxContext`).
 impl StackInner {
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
-    fn process_arp(&mut self, iface: &mut IfaceState<'_>, mut buf: PacketBuf, now: Instant) {
+    fn process_arp(&mut self, iface: &mut IfaceState<'_>, mut buf: DriverBuf, now: Instant) {
         let arp_packet = check!(ArpPacket::new_checked(&mut buf));
 
         if arp_packet.hardware_type() != ArpHardware::Ethernet
@@ -2430,7 +2432,7 @@ impl StackInner {
         iface: &mut IfaceState<'_>,
         src_addr: Ipv6Addr,
         dst_addr: Ipv6Addr,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         now: Instant,
     ) {
         let icmp_packet = &mut Icmpv6Packet::new_unchecked(&mut buf);
@@ -2605,16 +2607,10 @@ impl StackInner {
         }
     }
 
-    /// Hand an IP packet whose next hop resolved to `hardware_addr` to the
+    /// Hand a parked IP packet whose next hop resolved to `hardware_addr` to the
     /// link layer of the interface's medium. `dst_addr` names the IP version.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn transmit_link(
-        &mut self,
-        iface: &mut IfaceState<'_>,
-        hardware_addr: HardwareAddress,
-        buf: PacketBuf,
-        dst_addr: IpAddr,
-    ) {
+    fn transmit_link(&mut self, iface: &mut IfaceState<'_>, hardware_addr: HardwareAddress, buf: Buf, dst_addr: IpAddr) {
         #[cfg(not(feature = "medium-ethernet"))]
         let _ = dst_addr;
         match hardware_addr {
@@ -2623,7 +2619,7 @@ impl StackInner {
                 // Only IPv4 is parked larger than the MTU, to be fragmented.
                 #[cfg(feature = "ipv4-fragmentation")]
                 if buf.len() > iface.ip_mtu {
-                    return self.fragment_ipv4(iface, HardwareAddress::Ethernet(hardware_addr), buf);
+                    return self.fragment_ipv4(iface, HardwareAddress::Ethernet(hardware_addr), buf.into_driver_buf());
                 }
                 let ethertype = match dst_addr {
                     #[cfg(feature = "ipv4")]
@@ -2631,10 +2627,12 @@ impl StackInner {
                     #[cfg(feature = "ipv6")]
                     IpAddr::V6(_) => EthernetProtocol::Ipv6,
                 };
-                self.transmit_ethernet(iface, hardware_addr, buf, ethertype)
+                self.transmit_ethernet(iface, hardware_addr, buf.into_driver_buf(), ethertype)
             }
             #[cfg(feature = "medium-ieee802154")]
-            HardwareAddress::Ieee802154(hardware_addr) => self.dispatch_ieee802154(iface, hardware_addr, buf),
+            HardwareAddress::Ieee802154(hardware_addr) => {
+                self.dispatch_ieee802154(iface, hardware_addr, buf.into_driver_buf())
+            }
             #[cfg(feature = "medium-ip")]
             HardwareAddress::Ip => unreachable!(),
         }
@@ -2784,7 +2782,7 @@ impl StackInner {
     pub(crate) fn transmit_ndisc(
         &mut self,
         iface: &mut IfaceState<'_>,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         src_addr: Ipv6Addr,
         dst_addr: Ipv6Addr,
     ) {
@@ -2807,7 +2805,7 @@ impl StackInner {
     /// The error says what the packet waits for. The caller leaves its state as
     /// it was, so the packet stays due.
     #[allow(dead_code)] // which builds use it depends on the features
-    pub(crate) fn alloc_obligation(&mut self, driver: &mut dyn Driver) -> Result<PacketBuf, Blocked> {
+    pub(crate) fn alloc_obligation(&mut self, driver: &mut dyn Driver) -> Result<DriverBuf, Blocked> {
         if !driver.can_transmit() {
             return Err(Blocked::DeviceBusy);
         }
@@ -2826,7 +2824,7 @@ impl StackInner {
         iface: &mut IfaceState<'_>,
         src_addr: Ipv4Addr,
         dst_addr: Ipv4Addr,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
     ) {
         push_ipv4_header(
             &mut buf,
@@ -2862,7 +2860,7 @@ impl StackInner {
         iface: &mut IfaceState<'_>,
         dst_addr: IpAddr,
         next_hop: IpAddr,
-        buf: PacketBuf,
+        buf: DriverBuf,
         ethertype: EthernetProtocol,
     ) -> TxResult {
         #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
@@ -2931,15 +2929,15 @@ impl StackInner {
     /// Park a packet on a neighbor that is being resolved, if it doesn't hold one
     /// already. Nothing is ever dropped to make room.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn park(&mut self, key: NeighborKey, buf: PacketBuf) -> TxResult {
-        match self.neighbor_cache.park(&key, buf) {
+    fn park(&mut self, key: NeighborKey, buf: DriverBuf) -> TxResult {
+        match self.neighbor_cache.park(&key, Buf::from_driver_buf(buf)) {
             Ok(()) => {
                 debug!("neighbor {} pending, parking packet", key.1);
                 Ok(())
             }
             Err(buf) => {
                 trace!("neighbor {} pending, and already holds a packet", key.1);
-                Err((Blocked::Neighbor, buf))
+                Err((Blocked::Neighbor, buf.into_driver_buf()))
             }
         }
     }
@@ -2949,7 +2947,7 @@ impl StackInner {
         &mut self,
         iface: &mut IfaceState<'_>,
         dst_hw: EthernetAddress,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         ethertype: EthernetProtocol,
     ) {
         buf.push_front(ETHERNET_HEADER_LEN);
@@ -2960,7 +2958,7 @@ impl StackInner {
         self.transmit_raw(iface, buf);
     }
 
-    pub(crate) fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
+    pub(crate) fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: DriverBuf) {
         debug_assert!(buf.headroom() >= iface.caps.tx_headroom);
 
         #[cfg(feature = "packet-log")]
@@ -2995,7 +2993,7 @@ fn packet_log_layer(medium: Medium) -> crate::packet_log::Layer {
 #[cfg(feature = "ipv4")]
 #[inline(never)] // helps code size
 pub(crate) fn push_ipv4_header(
-    buf: &mut PacketBuf,
+    buf: &mut DriverBuf,
     src_addr: Ipv4Addr,
     dst_addr: Ipv4Addr,
     next_header: IpProtocol,
@@ -3029,7 +3027,7 @@ pub(crate) fn push_ipv4_header(
 /// Prepend an IPv6 header to a fully-built L4 payload.
 #[cfg(feature = "ipv6")]
 pub(crate) fn push_ipv6_header(
-    buf: &mut PacketBuf,
+    buf: &mut DriverBuf,
     src_addr: Ipv6Addr,
     dst_addr: Ipv6Addr,
     next_header: IpProtocol,
@@ -3060,7 +3058,7 @@ const ICMP_ERROR_HEADER_LEN: usize = 8;
 /// The quote is moved back if the packet has less room in front than that.
 /// Returns `false`, with the packet left as it was, if the buffer can't hold
 /// the headers at all.
-fn quote_in_place(packet: &mut PacketBuf, headroom: usize, max_quote: usize) -> bool {
+fn quote_in_place(packet: &mut DriverBuf, headroom: usize, max_quote: usize) -> bool {
     let headroom = headroom + ICMP_ERROR_HEADER_LEN;
     if headroom > packet.capacity() {
         return false;
@@ -3086,7 +3084,7 @@ fn quote_in_place(packet: &mut PacketBuf, headroom: usize, max_quote: usize) -> 
 /// Returns `false` if the buffer can't hold it.
 #[cfg(feature = "ipv4")]
 fn make_icmpv4_error(
-    packet: &mut PacketBuf,
+    packet: &mut DriverBuf,
     ip_headroom: usize,
     msg_type: Icmpv4Message,
     msg_code: u8,
@@ -3123,7 +3121,7 @@ fn make_icmpv4_error(
 #[cfg(feature = "ipv6")]
 #[allow(clippy::too_many_arguments)]
 fn make_icmpv6_error(
-    packet: &mut PacketBuf,
+    packet: &mut DriverBuf,
     ip_headroom: usize,
     src_addr: &Ipv6Addr,
     dst_addr: &Ipv6Addr,
@@ -4504,7 +4502,7 @@ pub(crate) mod test {
         stack.udp_socket(handle).bind(7, ListenSocketAddr::UNSPECIFIED).unwrap();
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
-        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"echo?");
+        assert_eq!(&stack.udp_socket(handle).recv().unwrap()[..], b"echo?");
     }
 
     #[test]
@@ -4525,7 +4523,7 @@ pub(crate) mod test {
         inject(&mut stack, &rx, packet.clone());
 
         assert!(tx.borrow().is_empty());
-        assert_eq!(&*stack.raw_socket(handle).recv().unwrap(), &packet[..]);
+        assert_eq!(&stack.raw_socket(handle).recv().unwrap()[..], &packet[..]);
     }
 
     #[test]
@@ -5611,9 +5609,10 @@ pub(crate) mod test {
         let mut buf = crate::pool::test_pool_ref().alloc().unwrap();
         buf.set_len(packet.len());
         buf.copy_from_slice(&packet);
+        let buf = crate::Buf::from_driver_buf(buf);
         stack
             .raw_socket(handle)
-            .send_packet(buf)
+            .send_buf(buf)
             .map_err(|(err, _)| err)
             .unwrap();
         assert_eq!(big.tx.borrow().len(), 2);
@@ -6989,7 +6988,7 @@ pub(crate) mod test {
             .bind(5000, ListenSocketAddr::UNSPECIFIED)
             .unwrap();
         inject(&mut stack, &rx, packet.clone());
-        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"hello");
+        assert_eq!(&stack.udp_socket(handle).recv().unwrap()[..], b"hello");
 
         let (mut stack, rx, _tx) = test_stack(Medium::Ip);
         let handle = stack.add_udp_socket().unwrap();
@@ -7630,7 +7629,7 @@ pub(crate) mod test {
         }
         assert!(!stack.udp_socket(udp).can_recv());
         let copy = stack.raw_socket(raw).recv().unwrap();
-        assert_eq!(&*copy, &packet[..]);
+        assert_eq!(&copy[..], &packet[..]);
     }
 
     /// IPv4 source selection: the address on the destination's subnet, else the
@@ -7770,13 +7769,13 @@ pub(crate) mod test {
         let v6 = ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol::Icmpv6, &reply);
         inject(&mut stack, &rx, v6.clone());
         assert!(tx.borrow().is_empty());
-        assert_eq!(&*stack.raw_socket(raw).recv().unwrap(), &v6[..]);
+        assert_eq!(&stack.raw_socket(raw).recv().unwrap()[..], &v6[..]);
 
         let reply = icmpv4_echo(Icmpv4Message::EchoReply, 0, 0, b"Lorem Ipsum");
         let v4 = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &reply);
         inject(&mut stack, &rx, v4.clone());
         assert!(tx.borrow().is_empty());
-        assert_eq!(&*stack.raw_socket(raw).recv().unwrap(), &v4[..]);
+        assert_eq!(&stack.raw_socket(raw).recv().unwrap()[..], &v4[..]);
     }
 
     /// A neighbor advertisement from `src_addr` to `dst_addr` about `target`,
@@ -8293,7 +8292,7 @@ pub(crate) mod test {
             );
             let recv = stack.raw_socket(raw).recv().unwrap();
             assert_eq!(recv.len(), IPV4_HEADER_LEN + 4);
-            assert_eq!(&*recv, &packet[..]);
+            assert_eq!(&recv[..], &packet[..]);
 
             let packet = ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol(99), b"abcd");
             let mut padded = packet.clone();
@@ -8305,7 +8304,7 @@ pub(crate) mod test {
             );
             let recv = stack.raw_socket(raw).recv().unwrap();
             assert_eq!(recv.len(), IPV6_HEADER_LEN + 4);
-            assert_eq!(&*recv, &packet[..]);
+            assert_eq!(&recv[..], &packet[..]);
         }
 
         // Shorter than the length field claims: dropped, not delivered.
@@ -8356,8 +8355,8 @@ pub(crate) mod test {
     }
 
     /// Take every buffer of `pool` but `free` of them.
-    fn hold_all_but(pool: &'static impl crate::pool::Pool, free: usize) -> Vec<PacketBuf> {
-        let mut held: Vec<PacketBuf> = core::iter::from_fn(|| pool.alloc()).collect();
+    fn hold_all_but(pool: &'static impl crate::pool::Pool, free: usize) -> Vec<DriverBuf> {
+        let mut held: Vec<DriverBuf> = core::iter::from_fn(|| pool.alloc()).collect();
         for _ in 0..free {
             drop(held.pop());
         }
@@ -8445,7 +8444,7 @@ pub(crate) mod test {
         }
 
         // The one buffer is free again.
-        let free: Vec<PacketBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
+        let free: Vec<DriverBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
         assert_eq!(free.len(), 1);
     }
 
@@ -8524,7 +8523,7 @@ pub(crate) mod test {
         assert!(stack.ifaces.get(0).fragmenter.is_idle());
         assert_eq!(stack.poll(t), idle_deadline(t));
         // No buffer is left behind.
-        let free: Vec<PacketBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
+        let free: Vec<DriverBuf> = core::iter::from_fn(|| POOL.alloc()).collect();
         assert_eq!(free.len(), 16);
     }
 

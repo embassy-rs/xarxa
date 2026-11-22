@@ -1,7 +1,7 @@
 //! Reassembly of incoming fragments: IPv4 (feature `ipv4-reassembly`) and
 //! 6LoWPAN (feature `sixlowpan-reassembly`).
 //!
-//! The fragments of one datagram are copied into a `PacketBuf` taken from the
+//! The fragments of one datagram are copied into a `DriverBuf` taken from the
 //! pool, at their offsets, and the buffer is handed up the stack whole once the
 //! last hole is filled. So a reassembled packet must fit one buffer of the pool,
 //! and each datagram being reassembled pins one pool buffer until it completes or
@@ -10,7 +10,8 @@
 use core::fmt;
 
 use crate::config::REASSEMBLY_BUFFER_COUNT;
-use crate::driver::PacketBuf;
+use crate::driver::DriverBuf;
+use crate::buffers::Buf;
 use crate::pool::PoolRef;
 use crate::stack::Stack;
 use crate::storage::Assembler;
@@ -56,12 +57,13 @@ pub(crate) struct Fragment<'a, K> {
 
 /// Holds different fragments of one packet, used for assembling fragmented packets.
 ///
-/// The fragments are assembled into a `PacketBuf`, taken from the pool when the
-/// first one arrives and handed out whole by [`assemble`](Self::assemble).
+/// The fragments are assembled into a buffer, taken from the pool when the
+/// first one arrives and handed out whole by [`assemble`](Self::assemble). It
+/// waits for the other fragments, so it is a [`Buf`].
 #[derive(Debug)]
 pub struct PacketAssembler<K> {
     key: Option<K>,
-    buffer: Option<PacketBuf>,
+    buffer: Option<Buf>,
 
     assembler: Assembler,
     total_size: Option<usize>,
@@ -90,9 +92,9 @@ impl<K> PacketAssembler<K> {
     }
 
     /// The buffer the fragments are assembled into, taken from the pool on first use.
-    fn buffer(&mut self, pool: PoolRef) -> Result<&mut PacketBuf, AssemblerError> {
+    fn buffer(&mut self, pool: PoolRef) -> Result<&mut Buf, AssemblerError> {
         if self.buffer.is_none() {
-            self.buffer = Some(pool.alloc().ok_or(AssemblerError)?);
+            self.buffer = Some(Buf::from_driver_buf(pool.alloc().ok_or(AssemblerError)?));
         }
         // NOTE(unwrap): filled in just above.
         Ok(unwrap!(self.buffer.as_mut()))
@@ -158,7 +160,7 @@ impl<K> PacketAssembler<K> {
 
     /// Get the reassembled packet, if reassembly is complete.
     /// This will mark the assembler as empty, so that it can be reused.
-    fn assemble(&mut self, pool: PoolRef) -> Option<PacketBuf> {
+    fn assemble(&mut self, pool: PoolRef) -> Option<DriverBuf> {
         if !self.is_complete() {
             return None;
         }
@@ -168,7 +170,7 @@ impl<K> PacketAssembler<K> {
         self.buffer(pool).ok()?.set_len(total_size);
         let buffer = self.buffer.take();
         self.reset();
-        buffer
+        buffer.map(Buf::into_driver_buf)
     }
 
     /// Returns `true` when all fragments have been received, otherwise `false`.
@@ -212,7 +214,7 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
         frag: Fragment<'_, K>,
         now: Instant,
         timeout: Duration,
-    ) -> Option<PacketBuf> {
+    ) -> Option<DriverBuf> {
         let end = frag.offset + frag.data.len();
         if end > frag.max_size || frag.total_size.is_some_and(|total_size| total_size > frag.max_size) {
             debug!("fragmented packet too large for a packet buffer");
@@ -354,7 +356,7 @@ impl Stack<'_> {
     /// fragment's IP header in front, patched to describe the whole datagram.
     /// `None` while the packet is incomplete, or if the fragment was dropped.
     #[cfg(feature = "ipv4-reassembly")]
-    pub(crate) fn reassemble_ipv4(&mut self, mut buf: PacketBuf, now: Instant) -> Option<PacketBuf> {
+    pub(crate) fn reassemble_ipv4(&mut self, mut buf: DriverBuf, now: Instant) -> Option<DriverBuf> {
         let ipv4_packet = Ipv4Packet::new_unchecked(&mut buf);
         let header_len = ipv4_packet.header_len() as usize;
         let offset = ipv4_packet.frag_offset() as usize;

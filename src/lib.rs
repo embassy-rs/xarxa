@@ -35,6 +35,7 @@ mod fmt;
 #[macro_use]
 mod macros;
 
+mod buffers;
 pub mod config;
 
 #[cfg(feature = "dns")]
@@ -77,6 +78,8 @@ pub mod wire;
 
 /// The driver interface, re-exported for driver crates and code that names their types.
 pub use xarxa_driver as driver;
+
+pub use buffers::Buf;
 
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 pub use neighbor::{Neighbor, NeighborCache, NeighborState};

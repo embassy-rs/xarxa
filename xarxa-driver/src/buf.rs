@@ -1,7 +1,7 @@
 //! Owned packet buffers.
 //!
-//! Every packet in the stack is a [`PacketBuf`]: one buffer, owned by whoever
-//! holds it (the driver, the stack, a socket, the application).
+//! A [`DriverBuf`] is a packet buffer on its way to or from a device: one
+//! buffer, owned by whoever holds it.
 //!
 //! Buffers come from the network stack's pool. A driver gets the buffers it
 //! receives frames into from the stack, with
@@ -14,15 +14,15 @@ use core::ptr::NonNull;
 
 use crate::meta::PacketMeta;
 
-/// The bookkeeping of one [`PacketBuf`]: where its storage is, its headroom and
+/// The bookkeeping of one [`DriverBuf`]: where its storage is, its headroom and
 /// length, its metadata, and how to free it.
 ///
 /// Only pool implementations deal with this type. They keep one for each buffer,
-/// fill it in, and pass it to [`PacketBuf::from_raw`].
-pub struct RawPacketBuf {
-    /// Called with this `RawPacketBuf` when the buffer is dropped. It gives the buffer
+/// fill it in, and pass it to [`DriverBuf::from_raw`].
+pub struct RawDriverBuf {
+    /// Called with this `RawDriverBuf` when the buffer is dropped. It gives the buffer
     /// back to its pool.
-    pub free: unsafe fn(NonNull<RawPacketBuf>),
+    pub free: unsafe fn(NonNull<RawDriverBuf>),
     /// For the pool's own use, for example to find itself in `free`. The buffer
     /// never reads it.
     pub pool: *const (),
@@ -38,24 +38,24 @@ pub struct RawPacketBuf {
     pub meta: PacketMeta,
 }
 
-/// An owned network packet buffer.
+/// An owned network packet buffer, on its way to or from a device.
 ///
 /// ```text
 /// | headroom | data (len) | tailroom |
 /// ```
 ///
 /// Dropping it gives it back to the pool it came from.
-pub struct PacketBuf {
-    raw: NonNull<RawPacketBuf>,
+pub struct DriverBuf {
+    raw: NonNull<RawDriverBuf>,
 }
 
-// SAFETY: a `PacketBuf` is the unique owner of its `RawPacketBuf` and storage, like a
+// SAFETY: a `DriverBuf` is the unique owner of its `RawDriverBuf` and storage, like a
 // `Box` of them. Its `free` can be called from any thread (see `from_raw`).
-unsafe impl Send for PacketBuf {}
-unsafe impl Sync for PacketBuf {}
+unsafe impl Send for DriverBuf {}
+unsafe impl Sync for DriverBuf {}
 
-impl PacketBuf {
-    /// Make a buffer out of a `RawPacketBuf` a pool filled in.
+impl DriverBuf {
+    /// Make a buffer out of a `RawDriverBuf` a pool filled in.
     ///
     /// For pool implementations. Dropping the buffer calls `raw.free` with `raw`.
     ///
@@ -72,19 +72,19 @@ impl PacketBuf {
     ///   called.
     /// - `free` must be safe to call once with `raw`, from any thread, after
     ///   the buffer is dropped.
-    pub unsafe fn from_raw(raw: NonNull<RawPacketBuf>) -> Self {
+    pub unsafe fn from_raw(raw: NonNull<RawDriverBuf>) -> Self {
         Self { raw }
     }
 
     #[inline]
-    fn raw(&self) -> &RawPacketBuf {
-        // SAFETY: we own the `RawPacketBuf` for as long as `self` exists.
+    fn raw(&self) -> &RawDriverBuf {
+        // SAFETY: we own the `RawDriverBuf` for as long as `self` exists.
         unsafe { self.raw.as_ref() }
     }
 
     #[inline]
-    fn raw_mut(&mut self) -> &mut RawPacketBuf {
-        // SAFETY: we own the `RawPacketBuf` for as long as `self` exists, and `&mut self`
+    fn raw_mut(&mut self) -> &mut RawDriverBuf {
+        // SAFETY: we own the `RawDriverBuf` for as long as `self` exists, and `&mut self`
         // makes this the only reference.
         unsafe { self.raw.as_mut() }
     }
@@ -219,17 +219,17 @@ impl PacketBuf {
     }
 }
 
-impl Drop for PacketBuf {
+impl Drop for DriverBuf {
     #[inline(never)] // helps code size
     fn drop(&mut self) {
         let free = self.raw().free;
-        // SAFETY: `from_raw` was given this `RawPacketBuf`, and the buffer is never used
+        // SAFETY: `from_raw` was given this `RawDriverBuf`, and the buffer is never used
         // again.
         unsafe { free(self.raw) }
     }
 }
 
-impl Deref for PacketBuf {
+impl Deref for DriverBuf {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         let raw = self.raw();
@@ -241,7 +241,7 @@ impl Deref for PacketBuf {
     }
 }
 
-impl DerefMut for PacketBuf {
+impl DerefMut for DriverBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
         let raw = self.raw();
         let start = raw.headroom;
@@ -252,9 +252,9 @@ impl DerefMut for PacketBuf {
     }
 }
 
-impl fmt::Debug for PacketBuf {
+impl fmt::Debug for DriverBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PacketBuf")
+        f.debug_struct("DriverBuf")
             .field("headroom", &self.headroom())
             .field("len", &self.len())
             .finish()
@@ -262,9 +262,9 @@ impl fmt::Debug for PacketBuf {
 }
 
 #[cfg(feature = "defmt")]
-impl defmt::Format for PacketBuf {
+impl defmt::Format for DriverBuf {
     fn format(&self, f: defmt::Formatter<'_>) {
-        defmt::write!(f, "PacketBuf {{ headroom: {}, len: {} }}", self.headroom(), self.len());
+        defmt::write!(f, "DriverBuf {{ headroom: {}, len: {} }}", self.headroom(), self.len());
     }
 }
 
@@ -282,22 +282,22 @@ mod tests {
         out: Mutex<usize>,
     }
 
-    /// One heap buffer. The `RawPacketBuf` comes first, so a pointer to it is a pointer
+    /// One heap buffer. The `RawDriverBuf` comes first, so a pointer to it is a pointer
     /// to the whole thing.
     #[repr(C)]
     struct TestBuf {
-        raw: MaybeUninit<RawPacketBuf>,
+        raw: MaybeUninit<RawDriverBuf>,
         data: [u8; SIZE],
     }
 
     impl TestPool {
-        fn alloc(&'static self) -> Option<PacketBuf> {
+        fn alloc(&'static self) -> Option<DriverBuf> {
             *self.out.lock().unwrap() += 1;
             let buf = Box::leak(Box::new(TestBuf {
                 raw: MaybeUninit::uninit(),
                 data: [0xa5; SIZE],
             }));
-            let raw = buf.raw.write(RawPacketBuf {
+            let raw = buf.raw.write(RawDriverBuf {
                 free,
                 pool: (self as *const TestPool).cast(),
                 data: NonNull::from(&mut buf.data).cast(),
@@ -307,13 +307,13 @@ mod tests {
                 meta: PacketMeta::default(),
             });
             // SAFETY: the allocation is fresh and only given to this buffer.
-            // `free` gets back the `RawPacketBuf` of a `TestBuf`.
-            Some(unsafe { PacketBuf::from_raw(NonNull::from(raw)) })
+            // `free` gets back the `RawDriverBuf` of a `TestBuf`.
+            Some(unsafe { DriverBuf::from_raw(NonNull::from(raw)) })
         }
     }
 
-    unsafe fn free(raw: NonNull<RawPacketBuf>) {
-        // SAFETY: the `RawPacketBuf` is the first field of a `TestBuf` from `Box::leak`,
+    unsafe fn free(raw: NonNull<RawDriverBuf>) {
+        // SAFETY: the `RawDriverBuf` is the first field of a `TestBuf` from `Box::leak`,
         // and its pool is a `&'static TestPool`.
         unsafe {
             let pool = &*raw.as_ref().pool.cast::<TestPool>();

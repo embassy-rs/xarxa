@@ -1,11 +1,11 @@
 //! Packet pool exhaustion. The test has a pool of its own, so it can take every
 //! buffer in it.
 
-use xarxa::driver::PacketBuf;
+use xarxa::driver::DriverBuf;
 use xarxa::iface::Medium;
 use xarxa::udp::SendError;
 use xarxa::wire::{HardwareAddress, IpCidr, Ipv4Addr, ListenSocketAddr, SocketAddr};
-use xarxa::{Pool, Stack, StaticPool};
+use xarxa::{Buf, Pool, Stack, StaticPool};
 
 use test_device::TestDevice;
 
@@ -43,7 +43,7 @@ fn exhaustion() {
     assert!(!held.is_empty());
     assert!(POOL.alloc().is_none());
 
-    assert!(stack.udp_socket(udp).alloc().is_none());
+    assert!(stack.udp_socket(udp).alloc_buf().is_none());
 
     // A send now fails, and the socket is unharmed.
     assert_eq!(
@@ -53,17 +53,17 @@ fn exhaustion() {
     assert!(stack.udp_socket(udp).is_open());
 
     // An owned send needs no free buffer, even without reserved headroom.
-    let mut buf = held.pop().unwrap();
+    let mut buf = Buf::from_driver_buf(held.pop().unwrap());
     buf.set_len(5);
     buf.copy_from_slice(b"hello");
-    stack.udp_socket(udp).send_packet(buf, dst).unwrap();
-    let mut buf = stack.udp_socket(udp).alloc().unwrap();
+    stack.udp_socket(udp).send_buf(buf, dst).unwrap();
+    let mut buf = stack.udp_socket(udp).alloc_buf().unwrap();
     assert!(buf.is_empty());
     assert!(buf.headroom() >= test_device::TX_HEADROOM + 20 + 8);
     buf.set_len(5);
     buf.copy_from_slice(b"hello");
-    stack.udp_socket(udp).send_packet(buf, dst).unwrap();
-    held.push(stack.udp_socket(udp).alloc().unwrap());
+    stack.udp_socket(udp).send_buf(buf, dst).unwrap();
+    held.push(stack.udp_socket(udp).alloc_buf().unwrap().into_driver_buf());
     assert!(POOL.alloc().is_none());
 
     // Freeing one buffer is enough for a send. Taking it back starves sends again.
@@ -222,7 +222,7 @@ fn exhaustion() {
 
         /// Hands the stack one junk frame, which it drops. That frees a buffer in
         /// the middle of a poll, as a driver reclaiming a sent frame would.
-        struct Junk(Option<PacketBuf>);
+        struct Junk(Option<DriverBuf>);
         impl Driver for Junk {
             fn capabilities(&self) -> Capabilities {
                 let mut caps = Capabilities::default();
@@ -236,14 +236,14 @@ fn exhaustion() {
             fn rx_wanted(&mut self) -> usize {
                 0
             }
-            fn rx_give(&mut self, _buf: PacketBuf) {}
-            fn receive(&mut self) -> Option<PacketBuf> {
+            fn rx_give(&mut self, _buf: DriverBuf) {}
+            fn receive(&mut self) -> Option<DriverBuf> {
                 self.0.take()
             }
             fn can_transmit(&mut self) -> bool {
                 true
             }
-            fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
+            fn transmit(&mut self, _buf: DriverBuf) -> Result<(), DriverBuf> {
                 Ok(())
             }
         }

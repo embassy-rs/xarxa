@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{Align, Pool, Slot, ValidAlign, check_buf_capacity};
-use crate::driver::{PacketBuf, PacketMeta, RawPacketBuf};
+use crate::driver::{DriverBuf, PacketMeta, RawDriverBuf};
 
 /// Statically allocated [`Pool`].
 ///
@@ -41,7 +41,7 @@ pub struct StaticPool<const SIZE: usize = 1514, const COUNT: usize = 16, const A
 where
     Align<ALIGN>: ValidAlign,
 {
-    /// `used[i]` is set while slot `i` is owned by a `PacketBuf`.
+    /// `used[i]` is set while slot `i` is owned by a `DriverBuf`.
     used: [AtomicBool; COUNT],
     /// Perf optimization:
     /// - On free, store index in `next`.
@@ -50,8 +50,8 @@ where
     slots: [UnsafeCell<Slot<SIZE, ALIGN>>; COUNT],
 }
 
-// SAFETY: a slot is handed to at most one `PacketBuf` at a time. Its flag is
-// set by the one `alloc` that wins it, and cleared only when that `PacketBuf`
+// SAFETY: a slot is handed to at most one `DriverBuf` at a time. Its flag is
+// set by the one `alloc` that wins it, and cleared only when that `DriverBuf`
 // is dropped, in `free`. So no two threads ever touch the same slot, and the
 // flags are atomic.
 unsafe impl<const SIZE: usize, const COUNT: usize, const ALIGN: usize> Sync for StaticPool<SIZE, COUNT, ALIGN> where
@@ -135,9 +135,9 @@ where
     /// Give a buffer back to its pool. Called when it is dropped.
     ///
     /// # Safety
-    /// `raw` must be the `RawPacketBuf` `alloc` gave the buffer, and the buffer must
+    /// `raw` must be the `RawDriverBuf` `alloc` gave the buffer, and the buffer must
     /// no longer be used.
-    unsafe fn free(raw: NonNull<RawPacketBuf>) {
+    unsafe fn free(raw: NonNull<RawDriverBuf>) {
         // SAFETY: `alloc` set `raw.pool` to a `&'static Self`. `raw`
         // is the first field of one of its slots, so a pointer to that slot.
         let (pool, index) = unsafe {
@@ -166,7 +166,7 @@ where
     Align<ALIGN>: ValidAlign,
 {
     #[inline(never)] // helps code size: it has many callers
-    fn alloc(&'static self) -> Option<PacketBuf> {
+    fn alloc(&'static self) -> Option<DriverBuf> {
         let index = self.claim()?;
         let slot = self.slots[index].get();
         // SAFETY: the slot is ours (its flag is set), and nothing else points into
@@ -176,8 +176,8 @@ where
             // Catch code that relies on fresh buffers being zeroed.
             #[cfg(test)]
             data.write_bytes(0xa5, SIZE);
-            let raw = (&raw mut (*slot).raw).cast::<RawPacketBuf>();
-            raw.write(RawPacketBuf {
+            let raw = (&raw mut (*slot).raw).cast::<RawDriverBuf>();
+            raw.write(RawDriverBuf {
                 free: Self::free,
                 pool: (self as *const Self).cast(),
                 data: NonNull::new_unchecked(data),
@@ -186,9 +186,9 @@ where
                 len: 0,
                 meta: PacketMeta::default(),
             });
-            // `free` gets back this slot's `RawPacketBuf`, whose `pool` is this pool,
+            // `free` gets back this slot's `RawDriverBuf`, whose `pool` is this pool,
             // which is `'static`.
-            Some(PacketBuf::from_raw(NonNull::new_unchecked(raw)))
+            Some(DriverBuf::from_raw(NonNull::new_unchecked(raw)))
         }
     }
 

@@ -7,8 +7,10 @@
 //! written into the space the uncompressed one occupied, and the other way
 //! around, with the headroom taking up the difference.
 
+#[cfg(feature = "sixlowpan-fragmentation")]
+use crate::buffers::Buf;
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
-use crate::driver::PacketBuf;
+use crate::driver::DriverBuf;
 use crate::error::{Full, Malformed};
 #[cfg(feature = "sixlowpan-fragmentation")]
 use crate::fragmentation::{Fragmenter, SixlowpanFragmenter};
@@ -136,7 +138,7 @@ impl Iface<'_, '_> {
 
 // Ingress.
 impl Stack<'_> {
-    pub(crate) fn process_ieee802154(&mut self, iface: IfaceHandle, mut buf: PacketBuf, now: Instant) {
+    pub(crate) fn process_ieee802154(&mut self, iface: IfaceHandle, mut buf: DriverBuf, now: Instant) {
         let (ieee802154_repr, header_len) = check!(Ieee802154Repr::parse(&buf));
 
         if ieee802154_repr.frame_type != Ieee802154FrameType::Data {
@@ -172,7 +174,7 @@ impl Stack<'_> {
         &mut self,
         iface: IfaceHandle,
         ieee802154_repr: &Ieee802154Repr,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         now: Instant,
     ) {
         let buf = match check!(SixlowpanPacket::dispatch(&buf)) {
@@ -250,7 +252,7 @@ fn ext_header_len(data_len: usize) -> usize {
 /// fragment of one, since the payload length and the UDP length fields can
 /// not be measured then. `None` for a complete packet.
 pub(crate) fn sixlowpan_to_ipv6(
-    buf: &mut PacketBuf,
+    buf: &mut DriverBuf,
     ll_src_addr: Option<Ieee802154Address>,
     ll_dst_addr: Option<Ieee802154Address>,
     address_context: &[SixlowpanAddressContext],
@@ -439,7 +441,7 @@ struct ExtHeader {
 ///
 /// Returns the difference between the uncompressed and the compressed header
 /// chain lengths, which fragmentation needs for its offsets.
-pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr) -> Result<usize, Malformed> {
+pub(crate) fn ipv6_to_sixlowpan(buf: &mut DriverBuf, ieee_repr: &Ieee802154Repr) -> Result<usize, Malformed> {
     // Parse the uncompressed chain.
     let packet = Ipv6Packet::new_checked(buf)?;
     let src_addr = packet.src_addr();
@@ -586,7 +588,7 @@ impl StackInner {
         &mut self,
         iface: &mut IfaceState<'_>,
         ll_dst_a: Ieee802154Address,
-        buf: PacketBuf,
+        buf: DriverBuf,
     ) {
         let ll_src_a = iface.ieee802154_addr();
 
@@ -608,7 +610,7 @@ impl StackInner {
         self.dispatch_sixlowpan(iface, buf, ieee_repr);
     }
 
-    fn dispatch_sixlowpan(&mut self, iface: &mut IfaceState<'_>, mut buf: PacketBuf, ieee_repr: Ieee802154Repr) {
+    fn dispatch_sixlowpan(&mut self, iface: &mut IfaceState<'_>, mut buf: DriverBuf, ieee_repr: Ieee802154Repr) {
         let header_diff = match ipv6_to_sixlowpan(&mut buf, &ieee_repr) {
             Ok(header_diff) => header_diff,
             Err(_) => {
@@ -625,7 +627,7 @@ impl StackInner {
 
         if total_size + ieee_len > mtu {
             #[cfg(feature = "sixlowpan-fragmentation")]
-            self.fragment_sixlowpan(iface, buf, ieee_repr, header_diff);
+            self.fragment_sixlowpan(iface, Buf::from_driver_buf(buf), ieee_repr, header_diff);
 
             #[cfg(not(feature = "sixlowpan-fragmentation"))]
             debug!("Enable the `sixlowpan-fragmentation` feature for fragmentation support.");
@@ -653,9 +655,9 @@ impl Stack<'_> {
         &mut self,
         iface: IfaceHandle,
         ieee802154_repr: &Ieee802154Repr,
-        mut buf: PacketBuf,
+        mut buf: DriverBuf,
         now: Instant,
-    ) -> Option<PacketBuf> {
+    ) -> Option<DriverBuf> {
         use crate::reassembly::{FragKey, Fragment};
 
         // The key needs both link-layer addresses.
@@ -737,7 +739,7 @@ impl StackInner {
     fn fragment_sixlowpan(
         &mut self,
         iface: &mut IfaceState<'_>,
-        buf: PacketBuf,
+        buf: Buf,
         ieee_repr: Ieee802154Repr,
         header_diff: usize,
     ) {
@@ -792,7 +794,7 @@ impl StackInner {
 
     /// Fill `tx_buffer` with the next fragment of the 6LoWPAN packet in the
     /// interface's fragmenter, and transmit it.
-    pub(crate) fn dispatch_ieee802154_frag(&mut self, iface: &mut IfaceState<'_>, mut tx_buffer: PacketBuf) {
+    pub(crate) fn dispatch_ieee802154_frag(&mut self, iface: &mut IfaceState<'_>, mut tx_buffer: DriverBuf) {
         tx_buffer.reserve(iface.caps.tx_headroom);
         let Fragmenter::Sixlowpan(frag) = &mut iface.fragmenter else {
             return;

@@ -20,7 +20,9 @@ use crate::error::InvalidHopLimit;
 use crate::iface::IfaceHandle;
 #[cfg(feature = "async")]
 use crate::stack::TxWait;
-use crate::stack::{Blocked, EgressRoute, IfaceBinding, Stack, TxContext, addr_score, alloc_ephemeral_port};
+use crate::stack::{
+    Blocked, EgressRoute, IfaceBinding, IngressInfo, Stack, TxContext, addr_score, alloc_ephemeral_port,
+};
 use crate::storage::Slab;
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -1132,13 +1134,14 @@ impl Stack<'_> {
     /// `recv` can parse the addresses back out of it.
     pub(crate) fn process_udp(
         &mut self,
-        iface: IfaceHandle,
+        info: IngressInfo,
         src_addr: IpAddr,
         dst_addr: IpAddr,
         ip_header_len: usize,
         handled_by_raw: bool,
         mut buf: DriverBuf,
     ) {
+        let iface = info.iface;
         let Ok(udp_packet) = UdpPacket::new_checked(&mut buf) else {
             trace!("udp: malformed packet");
             return;
@@ -1184,14 +1187,14 @@ impl Stack<'_> {
             match dst_addr {
                 #[cfg(feature = "ipv4")]
                 IpAddr::V4(_) => self.transmit_icmpv4_error(
-                    iface,
+                    info,
                     buf,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::PortUnreachable.into(),
                 ),
                 #[cfg(feature = "ipv6")]
                 IpAddr::V6(_) => self.transmit_icmpv6_error(
-                    iface,
+                    info,
                     buf,
                     Icmpv6Message::DstUnreachable,
                     Icmpv6DstUnreachable::PortUnreachable.into(),
@@ -1288,7 +1291,7 @@ impl<'d> UdpSocketIter<'_, 'd> {
 mod test {
     use super::*;
     use crate::iface::Medium;
-    use crate::stack::Stack;
+    use crate::stack::{DstKind, LinkDst, Stack};
     use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Addr, Ipv6Addr};
 
@@ -1396,21 +1399,31 @@ mod test {
     ) {
         let mut buf = stack.test_buf(&queued_packet_from(src_addr, src_port, dst_addr, payload));
         buf.pull_front(IPV4_HEADER_LEN);
-        stack.process_udp(iface, src_addr.into(), dst_addr.into(), IPV4_HEADER_LEN, false, buf);
+        let info = ingress_info(stack, iface, dst_addr);
+        stack.process_udp(info, src_addr.into(), dst_addr.into(), IPV4_HEADER_LEN, false, buf);
+    }
+
+    /// What ingress would make of a packet to `dst_addr` arriving on `iface`
+    /// unicast at the link layer. A destination not for the interface is
+    /// taken as unicast.
+    fn ingress_info(stack: &Stack, iface: IfaceHandle, dst_addr: Ipv4Addr) -> IngressInfo {
+        IngressInfo {
+            iface,
+            link_dst: LinkDst::Unicast,
+            dst: stack
+                .ifaces
+                .get(iface.index())
+                .v4_dst_kind(dst_addr)
+                .unwrap_or(DstKind::Unicast),
+        }
     }
 
     /// Like [`deliver`], with an explicit destination port.
     fn deliver_to_port(stack: &mut Stack, dst_port: u16, payload: &[u8]) {
         let mut buf = stack.test_buf(&queued_packet_to_port(REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, dst_port, payload));
         buf.pull_front(IPV4_HEADER_LEN);
-        stack.process_udp(
-            IfaceHandle::new(0),
-            REMOTE_ADDR.into(),
-            LOCAL_ADDR.into(),
-            IPV4_HEADER_LEN,
-            false,
-            buf,
-        );
+        let info = ingress_info(stack, IfaceHandle::new(0), LOCAL_ADDR);
+        stack.process_udp(info, REMOTE_ADDR.into(), LOCAL_ADDR.into(), IPV4_HEADER_LEN, false, buf);
     }
 
     #[test]

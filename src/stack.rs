@@ -452,6 +452,71 @@ pub(crate) fn is_own_or_broadcast(ifaces: &Slab<IfaceState<'_>, IFACE_COUNT>, ad
         .any(|(_, iface)| iface.has_ip_addr(*addr) || iface.is_broadcast(addr))
 }
 
+/// How the frame an ingress packet arrived in was addressed: what the medium's
+/// accept function found its link-layer destination to be.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // which ones are made depends on the mediums
+pub(crate) enum LinkDst {
+    /// To our link-layer address. Always so on a medium without link-layer
+    /// addresses, and for a packet the stack made for itself.
+    Unicast,
+    /// To the link-layer broadcast address.
+    Broadcast,
+    /// To a link-layer multicast address.
+    Multicast,
+}
+
+/// What the IP destination of an ingress packet is to the arrival interface,
+/// as the admission check found it.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // which ones are made depends on the IP versions
+pub(crate) enum DstKind {
+    /// One of our addresses.
+    Unicast,
+    /// The limited broadcast address, or the broadcast address of one of the
+    /// interface's subnets.
+    Broadcast,
+    /// A multicast group the interface listens to.
+    Multicast,
+}
+
+/// What ingress found out about a packet before its upper-layer protocol, and
+/// the ICMP error builders, see it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IngressInfo {
+    /// The interface the packet arrived on.
+    pub(crate) iface: IfaceHandle,
+    pub(crate) link_dst: LinkDst,
+    pub(crate) dst: DstKind,
+}
+
+impl IngressInfo {
+    /// Whether the packet was unicast to us, at both the link and the IP layer.
+    /// No ICMP error may answer one that wasn't (RFC 1122 §3.2.2, RFC 4443 §2.4
+    /// e.3 to e.5).
+    pub(crate) fn is_unicast(&self) -> bool {
+        self.link_dst == LinkDst::Unicast && self.dst == DstKind::Unicast
+    }
+}
+
+/// Whether an Ethernet frame to `dst` is for `iface`, and how it was addressed.
+/// `None` if it is unicast to another host. Every multicast frame is taken: the
+/// IP layer checks the group.
+#[cfg(feature = "medium-ethernet")]
+fn accept_ethernet(iface: &IfaceState<'_>, dst: EthernetAddress) -> Option<LinkDst> {
+    if dst.is_broadcast() {
+        Some(LinkDst::Broadcast)
+    } else if dst.is_multicast() {
+        Some(LinkDst::Multicast)
+    } else if dst == iface.ethernet_addr() {
+        Some(LinkDst::Unicast)
+    } else {
+        None
+    }
+}
+
 impl TxContext<'_, '_> {
     /// The stack's PRNG.
     #[cfg(any(feature = "udp", feature = "tcp"))]
@@ -1668,9 +1733,9 @@ impl<'d> Stack<'d> {
         self.inner.local_ingress = true;
         match IpVersion::of_packet(&buf) {
             #[cfg(feature = "ipv4")]
-            Ok(IpVersion::V4) => self.process_ipv4(iface, None, buf, now),
+            Ok(IpVersion::V4) => self.process_ipv4(iface, None, LinkDst::Unicast, buf, now),
             #[cfg(feature = "ipv6")]
-            Ok(IpVersion::V6) => self.process_ipv6(iface, None, buf, now),
+            Ok(IpVersion::V6) => self.process_ipv6(iface, None, LinkDst::Unicast, buf, now),
             Err(_) => {}
         }
         self.inner.local_ingress = false;
@@ -1680,13 +1745,9 @@ impl<'d> Stack<'d> {
     fn process_ethernet(&mut self, iface: IfaceHandle, mut buf: DriverBuf, now: Instant) {
         let eth_frame = check!(EthernetFrame::new_checked(&mut buf));
 
-        // Ignore any packets not directed to our hardware address or any of the multicast groups.
-        if !eth_frame.dst_addr().is_broadcast()
-            && !eth_frame.dst_addr().is_multicast()
-            && eth_frame.dst_addr() != self.ifaces.get(iface.index()).ethernet_addr()
-        {
+        let Some(link_dst) = accept_ethernet(self.ifaces.get(iface.index()), eth_frame.dst_addr()) else {
             return;
-        }
+        };
 
         let src_addr = eth_frame.src_addr();
         let ethertype = eth_frame.ethertype();
@@ -1711,9 +1772,11 @@ impl<'d> Stack<'d> {
             #[cfg(feature = "ipv4")]
             EthernetProtocol::Arp => self.inner.process_arp(self.ifaces.get_mut(iface.index()), buf, now),
             #[cfg(feature = "ipv4")]
-            EthernetProtocol::Ipv4 => self.process_ipv4(iface, Some(src_addr), buf, now),
+            EthernetProtocol::Ipv4 => self.process_ipv4(iface, Some(src_addr), link_dst, buf, now),
             #[cfg(feature = "ipv6")]
-            EthernetProtocol::Ipv6 => self.process_ipv6(iface, Some(HardwareAddress::Ethernet(src_addr)), buf, now),
+            EthernetProtocol::Ipv6 => {
+                self.process_ipv6(iface, Some(HardwareAddress::Ethernet(src_addr)), link_dst, buf, now)
+            }
             // Drop all other traffic.
             _ => {}
         }
@@ -1726,9 +1789,9 @@ impl<'d> Stack<'d> {
         }
         match IpVersion::of_packet(&buf) {
             #[cfg(feature = "ipv4")]
-            Ok(IpVersion::V4) => self.process_ipv4(iface, None, buf, now),
+            Ok(IpVersion::V4) => self.process_ipv4(iface, None, LinkDst::Unicast, buf, now),
             #[cfg(feature = "ipv6")]
-            Ok(IpVersion::V6) => self.process_ipv6(iface, None, buf, now),
+            Ok(IpVersion::V6) => self.process_ipv6(iface, None, LinkDst::Unicast, buf, now),
             Err(_) => {}
         }
     }
@@ -1737,7 +1800,16 @@ impl<'d> Stack<'d> {
     // medium never calls this.
     #[cfg(feature = "ipv4")]
     #[cfg_attr(not(any(feature = "medium-ethernet", feature = "medium-ip")), allow(dead_code))]
-    fn process_ipv4(&mut self, iface: IfaceHandle, eth_src: Option<EthernetAddress>, mut buf: DriverBuf, now: Instant) {
+    /// `eth_src` is the source address of the Ethernet frame the packet arrived
+    /// in, `None` on another medium. `link_dst` is how that frame was addressed.
+    fn process_ipv4(
+        &mut self,
+        iface: IfaceHandle,
+        eth_src: Option<EthernetAddress>,
+        link_dst: LinkDst,
+        mut buf: DriverBuf,
+        now: Instant,
+    ) {
         let _ = now;
         let ipv4_packet = check!(Ipv4Packet::new_checked(&mut buf));
 
@@ -1755,7 +1827,7 @@ impl<'d> Stack<'d> {
             // the DHCP client on, the packet may be for the address being leased,
             // which isn't ours yet, so it is reassembled anyway.
             let iface_state = self.ifaces.get(iface.index());
-            let for_us = iface_state.accepts_v4_dst(ipv4_packet.dst_addr());
+            let for_us = iface_state.v4_dst_kind(ipv4_packet.dst_addr()).is_some();
             #[cfg(feature = "dhcpv4")]
             let for_us = for_us || iface_state.dhcpv4.is_some();
             if !for_us {
@@ -1832,7 +1904,9 @@ impl<'d> Stack<'d> {
 
         // A packet the stack made for itself has our addresses on both ends, and
         // no link to check them against.
-        if !self.inner.local_ingress() {
+        let dst = if self.inner.local_ingress() {
+            DstKind::Unicast
+        } else {
             // Discard packets whose source can't be a remote host, but allow
             // unspecified (a host that has no address yet).
             if !src_addr.is_unspecified()
@@ -1843,15 +1917,15 @@ impl<'d> Stack<'d> {
             }
 
             let iface = self.ifaces.get(iface.index());
-            if !iface.accepts_v4_dst(dst_addr) {
-                // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
+            // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
+            let Some(dst) = iface.v4_dst_kind(dst_addr) else {
                 trace!("Rejecting IPv4 packet; not for us");
                 return;
-            }
+            };
 
             #[cfg(feature = "medium-ethernet")]
             if let Some(eth_src) = eth_src
-                && iface.has_ip_addr(dst_addr.into())
+                && dst == DstKind::Unicast
             {
                 self.inner.neighbor_cache.reset_expiry_if_existing(
                     (iface.handle, IpAddr::V4(src_addr)),
@@ -1859,9 +1933,11 @@ impl<'d> Stack<'d> {
                     now,
                 );
             }
-            #[cfg(not(feature = "medium-ethernet"))]
-            let _ = eth_src;
-        }
+            dst
+        };
+        #[cfg(not(feature = "medium-ethernet"))]
+        let _ = eth_src;
+        let info = IngressInfo { iface, link_dst, dst };
 
         // Strip any trailing padding added by the link layer.
         buf.set_len(total_len);
@@ -1886,12 +1962,12 @@ impl<'d> Stack<'d> {
         buf.pull_front(header_len);
 
         match next_header {
-            IpProtocol::Icmp => self.process_icmpv4(iface, src_addr, dst_addr, buf),
+            IpProtocol::Icmp => self.process_icmpv4(info, src_addr, dst_addr, buf),
             #[cfg(feature = "multicast")]
             IpProtocol::Igmp => self.ifaces.get_mut(iface.index()).process_igmp(dst_addr, buf, now),
             #[cfg(feature = "udp")]
             IpProtocol::Udp => self.process_udp(
-                iface,
+                info,
                 IpAddr::V4(src_addr),
                 IpAddr::V4(dst_addr),
                 header_len,
@@ -1899,14 +1975,14 @@ impl<'d> Stack<'d> {
                 buf,
             ),
             #[cfg(feature = "tcp")]
-            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V4(src_addr), IpAddr::V4(dst_addr), buf, now),
+            IpProtocol::Tcp => self.process_tcp(info, IpAddr::V4(src_addr), IpAddr::V4(dst_addr), buf, now),
             _ => {
                 trace!("ipv4: protocol {} not supported", next_header);
                 // ICMP protocol unreachable (RFC 792): restore the IP header so the
                 // whole offending packet can be quoted.
                 buf.push_front(header_len);
                 self.transmit_icmpv4_error(
-                    iface,
+                    info,
                     buf,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::ProtoUnreachable.into(),
@@ -1925,18 +2001,22 @@ impl<'d> Stack<'d> {
     /// for (data, ACKs, challenge ACKs) the socket sends from its own egress,
     /// which [`Stack::poll`] drives right after ingress processing.
     #[cfg(feature = "tcp")]
-    fn process_tcp(
-        &mut self,
-        iface: IfaceHandle,
-        src_addr: IpAddr,
-        dst_addr: IpAddr,
-        mut buf: DriverBuf,
-        now: Instant,
-    ) {
+    fn process_tcp(&mut self, info: IngressInfo, src_addr: IpAddr, dst_addr: IpAddr, mut buf: DriverBuf, now: Instant) {
+        let iface = info.iface;
+
+        // A segment to a broadcast or multicast address is silently discarded
+        // (RFC 9293 §3.9.2.3, MUST-57, and RFC 1122 §4.2.3.10): it must neither
+        // reach a listener nor be answered with an RST, which would go out from
+        // that address. This is done before any socket sees it.
+        if info.dst != DstKind::Unicast {
+            trace!("tcp: segment to a broadcast or multicast address, dropping");
+            return;
+        }
+
         // Per RFC 1122 §3.2.1.3, the unspecified address must never appear as a source
         // or destination in any IP datagram. Drop such TCP segments early to avoid
         // creating sockets with unspecified peers (which would later panic on egress).
-        // The destination was already checked to be one of ours. The IPv4 layer lets
+        // The destination was checked to be one of ours above. The IPv4 layer lets
         // an unspecified source through, for DHCP.
         if src_addr.is_unspecified() {
             return;
@@ -2019,7 +2099,8 @@ impl<'d> Stack<'d> {
     }
 
     #[cfg(feature = "ipv4")]
-    fn process_icmpv4(&mut self, iface: IfaceHandle, src_addr: Ipv4Addr, dst_addr: Ipv4Addr, mut buf: DriverBuf) {
+    fn process_icmpv4(&mut self, info: IngressInfo, src_addr: Ipv4Addr, dst_addr: Ipv4Addr, mut buf: DriverBuf) {
+        let iface = info.iface;
         let mut icmp_packet = check!(Icmpv4Packet::new_checked(&mut buf));
         if !self.ifaces.get(iface.index()).checksum_caps().icmpv4.rx && !icmp_packet.verify_checksum() {
             trace!("icmpv4: checksum incorrect");
@@ -2027,7 +2108,7 @@ impl<'d> Stack<'d> {
         }
 
         #[cfg(not(feature = "icmp-ping-reply"))]
-        let _ = (iface, src_addr, dst_addr);
+        let _ = (info, src_addr, dst_addr);
         #[cfg(not(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp"))))]
         let _ = &mut icmp_packet;
 
@@ -2035,27 +2116,21 @@ impl<'d> Stack<'d> {
             // Respond to echo requests.
             #[cfg(feature = "icmp-ping-reply")]
             (Icmpv4Message::EchoRequest, 0) => {
-                let reply_src = {
-                    let iface = self.ifaces.get(iface.index());
-                    // Ingress let only unicast sources through, and the unspecified
-                    // one, which can't be answered.
-                    if src_addr.is_unspecified() {
-                        return;
-                    }
-                    // The destination is ours: one of our addresses, a broadcast
-                    // address or a group. Reply from it if it is an address; only
-                    // reply to broadcasts for echo replies and not other ICMP
-                    // messages, and never to groups.
-                    if self.inner.local_ingress() || iface.has_ip_addr(dst_addr.into()) {
-                        dst_addr
-                    } else if iface.is_broadcast_v4(dst_addr) {
-                        match iface.ipv4_addr() {
-                            Some(addr) => addr,
-                            None => return,
-                        }
-                    } else {
-                        return;
-                    }
+                // Ingress let only unicast sources through, and the unspecified
+                // one, which can't be answered.
+                if src_addr.is_unspecified() {
+                    return;
+                }
+                // Reply from the destination if it is one of our addresses. Only
+                // reply to broadcasts for echo replies and not other ICMP
+                // messages, and never to groups.
+                let reply_src = match info.dst {
+                    DstKind::Unicast => dst_addr,
+                    DstKind::Broadcast => match self.ifaces.get(iface.index()).ipv4_addr() {
+                        Some(addr) => addr,
+                        None => return,
+                    },
+                    DstKind::Multicast => return,
                 };
 
                 // Route first: the reply's checksum is the egress interface's to
@@ -2134,12 +2209,14 @@ impl<'d> Stack<'d> {
     }
 
     /// `ll_src` is the link-layer source address of the frame the packet arrived
-    /// in, `None` on a medium without link-layer addresses.
+    /// in, `None` on a medium without link-layer addresses. `link_dst` is how
+    /// that frame was addressed.
     #[cfg(feature = "ipv6")]
     pub(crate) fn process_ipv6(
         &mut self,
         iface: IfaceHandle,
         ll_src: Option<HardwareAddress>,
+        link_dst: LinkDst,
         mut buf: DriverBuf,
         now: Instant,
     ) {
@@ -2157,7 +2234,9 @@ impl<'d> Stack<'d> {
 
         // A packet the stack made for itself has our addresses on both ends, and
         // no link to check them against.
-        if !self.inner.local_ingress() {
+        let dst = if self.inner.local_ingress() {
+            DstKind::Unicast
+        } else {
             // Discard packets whose source can't be a remote host.
             if !src_addr.x_is_unicast() || is_own_or_broadcast(&self.ifaces, &IpAddr::V6(src_addr)) {
                 debug!("ipv6: invalid source address");
@@ -2165,20 +2244,22 @@ impl<'d> Stack<'d> {
             }
 
             let iface = self.ifaces.get(iface.index());
-            if !iface.has_ip_addr(dst_addr.into()) && !iface.has_multicast_group(dst_addr.into()) {
+            let Some(dst) = iface.v6_dst_kind(dst_addr) else {
                 trace!("Rejecting IPv6 packet; not for us");
                 return;
-            }
+            };
 
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             if let Some(ll_src) = ll_src
-                && dst_addr.x_is_unicast()
+                && dst == DstKind::Unicast
             {
                 self.inner
                     .neighbor_cache
                     .reset_expiry_if_existing((iface.handle, IpAddr::V6(src_addr)), ll_src, now);
             }
-        }
+            dst
+        };
+        let info = IngressInfo { iface, link_dst, dst };
 
         // Strip any trailing padding added by the link layer.
         buf.set_len(IPV6_HEADER_LEN + payload_len);
@@ -2198,7 +2279,7 @@ impl<'d> Stack<'d> {
                     allow_multicast_dst,
                 } => {
                     self.transmit_icmpv6_error(
-                        iface,
+                        info,
                         buf,
                         Icmpv6Message::ParamProblem,
                         Icmpv6ParamProblem::UnrecognizedOption.into(),
@@ -2231,10 +2312,10 @@ impl<'d> Stack<'d> {
         buf.pull_front(l4_offset);
 
         match next_header {
-            IpProtocol::Icmpv6 => self.process_icmpv6(iface, ll_src, src_addr, dst_addr, hop_limit, buf, now),
+            IpProtocol::Icmpv6 => self.process_icmpv6(info, ll_src, src_addr, dst_addr, hop_limit, buf, now),
             #[cfg(feature = "udp")]
             IpProtocol::Udp => self.process_udp(
-                iface,
+                info,
                 IpAddr::V6(src_addr),
                 IpAddr::V6(dst_addr),
                 l4_offset,
@@ -2242,7 +2323,7 @@ impl<'d> Stack<'d> {
                 buf,
             ),
             #[cfg(feature = "tcp")]
-            IpProtocol::Tcp => self.process_tcp(iface, IpAddr::V6(src_addr), IpAddr::V6(dst_addr), buf, now),
+            IpProtocol::Tcp => self.process_tcp(info, IpAddr::V6(src_addr), IpAddr::V6(dst_addr), buf, now),
             _ => {
                 trace!("ipv6: protocol {} not supported", next_header);
                 // ICMPv6 parameter problem, unrecognized next header (RFC 4443
@@ -2251,7 +2332,7 @@ impl<'d> Stack<'d> {
                 // unrecognized value.
                 buf.push_front(l4_offset);
                 self.transmit_icmpv6_error(
-                    iface,
+                    info,
                     buf,
                     Icmpv6Message::ParamProblem,
                     Icmpv6ParamProblem::UnrecognizedNxtHdr.into(),
@@ -2265,7 +2346,7 @@ impl<'d> Stack<'d> {
     #[cfg(feature = "ipv6")]
     fn process_icmpv6(
         &mut self,
-        iface: IfaceHandle,
+        info: IngressInfo,
         ll_src: Option<HardwareAddress>,
         src_addr: Ipv6Addr,
         dst_addr: Ipv6Addr,
@@ -2275,8 +2356,7 @@ impl<'d> Stack<'d> {
     ) {
         #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
         let _ = (ll_src, hop_limit, now);
-        #[cfg(not(feature = "icmp-ping-reply"))]
-        let _ = iface;
+        let iface = info.iface;
 
         let mut icmp_packet = check!(Icmpv6Packet::new_checked(&mut buf));
         if !self.ifaces.get(iface.index()).checksum_caps().icmpv6.rx
@@ -2295,7 +2375,7 @@ impl<'d> Stack<'d> {
             Icmpv6Message::EchoRequest => {
                 // The destination is one of our addresses or a group. Reply from
                 // it if it is an address.
-                let reply_src = if !dst_addr.is_multicast() {
+                let reply_src = if info.dst == DstKind::Unicast {
                     dst_addr
                 } else {
                     self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
@@ -2470,7 +2550,7 @@ impl<'d> Stack<'d> {
                 }
                 push_ipv4_header(&mut orig, reply_src, src_addr, IpProtocol::Icmp, 64, &checksum_caps);
                 self.inner.local_ingress = true;
-                self.process_ipv4(iface, None, orig, now);
+                self.process_ipv4(iface, None, LinkDst::Unicast, orig, now);
                 self.inner.local_ingress = false;
             }
             #[cfg(feature = "ipv6")]
@@ -2508,7 +2588,7 @@ impl<'d> Stack<'d> {
                 }
                 push_ipv6_header(&mut orig, reply_src, src_addr, IpProtocol::Icmpv6, 64);
                 self.inner.local_ingress = true;
-                self.process_ipv6(iface, None, orig, now);
+                self.process_ipv6(iface, None, LinkDst::Unicast, orig, now);
                 self.inner.local_ingress = false;
             }
             Err(_) => {}
@@ -2521,12 +2601,13 @@ impl<'d> Stack<'d> {
     ///
     /// Errors are only sent when both the source and the destination of the
     /// offending packet are unicast (RFC 1122 §3.2.2): none about broadcast or
-    /// multicast traffic, and none to non-unicast senders. Ingress let only
-    /// unicast sources through, and the unspecified one.
+    /// multicast traffic, at the IP or the link layer, and none to non-unicast
+    /// senders. Ingress let only unicast sources through, and the unspecified
+    /// one.
     #[cfg(feature = "ipv4")]
     pub(crate) fn transmit_icmpv4_error(
         &mut self,
-        iface: IfaceHandle,
+        info: IngressInfo,
         mut orig: DriverBuf,
         msg_type: Icmpv4Message,
         msg_code: u8,
@@ -2535,14 +2616,10 @@ impl<'d> Stack<'d> {
             let packet = Ipv4Packet::new_unchecked(&mut orig);
             (packet.src_addr(), packet.dst_addr())
         };
-        // The destination is ours: one of our addresses, a broadcast address or a
-        // group. A packet the stack sent itself is to one of our addresses.
-        if src_addr.is_unspecified()
-            || !(self.inner.local_ingress() || self.ifaces.get(iface.index()).has_ip_addr(dst_addr.into()))
-        {
+        if src_addr.is_unspecified() || !info.is_unicast() {
             return;
         }
-        let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddr::V4(src_addr)) else {
+        let Some((route, checksum_caps)) = self.route_reply(info.iface, &IpAddr::V4(src_addr)) else {
             return;
         };
         if !make_icmpv4_error(&mut orig, route.ip_headroom, msg_type, msg_code, &checksum_caps) {
@@ -2562,14 +2639,15 @@ impl<'d> Stack<'d> {
     /// (a whole IP packet, starting at the IP header, quoted in the error). The
     /// error is built in `orig` itself.
     ///
-    /// Errors are never sent to non-unicast sources, nor about multicast-destined
-    /// packets (RFC 4443 §2.4). The exception is an unrecognized hop-by-hop option
-    /// whose type demands the error even then (`allow_multicast_dst`). Ingress let
-    /// only unicast sources through.
+    /// Errors are never sent to non-unicast sources, nor about packets to a
+    /// multicast address or sent as a link-layer multicast or broadcast (RFC 4443
+    /// §2.4 e.3 to e.5). The exception is an unrecognized hop-by-hop option
+    /// whose type demands the error even then (`allow_multicast_dst`). Ingress
+    /// let only unicast sources through.
     #[cfg(feature = "ipv6")]
     pub(crate) fn transmit_icmpv6_error(
         &mut self,
-        iface: IfaceHandle,
+        info: IngressInfo,
         mut orig: DriverBuf,
         msg_type: Icmpv6Message,
         msg_code: u8,
@@ -2580,15 +2658,15 @@ impl<'d> Stack<'d> {
             let packet = Ipv6Packet::new_unchecked(&mut orig);
             (packet.src_addr(), packet.dst_addr())
         };
-        if dst_addr.is_multicast() && !allow_multicast_dst {
+        if !info.is_unicast() && !allow_multicast_dst {
             return;
         }
-        let reply_src = if !dst_addr.is_multicast() {
+        let reply_src = if info.dst == DstKind::Unicast {
             dst_addr
         } else {
-            self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
+            self.ifaces.get(info.iface.index()).get_source_address_ipv6(&src_addr)
         };
-        let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddr::V6(src_addr)) else {
+        let Some((route, checksum_caps)) = self.route_reply(info.iface, &IpAddr::V6(src_addr)) else {
             return;
         };
         if !make_icmpv6_error(
@@ -7855,11 +7933,16 @@ pub(crate) mod test {
             inject(&mut stack, &rx, wrap(&packet));
             assert!(tx.borrow().is_empty(), "{medium:?}");
 
-            // The same datagram to our unicast address is answered, so the
-            // suppression above is what kept the wire quiet.
+            // The same datagram to our unicast address, in a frame to our
+            // link-layer address, is answered, so the suppression above is
+            // what kept the wire quiet.
             let datagram = udp_datagram(REMOTE_V4.into(), 67, OUR_V4.into(), 68, b"hello");
             let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram);
-            inject(&mut stack, &rx, wrap(&packet));
+            let frame = match medium {
+                Medium::Ethernet => eth_frame_from(OTHER_HW, OUR_HW, EthernetProtocol::Ipv4, &packet),
+                _ => packet,
+            };
+            inject(&mut stack, &rx, frame);
             if medium == Medium::Ip {
                 assert_eq!(tx.borrow().len(), 1, "{medium:?}");
             } else {
@@ -7868,6 +7951,105 @@ pub(crate) mod test {
                 assert_eq!(tx.borrow().len(), 1, "{medium:?}");
                 assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
             }
+        }
+    }
+
+    /// No ICMP error answers a packet that came in a link-layer broadcast or
+    /// multicast frame, even one unicast at the IP layer (RFC 1122 §3.2.2, RFC
+    /// 4443 §2.4 e.4 and e.5). The exception of RFC 4443 e.3 still applies: an
+    /// unrecognized option whose type asks for an error even about multicast
+    /// gets one.
+    #[test]
+    fn test_icmp_no_error_to_link_layer_broadcast_multicast() {
+        const ETH_MULTICAST_V4: EthernetAddress = EthernetAddress([0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]);
+        const ETH_MULTICAST_V6: EthernetAddress = EthernetAddress([0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
+        let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+        let take_one = || {
+            let mut tx = tx.borrow_mut();
+            assert_eq!(tx.len(), 1);
+            tx.pop().unwrap()
+        };
+        // Resolve the sender, so that an error goes out at once rather than
+        // waiting on an ARP or NDISC exchange.
+        let iface = IfaceHandle::new(0);
+        for addr in [IpAddr::from(REMOTE_V4), REMOTE_V6.into()] {
+            stack
+                .inner
+                .neighbor_cache
+                .fill((iface, addr), HardwareAddress::Ethernet(OTHER_HW), Instant::ZERO);
+        }
+
+        // IPv4: UDP to a closed port, and an unknown protocol.
+        let datagram = udp_datagram(REMOTE_V4.into(), 4000, OUR_V4.into(), 9, b"hello");
+        let udp = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram);
+        let unknown = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol(99), b"hello");
+        for packet in [&udp, &unknown] {
+            for dst_hw in [EthernetAddress::BROADCAST, ETH_MULTICAST_V4] {
+                inject(
+                    &mut stack,
+                    &rx,
+                    eth_frame_from(OTHER_HW, dst_hw, EthernetProtocol::Ipv4, packet),
+                );
+                assert!(tx.borrow().is_empty(), "{dst_hw}");
+            }
+            // Unicast to us, it is answered.
+            inject(
+                &mut stack,
+                &rx,
+                eth_frame_from(OTHER_HW, OUR_HW, EthernetProtocol::Ipv4, packet),
+            );
+            let frame = take_one();
+            let (msg_type, _, _) = parse_icmpv4_reply(&frame[ETHERNET_HEADER_LEN..], OUR_V4, REMOTE_V4);
+            assert_eq!(msg_type, Icmpv4Message::DstUnreachable);
+        }
+
+        // IPv6: UDP to a closed port, an unknown next header, and an
+        // unrecognized hop-by-hop option that asks for an error only if the
+        // destination was not multicast (high bits 11).
+        let datagram = udp_datagram(REMOTE_V6.into(), 4000, OUR_V6.into(), 9, b"hello");
+        let udp = ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol::Udp, &datagram);
+        let unknown = ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol(99), b"hello");
+        let hbh = ipv6_packet(
+            REMOTE_V6,
+            OUR_V6,
+            IpProtocol::HopByHop,
+            &hbh_payload(IpProtocol::Udp, &[0xc1, 0x04, 0x00, 0x00, 0x00, 0x00], b""),
+        );
+        for packet in [&udp, &unknown, &hbh] {
+            for dst_hw in [EthernetAddress::BROADCAST, ETH_MULTICAST_V6] {
+                inject(
+                    &mut stack,
+                    &rx,
+                    eth_frame_from(OTHER_HW, dst_hw, EthernetProtocol::Ipv6, packet),
+                );
+                assert!(tx.borrow().is_empty(), "{dst_hw}");
+            }
+            inject(
+                &mut stack,
+                &rx,
+                eth_frame_from(OTHER_HW, OUR_HW, EthernetProtocol::Ipv6, packet),
+            );
+            let frame = take_one();
+            parse_icmpv6_reply(&frame[ETHERNET_HEADER_LEN..], OUR_V6, REMOTE_V6);
+        }
+
+        // High bits 10: the error is sent whatever the destination.
+        let hbh = ipv6_packet(
+            REMOTE_V6,
+            OUR_V6,
+            IpProtocol::HopByHop,
+            &hbh_payload(IpProtocol::Udp, &[0x81, 0x04, 0x00, 0x00, 0x00, 0x00], b""),
+        );
+        for dst_hw in [EthernetAddress::BROADCAST, ETH_MULTICAST_V6] {
+            inject(
+                &mut stack,
+                &rx,
+                eth_frame_from(OTHER_HW, dst_hw, EthernetProtocol::Ipv6, &hbh),
+            );
+            let frame = take_one();
+            let (msg_type, msg_code, _, _) = parse_icmpv6_reply(&frame[ETHERNET_HEADER_LEN..], OUR_V6, REMOTE_V6);
+            assert_eq!(msg_type, Icmpv6Message::ParamProblem);
+            assert_eq!(msg_code, Icmpv6ParamProblem::UnrecognizedOption.0);
         }
     }
 
@@ -8745,6 +8927,55 @@ pub(crate) mod test {
             ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Tcp, &segment),
         );
         assert!(stack.tcp_listener(listener).can_accept());
+    }
+
+    /// TCP segments to a broadcast or multicast address are dropped before any
+    /// socket sees them (RFC 9293 §3.9.2.3): a wildcard listener records no SYN,
+    /// and no RST goes out with that address as its source.
+    #[test]
+    #[cfg(feature = "tcp-listener")]
+    fn test_tcp_broadcast_multicast_dst_dropped() {
+        #[allow(unused_mut)]
+        let mut dsts: Vec<IpAddr> = vec![
+            Ipv4Addr::new(192, 168, 1, 255).into(),
+            Ipv4Addr::BROADCAST.into(),
+            IPV6_LINK_LOCAL_ALL_NODES.into(),
+        ];
+        #[cfg(feature = "multicast")]
+        dsts.push(Ipv4Addr::new(224, 1, 2, 3).into());
+
+        for dst in dsts {
+            let (mut stack, rx, tx) = test_stack(Medium::Ip);
+            #[cfg(feature = "multicast")]
+            stack
+                .iface(IfaceHandle::new(0))
+                .join_multicast_group(Ipv4Addr::new(224, 1, 2, 3))
+                .unwrap();
+            stack.poll(Instant::ZERO);
+            tx.borrow_mut().clear();
+            let listener = stack.add_tcp_listener().unwrap();
+            stack.tcp_listener(listener).listen(1234).unwrap();
+
+            let packet = |dst_port| match dst {
+                IpAddr::V4(dst) => {
+                    let segment = tcp_segment(REMOTE_V4.into(), 65000, dst.into(), dst_port, true);
+                    ipv4_packet(REMOTE_V4, dst, IpProtocol::Tcp, &segment)
+                }
+                IpAddr::V6(dst) => {
+                    let segment = tcp_segment(REMOTE_V6.into(), 65000, dst.into(), dst_port, true);
+                    ipv6_packet(REMOTE_V6, dst, IpProtocol::Tcp, &segment)
+                }
+            };
+
+            // A SYN to the listened port is not recorded.
+            inject(&mut stack, &rx, packet(1234));
+            assert!(!stack.tcp_listener(listener).can_accept(), "{dst}");
+            assert!(tx.borrow().is_empty(), "{dst}");
+
+            // A SYN to a closed port draws no RST.
+            inject(&mut stack, &rx, packet(80));
+            assert!(tx.borrow().is_empty(), "{dst}");
+        }
     }
 
     /// Link-layer padding behind an IP packet is stripped before a raw socket

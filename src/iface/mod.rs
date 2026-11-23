@@ -32,7 +32,7 @@ use crate::fragmentation::Fragmenter;
 use crate::stack::Blocked;
 #[cfg(feature = "packetmeta-timestamp")]
 use crate::stack::TxTimestampQueue;
-use crate::stack::{Stack, StackInner};
+use crate::stack::{DstKind, Stack, StackInner};
 use crate::storage::{MaybeBox, Slab, Vec};
 use crate::time::{Clock, Instant};
 use crate::wire::*;
@@ -998,12 +998,35 @@ impl IfaceState<'_> {
         })
     }
 
-    /// Whether an IPv4 packet to `dst_addr` is for this interface: to one of its
-    /// addresses, to a multicast group it listens to, or to broadcast.
+    /// What an IPv4 packet to `dst_addr` is to this interface: to one of its
+    /// addresses, to a multicast group it listens to, or to broadcast. `None` if
+    /// it is not for this interface.
     #[cfg(feature = "ipv4")]
     #[cfg_attr(not(any(feature = "medium-ethernet", feature = "medium-ip")), allow(dead_code))]
-    pub(crate) fn accepts_v4_dst(&self, dst_addr: Ipv4Addr) -> bool {
-        self.has_ip_addr(dst_addr.into()) || self.has_multicast_group(dst_addr.into()) || self.is_broadcast_v4(dst_addr)
+    pub(crate) fn v4_dst_kind(&self, dst_addr: Ipv4Addr) -> Option<DstKind> {
+        if self.has_ip_addr(dst_addr.into()) {
+            Some(DstKind::Unicast)
+        } else if self.has_multicast_group(dst_addr.into()) {
+            Some(DstKind::Multicast)
+        } else if self.is_broadcast_v4(dst_addr) {
+            Some(DstKind::Broadcast)
+        } else {
+            None
+        }
+    }
+
+    /// What an IPv6 packet to `dst_addr` is to this interface: to one of its
+    /// addresses, or to a multicast group it listens to. `None` if it is not for
+    /// this interface.
+    #[cfg(feature = "ipv6")]
+    pub(crate) fn v6_dst_kind(&self, dst_addr: Ipv6Addr) -> Option<DstKind> {
+        if self.has_ip_addr(dst_addr.into()) {
+            Some(DstKind::Unicast)
+        } else if self.has_multicast_group(dst_addr.into()) {
+            Some(DstKind::Multicast)
+        } else {
+            None
+        }
     }
 
     /// Determine if the given `Ipv6Addr` is the solicited node

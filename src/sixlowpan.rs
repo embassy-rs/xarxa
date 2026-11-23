@@ -15,7 +15,7 @@ use crate::error::{Full, Malformed};
 use crate::fragmentation::{Fragmenter, SixlowpanFragmenter};
 use crate::iface::{Iface, IfaceHandle, IfaceState};
 use crate::rand::Rand;
-use crate::stack::{Blocked, Stack, StackInner, TxResult};
+use crate::stack::{Blocked, LinkDst, Stack, StackInner, TxResult};
 use crate::storage::Vec;
 use crate::time::Instant;
 use crate::wire::ip::checksum;
@@ -150,29 +150,20 @@ impl Stack<'_> {
             return;
         }
 
-        // Drop frames when the user has set a PAN id and the PAN id from frame is not equal to this
-        // When the user didn't set a PAN id (so it is None), then we accept all PAN id's.
-        // We always accept the broadcast PAN id.
-        let pan_id = self.ifaces.get(iface.index()).sixlowpan.pan_id;
-        if pan_id.is_some()
-            && ieee802154_repr.dst_pan_id != pan_id
-            && ieee802154_repr.dst_pan_id != Some(Ieee802154Pan::BROADCAST)
-        {
-            debug!(
-                "IEEE802.15.4: dropping {:?} because not our PAN id (or not broadcast)",
-                ieee802154_repr
-            );
+        let Some(link_dst) = accept_ieee802154(self.ifaces.get(iface.index()), &ieee802154_repr) else {
+            debug!("IEEE802.15.4: dropping {:?}: not for us", ieee802154_repr);
             return;
-        }
+        };
 
         buf.pull_front(header_len);
-        self.process_sixlowpan(iface, &ieee802154_repr, buf, now)
+        self.process_sixlowpan(iface, &ieee802154_repr, link_dst, buf, now)
     }
 
     fn process_sixlowpan(
         &mut self,
         iface: IfaceHandle,
         ieee802154_repr: &Ieee802154Repr,
+        link_dst: LinkDst,
         mut buf: DriverBuf,
         now: Instant,
     ) {
@@ -215,9 +206,33 @@ impl Stack<'_> {
             Some(HardwareAddress::Ieee802154(
                 ieee802154_repr.src_addr.unwrap_or(Ieee802154Address::Absent),
             )),
+            link_dst,
             buf,
             now,
         )
+    }
+}
+
+/// Whether a data frame is for `iface`, and how it was addressed: the third
+/// level of filtering of IEEE 802.15.4-2006 §7.5.6.2. A destination PAN, if
+/// present, must be the interface's or the broadcast PAN (any PAN if the
+/// interface has none set). A destination address, if present, must be the
+/// interface's or the broadcast short address.
+///
+/// A frame without a destination address is taken as unicast to us: the
+/// standard sends it to the PAN coordinator.
+fn accept_ieee802154(iface: &IfaceState<'_>, repr: &Ieee802154Repr) -> Option<LinkDst> {
+    if let (Some(our_pan), Some(dst_pan)) = (iface.sixlowpan.pan_id, repr.dst_pan_id)
+        && dst_pan != our_pan
+        && dst_pan != Ieee802154Pan::BROADCAST
+    {
+        return None;
+    }
+    match repr.dst_addr {
+        None | Some(Ieee802154Address::Absent) => Some(LinkDst::Unicast),
+        Some(dst) if dst.is_broadcast() => Some(LinkDst::Broadcast),
+        Some(dst) if dst == iface.ieee802154_addr() => Some(LinkDst::Unicast),
+        Some(_) => None,
     }
 }
 
@@ -948,7 +963,6 @@ mod test {
     const VECTOR_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x92fc, 0x48c2, 0xa441, 0xfc76);
     /// The old test harness's own address.
     const ZERO_LL: Ieee802154Address = Ieee802154Address::Extended([0; 8]);
-    const TWO_LL: Ieee802154Address = Ieee802154Address::Extended([0x02; 8]);
 
     /// A stack with one IEEE 802.15.4 interface of address `hw` on `pan_id`.
     fn test_stack(
@@ -1317,6 +1331,63 @@ mod test {
         ];
         inject(&mut stack, &rx, data.to_vec());
         assert!(tx.borrow().is_empty());
+    }
+
+    /// A frame to another node's address is dropped, even when the packet in
+    /// it is addressed to us (IEEE 802.15.4-2006 §7.5.6.2). One to our address
+    /// or to the broadcast short address is taken.
+    #[test]
+    fn test_frame_to_other_address_dropped() {
+        let (mut stack, _iface, rx, _tx, _room) = test_stack(OUR_LL, Some(PAN));
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(6969, ListenSocketAddr::UNSPECIFIED).unwrap();
+        let datagram = udp_datagram(PEER_LINK_LOCAL.into(), 1234, OUR_LINK_LOCAL.into(), 6969, b"hello");
+        let packet = ipv6_packet(PEER_LINK_LOCAL, OUR_LINK_LOCAL, IpProtocol::Udp, &datagram);
+
+        let others = [
+            Ieee802154Address::Extended([0x02; 8]),
+            Ieee802154Address::Short([0x12, 0x34]),
+        ];
+        for dst in others {
+            let (compressed, _) = compress(&packet, PEER_LL, dst, 0);
+            inject(&mut stack, &rx, frame(PEER_LL, dst, PAN, &compressed));
+            assert_eq!(
+                stack.udp_socket(udp).recv().err(),
+                Some(RecvError::Exhausted),
+                "{dst:?}"
+            );
+        }
+
+        for dst in [OUR_LL, Ieee802154Address::BROADCAST] {
+            let (compressed, _) = compress(&packet, PEER_LL, dst, 0);
+            inject(&mut stack, &rx, frame(PEER_LL, dst, PAN, &compressed));
+            assert_eq!(&*stack.udp_socket(udp).recv().unwrap(), b"hello", "{dst:?}");
+        }
+    }
+
+    /// Fragments sent to another node take no reassembly slot: our own
+    /// fragmented datagram still gets through while every slot would be
+    /// held by theirs.
+    #[test]
+    #[cfg(feature = "sixlowpan-reassembly")]
+    fn test_fragments_to_other_address_take_no_slot() {
+        use crate::config::REASSEMBLY_BUFFER_COUNT;
+        let (mut stack, _iface, rx, _tx, _room, udp) = reassembly_stack();
+        let other = Ieee802154Address::Extended([0x02; 8]);
+        let payload: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let datagram = udp_datagram(PEER_LINK_LOCAL.into(), 1234, OUR_LINK_LOCAL.into(), 6969, &payload);
+        let packet = ipv6_packet(PEER_LINK_LOCAL, OUR_LINK_LOCAL, IpProtocol::Udp, &datagram);
+        for tag in 0..REASSEMBLY_BUFFER_COUNT as u16 {
+            inject(
+                &mut stack,
+                &rx,
+                fragments(&packet, PEER_LL, other, 100 + tag)[0].clone(),
+            );
+        }
+        for frame in big_datagram(1) {
+            inject(&mut stack, &rx, frame);
+        }
+        check_received(&mut stack, udp);
     }
 
     /// An IPv4 packet routed to an 802.15.4 interface is dropped, not sent.
@@ -1692,17 +1763,15 @@ mod test {
         0x7e, 0x7f,
     ];
 
-    /// A stack with the old harness's address and the vectors' address, for
-    /// the Contiki-NG vectors.
+    /// A stack with the link-layer address the Contiki-NG vectors are sent to,
+    /// and so the link-local address they are addressed to.
+    ///
+    /// The old harness had another link-layer address, and took the vectors
+    /// anyway: it did not check the frames' destination address.
     #[cfg(all(feature = "sixlowpan-fragmentation", feature = "sixlowpan-reassembly"))]
     fn vector_stack() -> (Stack<'static>, IfaceHandle, Queue, Sent, Room) {
-        let (mut stack, iface, rx, tx, room) = test_stack(TWO_LL, None);
-        stack
-            .iface(iface)
-            .add_ip_addr(IpCidr::new(VECTOR_LINK_LOCAL.into(), 10))
-            .unwrap();
-        stack.poll(Instant::ZERO);
-        tx.borrow_mut().clear();
+        let (mut stack, iface, rx, tx, room) = test_stack(VECTOR_LL, None);
+        assert!(stack.iface(iface).has_ip_addr(VECTOR_LINK_LOCAL));
         (stack, iface, rx, tx, room)
     }
 
@@ -1719,9 +1788,12 @@ mod test {
         }
 
         // The compressed reply the old test expected, minus its zeroed checksum.
-        let mut expected = vec![0x7a, 0x11, 0x3a];
-        expected.extend_from_slice(&VECTOR_LINK_LOCAL.octets()[8..]);
+        // Its source is elided here (SAM=11), not carried inline: it is
+        // derived from the frame's source, which the old harness's wasn't.
+        let mut expected = vec![0x7a, 0x31, 0x3a];
         expected.extend_from_slice(&CONTIKI_LINK_LOCAL.octets()[8..]);
+        // The ICMP checksum, after the type and the code.
+        let checksum = expected.len() + 2;
         expected.extend_from_slice(&[0x81, 0x00, 0x00, 0x00, 0x00, 0x27, 0x00, 0x02]);
         expected.extend_from_slice(&PING_DATA);
 
@@ -1745,17 +1817,18 @@ mod test {
             for frame in tx.borrow().iter() {
                 let (repr, _) = parse_frame(frame);
                 assert_eq!(repr.dst_addr, Some(ZERO_LL));
-                assert_eq!(repr.src_addr, Some(TWO_LL));
+                assert_eq!(repr.src_addr, Some(VECTOR_LL));
                 assert_eq!(repr.dst_pan_id, Some(Ieee802154Pan(0)));
             }
             let (size, _tag, offsets, compressed) = reassemble_frames(&tx.borrow());
             assert_eq!(size, 136 + 40);
-            assert_eq!(offsets, [0, 120]);
+            // The elided source leaves room for 8 more octets in the first fragment.
+            assert_eq!(offsets, [0, 128]);
             assert_eq!(compressed.len(), expected.len());
-            assert_eq!(compressed[..21], expected[..21]);
-            assert_eq!(compressed[23..], expected[23..]);
+            assert_eq!(compressed[..checksum], expected[..checksum]);
+            assert_eq!(compressed[checksum + 2..], expected[checksum + 2..]);
 
-            let mut packet = decompress(&compressed, TWO_LL, ZERO_LL, &[], 0, None).unwrap();
+            let mut packet = decompress(&compressed, VECTOR_LL, ZERO_LL, &[], 0, None).unwrap();
             let ip = Ipv6Packet::new_checked(&mut packet[..]).unwrap();
             assert_eq!(ip.src_addr(), VECTOR_LINK_LOCAL);
             assert_eq!(ip.dst_addr(), CONTIKI_LINK_LOCAL);
@@ -1820,7 +1893,7 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         let (size, _tag, offsets, compressed) = reassemble_frames(&tx.borrow());
         assert_eq!(size as usize, 40 + 8 + UDP_DATA.len());
         assert_eq!(offsets[0], 0);
-        let mut packet = decompress(&compressed, TWO_LL, ZERO_LL, &[], 0, None).unwrap();
+        let mut packet = decompress(&compressed, VECTOR_LL, ZERO_LL, &[], 0, None).unwrap();
         let ip = Ipv6Packet::new_checked(&mut packet[..]).unwrap();
         assert_eq!(ip.src_addr(), VECTOR_LINK_LOCAL);
         assert_eq!(ip.dst_addr(), CONTIKI_LINK_LOCAL);

@@ -803,6 +803,18 @@ impl<'d> TcpSocketState<'d> {
         self.rx_fin_seq.is_some_and(|fin_seq| fin_seq < self.recv_next())
     }
 
+    /// Mirror of Linux's `tcp_reset_check` that accepts RST for rcv_nxt - 1 after FIN.
+    ///
+    /// This addresses an issue where FINs cross so the acknowledgement does not cover the peer's
+    /// FIN. Linux's `tcp_reset_check` refers to connections being abruptly closed on macOS but
+    /// this can happen any time the application has closed its socket by the time our segment
+    /// arrives. A RST is sent with the same sequence number as our segment's acknowledgement,
+    /// which is one below RCV.NXT. This checks for that condition and returns true to indicate
+    /// the connection should be reset.
+    fn reset_check(&self, seq: TcpSeqNumber) -> bool {
+        seq == self.recv_next() - 1 && matches!(self.state, State::CloseWait | State::LastAck | State::Closing)
+    }
+
     /// Whether the socket is open: it may still process incoming or dispatch
     /// outgoing packets. `false` means it can be reused for a new connection: it
     /// is CLOSED and owes the remote no RST.
@@ -1555,7 +1567,15 @@ impl<'d> TcpSocketState<'d> {
                     // (3.10.7.4) and RFC 5961 (3.2): no reply is sent, and the
                     // TIME-WAIT timer below is not refreshed. RST senders don't
                     // need a reply to make progress.
+                    //
+                    // The exception, as in Linux's `tcp_validate_incoming`, is a RST at
+                    // RCV.NXT - 1 after the remote's FIN, which resets the connection.
                     if repr.control == TcpControl::Rst {
+                        if self.reset_check(repr.seq_number) {
+                            trace!("received RST at RCV.NXT - 1 after the remote's FIN");
+                            self.end_connection(CloseReason::Reset);
+                            return ProcessResult::None;
+                        }
                         debug!("dropping out-of-window RST");
                         return ProcessResult::None;
                     }
@@ -8083,6 +8103,82 @@ mod test {
         assert_eq!(s.view().close_reason(), Some(CloseReason::Reset));
         assert!(!s.view().is_open());
         recv_nothing!(s);
+    }
+
+    /// A remote has answered with a RST where the sequence number is one below RCV.NXT.
+    /// Verify the connection is Closed when in the CloseWait, LastAck or Closing states.
+    #[test]
+    fn test_rst_when_fins_cross() {
+        for (name, mut s) in [
+            ("CLOSE-WAIT", socket_close_wait()),
+            ("LAST-ACK", socket_last_ack()),
+            ("CLOSING", socket_closing()),
+        ] {
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Rst,
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: None,
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.state, State::Closed, "{name}");
+            assert_eq!(s.tuple, None, "{name}");
+            assert_eq!(s.view().close_reason(), Some(CloseReason::Reset), "{name}");
+        }
+    }
+
+    /// A RST with sequence two below RCV.NXT is not accepted when Closing.
+    #[test]
+    fn test_rst_before_rcv_nxt_when_closing() {
+        let mut s = socket_closing();
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state, State::Closing);
+    }
+
+    /// A RST with sequence one below RCV.NXT is not accepted when Established.
+    #[test]
+    fn test_rst_before_rcv_nxt_when_established() {
+        let mut s = socket_established();
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state, State::Established);
+    }
+
+    /// A RST with sequence one below RCV.NXT is not accepted when in TimeWait
+    /// (as in Linux, for RFC 1337).
+    #[test]
+    fn test_rst_before_rcv_nxt_when_time_wait() {
+        let mut s = socket_time_wait(true);
+        let _ = send(
+            &mut s,
+            Instant::from_millis(0),
+            &TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: None,
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.state, State::TimeWait);
     }
 
     #[test]

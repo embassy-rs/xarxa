@@ -19,10 +19,10 @@ use std::vec::Vec;
 
 use xarxa::Stack;
 use xarxa::driver::Capabilities;
-use xarxa::driver::{DriverBuf, RxWanted};
 #[cfg(feature = "packetmeta-id")]
 use xarxa::driver::PacketMeta;
 use xarxa::driver::{ChecksumCapabilities, Driver, LinkState};
+use xarxa::driver::{DriverBuf, RxWanted};
 #[cfg(feature = "packetmeta-timestamp")]
 use xarxa::driver::{Timestamp, TxTimestamp};
 use xarxa::iface::IfaceHandle;

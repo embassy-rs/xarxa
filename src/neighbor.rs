@@ -302,7 +302,10 @@ impl NeighborCache {
                         entry.state = State::Stale { hardware_addr };
                         // The stack no longer sends to this hardware address.
                         if entry.parked.take().is_some() {
-                            trace!("neighbor: dropping parked packet for {}, its entry went stale", entry.key.1);
+                            trace!(
+                                "neighbor: dropping parked packet for {}, its entry went stale",
+                                entry.key.1
+                            );
                         }
                     }
                 }
@@ -794,7 +797,11 @@ mod test {
         cache.probe_sent(&key(MOCK_IP_ADDR_1), t2);
 
         // Probe limit reached: resolution fails, the entry is removed.
-        assert!(is_failed(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 3, &mut 0), MOCK_IP_ADDR_1, false));
+        assert!(is_failed(
+            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 3, &mut 0),
+            MOCK_IP_ADDR_1,
+            false
+        ));
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1)), Answer::NotFound);
         let t3 = t0 + RETRANS_TIMER * 3;
         assert_eq!(next_deadline(&mut cache, t3), idle_deadline(t3));
@@ -827,7 +834,11 @@ mod test {
             assert_eq!(next_deadline(&mut cache, now), now + RETRANS_TIMER);
             now += RETRANS_TIMER;
         }
-        assert!(is_failed(cache.poll_retransmit(IF_0, now, &mut 0), MOCK_IP_ADDR_1, false));
+        assert!(is_failed(
+            cache.poll_retransmit(IF_0, now, &mut 0),
+            MOCK_IP_ADDR_1,
+            false
+        ));
     }
 
     #[test]
@@ -934,7 +945,10 @@ mod test {
         next_deadline(&mut cache, t0);
         // Polling one interface's timers doesn't touch another's entries.
         assert!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0).is_none());
-        assert!(is_retransmit(cache.poll_retransmit(IF_1, t0 + RETRANS_TIMER, &mut 0), MOCK_IP_ADDR_1));
+        assert!(is_retransmit(
+            cache.poll_retransmit(IF_1, t0 + RETRANS_TIMER, &mut 0),
+            MOCK_IP_ADDR_1
+        ));
     }
 
     /// A neighbor being resolved holds one parked packet. Another is handed
@@ -995,7 +1009,11 @@ mod test {
             cache.probe_sent(&key(MOCK_IP_ADDR_1), now);
         }
         now += RETRANS_TIMER;
-        assert!(is_failed(cache.poll_retransmit(IF_0, now, &mut 0), MOCK_IP_ADDR_1, true));
+        assert!(is_failed(
+            cache.poll_retransmit(IF_0, now, &mut 0),
+            MOCK_IP_ADDR_1,
+            true
+        ));
 
         // Resolved, it waits for the device, until the entry goes stale.
         cache.start_resolution(key(MOCK_IP_ADDR_1), true);

@@ -23,9 +23,9 @@ use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 
 use super::IfaceState;
+use crate::buffers::Buffers;
 use crate::config::{DHCP_MAX_DNS_SERVER_COUNT, DHCP_SERVER_CLIENT_ID_SIZE, DHCP_SERVER_LEASE_COUNT};
 use crate::driver::{ChecksumCapabilities, DriverBuf};
-use crate::buffers::Buffers;
 use crate::stack::{StackInner, push_ipv4_header};
 use crate::time::{Duration, Instant};
 use crate::wire::{
@@ -404,12 +404,26 @@ impl Server {
         };
 
         match message_type {
-            DhcpMessageType::Discover => {
-                self.handle_discover(buffers, now, server_cidr, checksum_caps, ip_headroom, packet, &id, chaddr)
-            }
-            DhcpMessageType::Request => {
-                self.handle_request(buffers, now, server_cidr, checksum_caps, ip_headroom, packet, &id, chaddr)
-            }
+            DhcpMessageType::Discover => self.handle_discover(
+                buffers,
+                now,
+                server_cidr,
+                checksum_caps,
+                ip_headroom,
+                packet,
+                &id,
+                chaddr,
+            ),
+            DhcpMessageType::Request => self.handle_request(
+                buffers,
+                now,
+                server_cidr,
+                checksum_caps,
+                ip_headroom,
+                packet,
+                &id,
+                chaddr,
+            ),
             DhcpMessageType::Decline => {
                 let Some(addr) = packet.option(field::OPT_REQUESTED_IP).and_then(parse_ipv4) else {
                     return None;
@@ -602,7 +616,14 @@ impl Server {
                 self.leases.retain(|l| l.address != addr || l.matches_client(id));
                 let Some(i) = self.entry_for(id, chaddr, now) else {
                     warn!("DHCP server: lease table full, cannot commit {}", addr);
-                    return self.nak(buffers, server_cidr, checksum_caps, ip_headroom, packet, "no free leases");
+                    return self.nak(
+                        buffers,
+                        server_cidr,
+                        checksum_caps,
+                        ip_headroom,
+                        packet,
+                        "no free leases",
+                    );
                 };
                 let lease = &mut self.leases[i];
                 lease.address = addr;

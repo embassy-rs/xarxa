@@ -9,9 +9,9 @@
 
 use core::fmt;
 
+use crate::buffers::{Buf, Buffers};
 use crate::config::REASSEMBLY_BUFFER_COUNT;
 use crate::driver::DriverBuf;
-use crate::buffers::{Buf, Buffers};
 use crate::stack::Stack;
 use crate::storage::Assembler;
 use crate::time::{Clock, Duration, Instant};

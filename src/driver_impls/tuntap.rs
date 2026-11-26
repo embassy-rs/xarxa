@@ -1,8 +1,8 @@
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use crate::driver::{DriverBuf, RxWanted};
 use crate::driver::{Capabilities, Driver};
+use crate::driver::{DriverBuf, RxWanted};
 use crate::iface::Medium;
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::ETHERNET_HEADER_LEN;

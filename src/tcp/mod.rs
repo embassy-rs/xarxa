@@ -7,6 +7,7 @@
 use core::fmt::Display;
 use core::{fmt, mem};
 
+use crate::buffers::Buffers;
 #[cfg(all(test, feature = "tcp-listener"))]
 use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
@@ -16,7 +17,6 @@ use crate::driver::DriverBuf;
 use crate::error::IcmpError;
 use crate::error::InvalidHopLimit;
 use crate::iface::IfaceHandle;
-use crate::buffers::Buffers;
 use crate::rand::Rand;
 use crate::stack::{Blocked, EgressRoute, IfaceBinding, Stack, TxContext, alloc_ephemeral_port};
 use crate::storage::Slab;
@@ -2805,18 +2805,11 @@ pub(crate) fn transmit(
         trace!("no packet buffer for segment to {}, holding it back", dst_addr);
         return Err(Blocked::NoBuffer);
     };
-    cx.transmit_ip(
-        &route,
-        buf,
-        src_addr,
-        dst_addr,
-        IpProtocol::Tcp,
-        hop_limit,
-    )
-    .map_err(|(blocked, _)| {
-        trace!("segment to {} would have to wait and can't, holding it back", dst_addr);
-        blocked
-    })
+    cx.transmit_ip(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit)
+        .map_err(|(blocked, _)| {
+            trace!("segment to {} would have to wait and can't, holding it back", dst_addr);
+            blocked
+        })
 }
 
 /// A Transmission Control Protocol socket, borrowed from a [`Stack`] by

@@ -14,12 +14,12 @@ use crate::config::RAW_RX_QUEUE_COUNT;
 use crate::storage::BoundedDeque;
 use core::fmt;
 
+use crate::buffers::{Buf, Buffers};
 use crate::driver::DriverBuf;
 use crate::driver::PacketMeta;
 use crate::iface::IfaceHandle;
 #[cfg(feature = "raw-ethernet")]
 use crate::iface::Medium;
-use crate::buffers::{Buf, Buffers};
 #[cfg(feature = "raw-ip")]
 use crate::stack::Blocked;
 #[cfg(feature = "async")]
@@ -1216,7 +1216,13 @@ mod test {
 
         // Not a stack protocol: the first matching socket takes the buffer.
         let packet = ipv4_packet(IP_PROTO, b"abcd");
-        let res = stack.process_raw_ip(IfaceHandle::new(0), IpVersion::V4, IP_PROTO, false, stack.test_buf(&packet));
+        let res = stack.process_raw_ip(
+            IfaceHandle::new(0),
+            IpVersion::V4,
+            IP_PROTO,
+            false,
+            stack.test_buf(&packet),
+        );
         assert!(res.is_none());
         assert!(!stack.raw_socket(h_icmp).can_recv());
         assert_eq!(&stack.raw_socket(h_any).recv().unwrap()[..], &packet[..]);
@@ -1253,7 +1259,13 @@ mod test {
         // No socket matches: the buffer is handed back.
         stack.raw_socket(h_any).close();
         let packet = ipv4_packet(IP_PROTO, b"nobody");
-        let res = stack.process_raw_ip(IfaceHandle::new(0), IpVersion::V4, IP_PROTO, false, stack.test_buf(&packet));
+        let res = stack.process_raw_ip(
+            IfaceHandle::new(0),
+            IpVersion::V4,
+            IP_PROTO,
+            false,
+            stack.test_buf(&packet),
+        );
         let (res_buf, handled) = res.unwrap();
         assert_eq!(&*res_buf, &packet[..]);
         assert!(!handled);

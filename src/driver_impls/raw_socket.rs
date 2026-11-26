@@ -2,8 +2,8 @@ use std::io;
 use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use crate::driver::{DriverBuf, RxWanted};
 use crate::driver::{Capabilities, Driver};
+use crate::driver::{DriverBuf, RxWanted};
 use crate::iface::Medium;
 use crate::wire::HardwareAddress;
 

@@ -1,6 +1,7 @@
 //! The network stack.
 
 use crate::Pool;
+use crate::buffers::{Buf, Buffers};
 use crate::config::IFACE_COUNT;
 #[cfg(feature = "loopback")]
 use crate::config::LOOPBACK_QUEUE_COUNT;
@@ -34,7 +35,6 @@ use crate::iface::{AddIfaceError, Iface, IfaceHandle, IfaceIter, IfaceState, Med
 use crate::neighbor::NeighborState;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::neighbor::{Answer as NeighborAnswer, Key as NeighborKey, NeighborCache, ProbeEvent};
-use crate::buffers::{Buf, Buffers};
 use crate::rand::Rand;
 #[cfg(feature = "_raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketIter, RawSocketState};
@@ -803,8 +803,7 @@ impl TxContext<'_, '_> {
             return self.inner.loop_back(route.iface, buf);
         }
         let iface = self.ifaces.get_mut(route.iface.index());
-        self.inner
-            .transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype)
+        self.inner.transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype)
     }
 
     /// Transmit a fully-built Ethernet frame on the given interface, as-is.
@@ -833,8 +832,7 @@ impl TxContext<'_, '_> {
             #[cfg(feature = "ipv6")]
             IpAddr::V6(_) => EthernetProtocol::Ipv6,
         };
-        self.inner
-            .transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype)
+        self.inner.transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype)
     }
 }
 
@@ -3008,7 +3006,13 @@ impl StackInner {
     /// Hand a parked IP packet whose next hop resolved to `hardware_addr` to the
     /// link layer of the interface's medium. `dst_addr` names the IP version.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn transmit_link(&mut self, iface: &mut IfaceState<'_>, hardware_addr: HardwareAddress, buf: Buf, dst_addr: IpAddr) {
+    fn transmit_link(
+        &mut self,
+        iface: &mut IfaceState<'_>,
+        hardware_addr: HardwareAddress,
+        buf: Buf,
+        dst_addr: IpAddr,
+    ) {
         #[cfg(not(feature = "medium-ethernet"))]
         let _ = dst_addr;
         match hardware_addr {
@@ -6098,11 +6102,7 @@ pub(crate) mod test {
 
         // An owned buffer with too little headroom is moved, not refused.
         let buf = stack.keep(stack.test_buf(&packet)).unwrap();
-        stack
-            .raw_socket(handle)
-            .send_buf(buf)
-            .map_err(|(err, _)| err)
-            .unwrap();
+        stack.raw_socket(handle).send_buf(buf).map_err(|(err, _)| err).unwrap();
         assert_eq!(big.tx.borrow().len(), 2);
     }
 
@@ -6939,14 +6939,7 @@ pub(crate) mod test {
 
                 let mut cx = stack.tx_context();
                 let route = cx.route(IfaceBinding::Any, &REMOTE_V4.into()).unwrap();
-                let _ = cx.transmit_ip(
-                    &route,
-                    buf,
-                    OUR_V4.into(),
-                    REMOTE_V4.into(),
-                    IpProtocol::Udp,
-                    64,
-                );
+                let _ = cx.transmit_ip(&route, buf, OUR_V4.into(), REMOTE_V4.into(), IpProtocol::Udp, 64);
 
                 let frames = tx.borrow();
                 assert!(!frames.is_empty(), "ip_packet_len: {}", ip_packet_len);
@@ -9257,10 +9250,7 @@ pub(crate) mod test {
         buf.fill(0xab);
 
         let mut held = hold_all_but(&POOL, 1);
-        let (err, buf) = stack
-            .udp_socket(udp)
-            .send_buf(buf, (REMOTE_V4, 1000))
-            .unwrap_err();
+        let (err, buf) = stack.udp_socket(udp).send_buf(buf, (REMOTE_V4, 1000)).unwrap_err();
         assert_eq!(err, crate::udp::SendError::NoBuffer);
         assert_eq!(buf.len(), 800);
         assert!(buf.iter().all(|&b| b == 0xab));
@@ -9321,10 +9311,7 @@ pub(crate) mod test {
         // The device takes the first fragment and has no room for the second.
         // Then no buffer is free for it.
         room.set(Some(1));
-        stack
-            .udp_socket(udp)
-            .send_slice(&[0; 800], (REMOTE_V4, 1000))
-            .unwrap();
+        stack.udp_socket(udp).send_slice(&[0; 800], (REMOTE_V4, 1000)).unwrap();
         assert_eq!(tx.borrow().len(), 1);
         let mut held = hold_all_but(&POOL, 0);
         room.set(None);
@@ -9333,7 +9320,9 @@ pub(crate) mod test {
         // The second interface is polled after the first one's fragments tried and
         // failed, and before they try again at the end of the poll.
         let junk = Junk(Some(held.pop().unwrap()));
-        stack.add_iface_borrowed(std::boxed::Box::leak(std::boxed::Box::new(junk))).unwrap();
+        stack
+            .add_iface_borrowed(std::boxed::Box::leak(std::boxed::Box::new(junk)))
+            .unwrap();
 
         let now = Instant::from_secs(1);
         let retry = now + Duration::from_millis(1);
@@ -9786,7 +9775,10 @@ pub(crate) mod test {
         // Another neighbor has a slot of its own.
         let other = Ipv4Addr::new(192, 168, 1, 100);
         let udp2 = stack.add_udp_socket().unwrap();
-        stack.udp_socket(udp2).bind(1001, ListenSocketAddr::UNSPECIFIED).unwrap();
+        stack
+            .udp_socket(udp2)
+            .bind(1001, ListenSocketAddr::UNSPECIFIED)
+            .unwrap();
         stack.udp_socket(udp2).send_slice(b"hi", (other, 1000)).unwrap();
         assert!(
             stack

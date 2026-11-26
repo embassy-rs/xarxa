@@ -629,7 +629,12 @@ impl StackInner {
 
     /// [`dispatch_ieee802154`](Self::dispatch_ieee802154) for a packet that is
     /// already allowed to wait: one that was parked on its neighbor.
-    pub(crate) fn dispatch_ieee802154_kept(&mut self, iface: &mut IfaceState<'_>, ll_dst_a: Ieee802154Address, buf: Buf) {
+    pub(crate) fn dispatch_ieee802154_kept(
+        &mut self,
+        iface: &mut IfaceState<'_>,
+        ll_dst_a: Ieee802154Address,
+        buf: Buf,
+    ) {
         let ieee_repr = Self::ieee802154_repr(iface, ll_dst_a);
         self.dispatch_sixlowpan_kept(iface, buf, ieee_repr);
     }

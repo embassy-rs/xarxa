@@ -1075,14 +1075,10 @@ impl UdpSocket<'_, '_> {
 
         trace!("udp:{}:{}: sending {} octets", src, dst, size);
 
-        let (blocked, mut buf) = match self.tx.transmit_ip(
-            &route,
-            buf,
-            src.addr,
-            dst.addr,
-            IpProtocol::Udp,
-            hop_limit,
-        ) {
+        let (blocked, mut buf) = match self
+            .tx
+            .transmit_ip(&route, buf, src.addr, dst.addr, IpProtocol::Udp, hop_limit)
+        {
             Ok(()) => {
                 // Whatever an earlier send waited for, the socket doesn't any more.
                 #[cfg(feature = "async")]
@@ -1420,7 +1416,13 @@ mod test {
 
     /// Like [`deliver`], with an explicit destination port.
     fn deliver_to_port(stack: &mut Stack, dst_port: u16, payload: &[u8]) {
-        let mut buf = stack.test_buf(&queued_packet_to_port(REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, dst_port, payload));
+        let mut buf = stack.test_buf(&queued_packet_to_port(
+            REMOTE_ADDR,
+            REMOTE_PORT,
+            LOCAL_ADDR,
+            dst_port,
+            payload,
+        ));
         buf.pull_front(IPV4_HEADER_LEN);
         let info = ingress_info(stack, IfaceHandle::new(0), LOCAL_ADDR);
         stack.process_udp(info, REMOTE_ADDR.into(), LOCAL_ADDR.into(), IPV4_HEADER_LEN, false, buf);

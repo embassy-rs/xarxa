@@ -1473,6 +1473,19 @@ impl<'d> TcpSocketState<'d> {
         let (payload, payload_offset) = match self.state {
             // In the SYN-SENT state, we have not yet synchronized with the remote end.
             State::SynSent => (&[][..], 0),
+            // Accept RST at RCV_NXT-1 when closing.
+            // This avoids stalling for one RTO when the FINs cross on the wire:
+            // - We send FIN
+            // - Remote sends FIN, tears down the socket.
+            // - Remote receives our FIN, replies with RST with a sequence too old by one.
+            // This would get resolved after one RTO:
+            // - We retransmit the FIN, with the updated ACK
+            // - Remote sends a new RST, with the right seq.
+            // The special case here allows this to get resolved instantly.
+            // It mirrors Linux's tcp_reset_check().
+            _ if repr.control == TcpControl::Rst && self.rx_fin_received() && segment_start + 1 == window_start => {
+                (&[][..], 0)
+            }
             _ => {
                 // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
                 //
@@ -8477,6 +8490,119 @@ mod test {
         );
         assert_eq!(s.state, State::TimeWait);
         recv!(s, []);
+    }
+
+    /// The FINs cross, and the remote has closed its socket by the time ours
+    /// arrives. It answers our FIN with an RST at its SEG.ACK, the remote's FIN,
+    /// one before RCV.NXT. That resets the connection right away, instead of
+    /// waiting for our FIN's retransmission to draw an RST at RCV.NXT.
+    #[test]
+    fn test_simultaneous_close_rst_at_fin() {
+        let mut s = socket_established();
+        s.view().close();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closing);
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.tuple, None);
+        assert_eq!(s.view().close_reason(), Some(CloseReason::Reset));
+        recv_nothing!(s);
+    }
+
+    /// An RST at the remote's FIN resets the connection in every state after
+    /// the FIN was taken, like one at RCV.NXT. That includes TIME-WAIT: there
+    /// is no RFC 1337 protection, so an RST at RCV.NXT ends it too.
+    #[test]
+    fn test_rst_at_fin_after_fin() {
+        for (mut s, seq_number) in [
+            socket_close_wait as fn() -> TestSocket,
+            socket_last_ack,
+            socket_closing,
+            || socket_time_wait(false),
+            || socket_time_wait(true),
+        ]
+        .into_iter()
+        .flat_map(|f| [(f(), REMOTE_SEQ + 1), (f(), REMOTE_SEQ + 1 + 1)])
+        {
+            let state = s.state;
+            send!(
+                s,
+                TcpRepr {
+                    control: TcpControl::Rst,
+                    seq_number,
+                    ack_number: None,
+                    ..SEND_TEMPL
+                }
+            );
+            assert_eq!(s.state, State::Closed, "{}", state);
+            assert_eq!(s.tuple, None, "{}", state);
+            assert_eq!(s.view().close_reason(), Some(CloseReason::Reset), "{}", state);
+            recv_nothing!(s);
+        }
+    }
+
+    /// Only the FIN's own sequence number is admitted below RCV.NXT: an RST
+    /// further back is still out of the window, and so is one at RCV.NXT - 1
+    /// before the remote's FIN.
+    #[test]
+    fn test_rst_before_fin_dropped() {
+        let mut s = socket_closing();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Closing);
+
+        let mut s = socket_fin_wait_2();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::FinWait2);
+        recv_nothing!(s);
     }
 
     #[test]
